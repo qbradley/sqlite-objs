@@ -438,7 +438,9 @@ static int azqliteTruncate(sqlite3_file *pFile, sqlite3_int64 size) {
         azure_error_t aerr;
         azure_error_init(&aerr);
         azure_err_t arc = p->ops->page_blob_resize(p->ops_ctx, p->zBlobName,
-                                                     alignedSize, &aerr);
+                                                     alignedSize,
+                                                     hasLease(p) ? p->leaseId : NULL,
+                                                     &aerr);
         if (arc != AZURE_OK) {
             return azureErrToSqlite(arc, SQLITE_IOERR_TRUNCATE);
         }
@@ -487,7 +489,9 @@ static int azqliteSync(sqlite3_file *pFile, int flags) {
         sqlite3_int64 alignedSize = (p->nData + 511) & ~(sqlite3_int64)511;
         azure_error_init(&aerr);
         azure_err_t arc = p->ops->page_blob_resize(p->ops_ctx, p->zBlobName,
-                                                     alignedSize, &aerr);
+                                                     alignedSize,
+                                                     hasLease(p) ? p->leaseId : NULL,
+                                                     &aerr);
         if (arc != AZURE_OK) {
             return SQLITE_IOERR_FSYNC;
         }
@@ -511,7 +515,8 @@ static int azqliteSync(sqlite3_file *pFile, int flags) {
         azure_error_init(&aerr);
         azure_err_t arc = p->ops->page_blob_write(
             p->ops_ctx, p->zBlobName,
-            offset, p->aData + offset, alignedLen, &aerr);
+            offset, p->aData + offset, alignedLen,
+            hasLease(p) ? p->leaseId : NULL, &aerr);
 
         if (arc != AZURE_OK) {
             return SQLITE_IOERR_FSYNC;
@@ -687,11 +692,20 @@ static int azqliteSectorSize(sqlite3_file *pFile) {
 /*
 ** xDeviceCharacteristics — Report device capabilities.
 ** ATOMIC512: 512-byte aligned writes are atomic on Azure Page Blobs.
-** SAFE_APPEND: appended data is written before size is updated.
+** POWERSAFE_OVERWRITE: individual Azure PUT Page calls don't corrupt
+** adjacent pages — each writes exactly the specified byte range.
+** SUBPAGE_READ: reads from our in-memory cache can return any portion.
+**
+** NOT ATOMIC — multi-page sync to Azure is not atomic.
+** NOT SAFE_APPEND — page_blob_resize + page_blob_write are separate
+**   HTTP calls, so extension is not atomic.
+** NOT SEQUENTIAL — Azure HTTP requests have no write ordering guarantee.
+**   Claiming SEQUENTIAL would cause SQLite to skip xSync on the journal
+**   file, which is where our VFS uploads the journal to Azure.
 */
 static int azqliteDeviceCharacteristics(sqlite3_file *pFile) {
     (void)pFile;
-    return SQLITE_IOCAP_ATOMIC512 | SQLITE_IOCAP_SAFE_APPEND;
+    return SQLITE_IOCAP_POWERSAFE_OVERWRITE | SQLITE_IOCAP_SUBPAGE_READ;
 }
 
 
@@ -1091,6 +1105,7 @@ int azqlite_vfs_register_with_config(const azqlite_config_t *config,
         clientCfg.container = config->container;
         clientCfg.sas_token = config->sas_token;
         clientCfg.account_key = config->account_key;
+        clientCfg.endpoint = config->endpoint;
 
         azure_error_t aerr;
         azure_error_init(&aerr);

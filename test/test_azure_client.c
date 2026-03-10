@@ -143,7 +143,7 @@ TEST(timeout_error) {
     mock_set_fail_operation(g_ctx, "page_blob_write", AZURE_ERR_TIMEOUT);
 
     uint8_t data[512] = {0};
-    azure_err_t rc = g_ops->page_blob_write(g_ctx, "test.db", 0, data, 512, &err);
+    azure_err_t rc = g_ops->page_blob_write(g_ctx, "test.db", 0, data, 512, NULL, &err);
     ASSERT_AZURE_ERR(rc, AZURE_ERR_TIMEOUT);
 }
 
@@ -269,7 +269,7 @@ TEST(buffer_growth_on_read) {
     /* Write different amounts to verify buffer grows */
     uint8_t data[4096];
     memset(data, 0xAA, sizeof(data));
-    g_ops->page_blob_write(g_ctx, "test.db", 0, data, 4096, &err);
+    g_ops->page_blob_write(g_ctx, "test.db", 0, data, 4096, NULL, &err);
 
     azure_buffer_t buf;
     azure_buffer_init(&buf);
@@ -553,7 +553,7 @@ TEST(mock_transient_error_not_retried) {
     mock_set_fail_operation(g_ctx, "page_blob_write", AZURE_ERR_THROTTLE);
 
     uint8_t data[512] = {0};
-    g_ops->page_blob_write(g_ctx, "test.db", 0, data, 512, &err);
+    g_ops->page_blob_write(g_ctx, "test.db", 0, data, 512, NULL, &err);
     ASSERT_EQ(mock_get_call_count(g_ctx, "page_blob_write"), 1);
 }
 
@@ -625,7 +625,7 @@ TEST(write_read_many_pages_sequentially) {
         uint8_t data[4096];
         memset(data, (uint8_t)(i & 0xFF), sizeof(data));
         g_ops->page_blob_write(g_ctx, "big.db",
-                               (int64_t)(i * 4096), data, 4096, &err);
+                               (int64_t)(i * 4096), data, 4096, NULL, &err);
     }
 
     for (int i = 0; i < num_pages; i++) {

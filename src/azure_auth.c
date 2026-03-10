@@ -226,7 +226,9 @@ azure_err_t azure_auth_sign_request(
 
     /*
      * Canonicalized resource: /account/path
-     * If query params exist, append sorted: \nparam:value
+     * For production Azure: path = /container/blob, result = /account/container/blob
+     * For Azurite: path = /account/container/blob (already has account), 
+     *              result = /account/account/container/blob (doubled to match Azurite's quirk)
      */
     p += snprintf(p, (size_t)(end - p), "/%s%s", client->account, path);
 

@@ -36,8 +36,17 @@ else
     LDFLAGS  = -lpthread -ldl -lm
 endif
 
-# Production linker flags (libcurl + OpenSSL)
-LDFLAGS_PROD = $(LDFLAGS) -lcurl -lssl -lcrypto
+# pkg-config support for production dependencies (OpenSSL + libcurl)
+# Falls back to hardcoded values if pkg-config is unavailable
+PKG_CONFIG ?= pkg-config
+OPENSSL_CFLAGS  := $(shell $(PKG_CONFIG) --cflags openssl 2>/dev/null || echo "")
+OPENSSL_LDFLAGS := $(shell $(PKG_CONFIG) --libs openssl 2>/dev/null || echo "-lssl -lcrypto")
+CURL_CFLAGS     := $(shell $(PKG_CONFIG) --cflags libcurl 2>/dev/null || echo "")
+CURL_LDFLAGS    := $(shell $(PKG_CONFIG) --libs libcurl 2>/dev/null || echo "-lcurl")
+
+# Production CFLAGS and LDFLAGS
+CFLAGS_PROD  = $(CFLAGS) $(OPENSSL_CFLAGS) $(CURL_CFLAGS)
+LDFLAGS_PROD = $(LDFLAGS) $(CURL_LDFLAGS) $(OPENSSL_LDFLAGS)
 
 # Test-specific CFLAGS (suppress GNU extension warning in test harness)
 TEST_CFLAGS = $(CFLAGS) -I$(TEST_DIR)
@@ -101,13 +110,13 @@ $(BUILD_DIR)/azure_client_stub.o: $(SRC_DIR)/azure_client_stub.c $(SRC_DIR)/azur
 # ---------- Production client sources ----------
 
 $(BUILD_DIR)/azure_client.o: $(SRC_DIR)/azure_client.c $(SRC_DIR)/azure_client_impl.h $(SRC_DIR)/azure_client.h | $(BUILD_DIR)
-	$(CC) $(CFLAGS) -c -o $@ $<
+	$(CC) $(CFLAGS_PROD) -c -o $@ $<
 
 $(BUILD_DIR)/azure_auth.o: $(SRC_DIR)/azure_auth.c $(SRC_DIR)/azure_client_impl.h $(SRC_DIR)/azure_client.h | $(BUILD_DIR)
-	$(CC) $(CFLAGS) -c -o $@ $<
+	$(CC) $(CFLAGS_PROD) -c -o $@ $<
 
 $(BUILD_DIR)/azure_error.o: $(SRC_DIR)/azure_error.c $(SRC_DIR)/azure_client_impl.h $(SRC_DIR)/azure_client.h | $(BUILD_DIR)
-	$(CC) $(CFLAGS) -c -o $@ $<
+	$(CC) $(CFLAGS_PROD) -c -o $@ $<
 
 # ---------- Static library (stub) ----------
 
@@ -118,7 +127,7 @@ $(LIBRARY): $(LIB_OBJS) | $(BUILD_DIR)
 
 all-production: $(PROD_LIB_OBJS) $(SHELL_SRC) | $(BUILD_DIR)
 	$(AR) rcs $(PROD_LIBRARY) $(PROD_LIB_OBJS)
-	$(CC) $(CFLAGS) -w -I$(SRC_DIR) -I$(SQLITE_DIR) \
+	$(CC) $(CFLAGS_PROD) -w -I$(SRC_DIR) -I$(SQLITE_DIR) \
 		-DSQLITE_THREADSAFE=1 \
 		-o $(SHELL_BIN) $(SRC_DIR)/azqlite_shell.c \
 		$(BUILD_DIR)/azqlite_vfs.o \
@@ -160,9 +169,16 @@ $(BUILD_DIR)/test_main: $(TEST_DIR)/test_main.c $(TEST_DIR)/test_vfs.c $(TEST_DI
 	$(CC) $(TEST_CFLAGS) -DENABLE_VFS_INTEGRATION -o $@ $(TEST_DIR)/test_main.c $(TEST_OBJS) $(LDFLAGS)
 
 # Layer 2: Integration tests (requires Azurite)
-test-integration:
-	@echo "=== Integration tests not yet implemented ==="
-	@echo "    (Samwise will add these in test/test_integration.c)"
+# These tests link against the REAL azure_client.c (not stubs/mocks)
+# and require Azurite to be running.
+test-integration: $(BUILD_DIR)/test_integration
+	@echo "=== Running integration tests (requires Azurite) ==="
+	@./test/run-integration.sh
+
+# Build the integration test binary
+# Links against: SQLite + VFS + REAL Azure client (with libcurl + OpenSSL)
+$(BUILD_DIR)/test_integration: $(TEST_DIR)/test_integration.c $(TEST_DIR)/test_harness.h $(PROD_LIB_OBJS) | $(BUILD_DIR)
+	$(CC) $(TEST_CFLAGS) -o $@ $(TEST_DIR)/test_integration.c $(PROD_LIB_OBJS) $(LDFLAGS_PROD)
 
 # Both layers
 test: test-unit test-integration

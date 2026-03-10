@@ -25,18 +25,21 @@ const char *azure_err_str(azure_err_t code)
 {
     switch (code) {
         case AZURE_OK:              return "OK";
-        case AZURE_ERR_HTTP:        return "HTTP error (non-retryable)";
-        case AZURE_ERR_TRANSIENT:   return "Transient error (retryable)";
+        case AZURE_ERR_BAD_REQUEST: return "Bad request";
+        case AZURE_ERR_SERVER:      return "Server error (retryable)";
         case AZURE_ERR_THROTTLED:   return "Throttled (429, retryable)";
         case AZURE_ERR_AUTH:        return "Authentication failure";
         case AZURE_ERR_NOT_FOUND:   return "Not found (404)";
         case AZURE_ERR_CONFLICT:    return "Conflict (409)";
         case AZURE_ERR_PRECONDITION:return "Precondition failed (412)";
-        case AZURE_ERR_CURL:        return "libcurl error";
-        case AZURE_ERR_OPENSSL:     return "OpenSSL error";
-        case AZURE_ERR_XML_PARSE:   return "XML parse error";
+        case AZURE_ERR_NETWORK:     return "Network error";
+        case AZURE_ERR_LEASE_EXPIRED:return "Lease expired";
         case AZURE_ERR_INVALID_ARG: return "Invalid argument";
-        case AZURE_ERR_ALLOC:       return "Memory allocation failure";
+        case AZURE_ERR_NOMEM:       return "Memory allocation failure";
+        case AZURE_ERR_IO:          return "I/O error";
+        case AZURE_ERR_TIMEOUT:     return "Timeout";
+        case AZURE_ERR_ALIGNMENT:   return "Alignment violation";
+        case AZURE_ERR_UNKNOWN:     return "Unknown error";
     }
     return "Unknown error";
 }
@@ -130,14 +133,14 @@ azure_err_t azure_classify_http_error(long http_status,
         case 502: /* Bad Gateway */
         case 503: /* Service Unavailable */
         case 504: /* Gateway Timeout */
-            return AZURE_ERR_TRANSIENT;
+            return AZURE_ERR_SERVER;
     }
 
     /* Azure-specific transient error codes (may arrive with various status) */
     if (error_code && *error_code) {
-        if (strcmp(error_code, "ServerBusy") == 0) return AZURE_ERR_TRANSIENT;
-        if (strcmp(error_code, "InternalError") == 0) return AZURE_ERR_TRANSIENT;
-        if (strcmp(error_code, "OperationTimedOut") == 0) return AZURE_ERR_TRANSIENT;
+        if (strcmp(error_code, "ServerBusy") == 0) return AZURE_ERR_SERVER;
+        if (strcmp(error_code, "InternalError") == 0) return AZURE_ERR_SERVER;
+        if (strcmp(error_code, "OperationTimedOut") == 0) return AZURE_ERR_SERVER;
     }
 
     /* Permanent errors */
@@ -147,14 +150,14 @@ azure_err_t azure_classify_http_error(long http_status,
         case 404: return AZURE_ERR_NOT_FOUND;
         case 409: return AZURE_ERR_CONFLICT;
         case 412: return AZURE_ERR_PRECONDITION;
-        default:  return AZURE_ERR_HTTP;
+        default:  return AZURE_ERR_BAD_REQUEST;
     }
 }
 
 /* Check if an error is retryable */
 int azure_is_retryable(azure_err_t code)
 {
-    return code == AZURE_ERR_TRANSIENT || code == AZURE_ERR_THROTTLED;
+    return code == AZURE_ERR_SERVER || code == AZURE_ERR_THROTTLED;
 }
 
 /* ================================================================

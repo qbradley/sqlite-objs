@@ -44,6 +44,7 @@ typedef struct azqlite_config {
     const char *container;      /* Blob container name */
     const char *sas_token;      /* SAS token (preferred), or NULL */
     const char *account_key;    /* Shared Key (fallback), or NULL */
+    const char *endpoint;       /* Optional custom endpoint (for Azurite), or NULL for Azure */
 
     /*
     ** Optional: override the Azure operations vtable.

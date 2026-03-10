@@ -255,8 +255,10 @@ static azure_err_t mock_page_blob_create(void *vctx, const char *name,
 
 static azure_err_t mock_page_blob_write(void *vctx, const char *name,
                                          int64_t offset, const uint8_t *data,
-                                         size_t len, azure_error_t *err) {
+                                         size_t len, const char *lease_id,
+                                         azure_error_t *err) {
     mock_azure_ctx_t *ctx = (mock_azure_ctx_t *)vctx;
+    (void)lease_id;  /* Mock does not enforce lease on writes */
     azure_err_t rc = pre_call(ctx, OP_PAGE_BLOB_WRITE, err);
     if (rc != AZURE_OK) return rc;
 
@@ -340,8 +342,10 @@ static azure_err_t mock_page_blob_read(void *vctx, const char *name,
 
 static azure_err_t mock_page_blob_resize(void *vctx, const char *name,
                                           int64_t new_size,
+                                          const char *lease_id,
                                           azure_error_t *err) {
     mock_azure_ctx_t *ctx = (mock_azure_ctx_t *)vctx;
+    (void)lease_id;  /* Mock does not enforce lease on resize */
     azure_err_t rc = pre_call(ctx, OP_PAGE_BLOB_RESIZE, err);
     if (rc != AZURE_OK) return rc;
 

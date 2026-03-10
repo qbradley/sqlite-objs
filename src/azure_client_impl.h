@@ -51,6 +51,7 @@ extern "C" {
 struct azure_client {
     char     account[256];
     char     container[256];
+    char     endpoint[512];      /* Custom endpoint (e.g., Azurite), or empty for Azure */
     char     key_b64[256];       /* Base64-encoded Shared Key */
     uint8_t  key_raw[64];        /* Decoded binary key */
     size_t   key_raw_len;

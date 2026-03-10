@@ -132,15 +132,24 @@ static size_t curl_header_cb(char *buffer, size_t size, size_t nitems,
  * URL construction
  *
  * Format: https://<account>.blob.core.windows.net/<container>/<blob>
+ * OR (for custom endpoint): <endpoint>/<container>/<blob>
  * ================================================================ */
 
 static void build_blob_url(const azure_client_t *client,
                            const char *blob_name,
                            char *url_buf, size_t url_buf_size)
 {
-    snprintf(url_buf, url_buf_size,
-             "https://%s.blob.core.windows.net/%s/%s",
-             client->account, client->container, blob_name);
+    if (client->endpoint[0]) {
+        /* Custom endpoint (e.g., Azurite): http://127.0.0.1:10000 
+         * Build URL as: endpoint/account/container/blob */
+        snprintf(url_buf, url_buf_size, "%s/%s/%s/%s",
+                 client->endpoint, client->account, client->container, blob_name);
+    } else {
+        /* Default Azure endpoint */
+        snprintf(url_buf, url_buf_size,
+                 "https://%s.blob.core.windows.net/%s/%s",
+                 client->account, client->container, blob_name);
+    }
 }
 
 /* ================================================================
@@ -170,20 +179,24 @@ static azure_err_t execute_single(
     CURL *curl = (CURL *)client->curl_handle;
     CURLcode res;
 
-    /* Build URL */
-    char url[2048];
+    /* Build URL with enough room for base + query + SAS token */
+    char url[4096];
     build_blob_url(client, blob_name, url, sizeof(url));
+    size_t url_len = strlen(url);
 
-    /* Append query parameters */
+    /* Append query parameters (bounds-checked) */
     if (query && *query) {
-        strcat(url, "?");
-        strcat(url, query);
+        int n = snprintf(url + url_len, sizeof(url) - url_len, "?%s", query);
+        if (n > 0) url_len += (size_t)n;
     }
 
-    /* Append SAS token */
+    /* Append SAS token (bounds-checked) */
     if (client->use_sas) {
-        strcat(url, (query && *query) ? "&" : "?");
-        strcat(url, client->sas_token);
+        const char *sep = (query && *query) ? "&" : "?";
+        int n = snprintf(url + url_len, sizeof(url) - url_len,
+                         "%s%s", sep, client->sas_token);
+        if (n > 0) url_len += (size_t)n;
+        (void)url_len;
     }
 
     /* Build x-ms-date and x-ms-version headers */
@@ -217,8 +230,21 @@ static azure_err_t execute_single(
     char auth_header[512] = "";
     if (!client->use_sas) {
         char path[1024];
-        snprintf(path, sizeof(path), "/%s/%s",
-                 client->container, blob_name);
+        /* Canonicalized resource format differs between production and Azurite:
+         * - Production Azure: /account/container/blob
+         * - Azurite: /account/account/container/blob (account doubled due to emulator quirk)
+         *   This is because Azurite prepends the account from the URL path to the configured
+         *   account name internally. See Azurite GitHub issues #223, #647 for details.
+         */
+        if (client->endpoint[0]) {
+            /* Custom endpoint (Azurite): double the account name */
+            snprintf(path, sizeof(path), "/%s/%s/%s",
+                     client->account, client->container, blob_name);
+        } else {
+            /* Production Azure: account will be prepended in azure_auth.c */
+            snprintf(path, sizeof(path), "/%s/%s",
+                     client->container, blob_name);
+        }
 
         azure_err_t rc = azure_auth_sign_request(
             client, method, path, query,
@@ -269,6 +295,9 @@ static azure_err_t execute_single(
         char h_ct[256];
         snprintf(h_ct, sizeof(h_ct), "Content-Type: %s", content_type);
         headers = curl_slist_append(headers, h_ct);
+    } else {
+        /* Disable curl's automatic Content-Type header to avoid signature mismatch */
+        headers = curl_slist_append(headers, "Content-Type:");
     }
 
     if (body_len > 0) {
@@ -433,7 +462,7 @@ static azure_err_t execute_with_retry(
         /* Transient/throttled error — retry with backoff */
         if (attempt < AZURE_MAX_RETRIES) {
             int delay_ms = azure_compute_retry_delay(attempt, rh.retry_after);
-            fprintf(stderr, "[azqlite] %s %s: %s (HTTP %ld) — "
+            fprintf(stderr, "[azqlite] %s %s: %s (HTTP %d) — "
                     "retry %d/%d in %dms\n",
                     method, blob_name, azure_err_str(rc),
                     err->http_status, attempt + 1, AZURE_MAX_RETRIES,
@@ -493,7 +522,8 @@ static azure_err_t az_page_blob_create(void *ctx, const char *name,
  */
 static azure_err_t az_page_blob_write(void *ctx, const char *name,
                                       int64_t offset, const uint8_t *data,
-                                      size_t len, azure_error_t *err)
+                                      size_t len, const char *lease_id,
+                                      azure_error_t *err)
 {
     azure_client_t *c = (azure_client_t *)ctx;
 
@@ -518,18 +548,35 @@ static azure_err_t az_page_blob_write(void *ctx, const char *name,
         return AZURE_ERR_INVALID_ARG;
     }
 
-    char range[64];
-    snprintf(range, sizeof(range), "bytes=%lld-%lld",
+    char range_header[128];
+    snprintf(range_header, sizeof(range_header), "x-ms-range:bytes=%lld-%lld",
              (long long)offset, (long long)(offset + (int64_t)len - 1));
 
-    const char *extra[] = {
+    char lease_header[128];
+    const char *extra_with_lease[] = {
         "x-ms-page-write:update",
+        range_header,
+        lease_header,
+        NULL
+    };
+    const char *extra_no_lease[] = {
+        "x-ms-page-write:update",
+        range_header,
         NULL
     };
 
+    const char **extra;
+    if (lease_id && lease_id[0] != '\0') {
+        snprintf(lease_header, sizeof(lease_header),
+                 "x-ms-lease-id:%s", lease_id);
+        extra = extra_with_lease;
+    } else {
+        extra = extra_no_lease;
+    }
+
     return execute_with_retry(c, "PUT", name, "comp=page",
                               extra, "application/octet-stream",
-                              data, len, range,
+                              data, len, NULL,
                               NULL, NULL, err);
 }
 
@@ -553,12 +600,17 @@ static azure_err_t az_page_blob_read(void *ctx, const char *name,
         return AZURE_ERR_INVALID_ARG;
     }
 
-    char range[64];
-    snprintf(range, sizeof(range), "bytes=%lld-%lld",
+    char range_header[128];
+    snprintf(range_header, sizeof(range_header), "x-ms-range:bytes=%lld-%lld",
              (long long)offset, (long long)(offset + (int64_t)len - 1));
 
+    const char *extra[] = {
+        range_header,
+        NULL
+    };
+
     return execute_with_retry(c, "GET", name, NULL,
-                              NULL, NULL, NULL, 0, range,
+                              extra, NULL, NULL, 0, NULL,
                               out, NULL, err);
 }
 
@@ -569,6 +621,7 @@ static azure_err_t az_page_blob_read(void *ctx, const char *name,
  */
 static azure_err_t az_page_blob_resize(void *ctx, const char *name,
                                        int64_t new_size,
+                                       const char *lease_id,
                                        azure_error_t *err)
 {
     azure_client_t *c = (azure_client_t *)ctx;
@@ -585,10 +638,25 @@ static azure_err_t az_page_blob_resize(void *ctx, const char *name,
     snprintf(size_header, sizeof(size_header),
              "x-ms-blob-content-length:%lld", (long long)new_size);
 
-    const char *extra[] = {
+    char lease_header[128];
+    const char *extra_with_lease[] = {
+        size_header,
+        lease_header,
+        NULL
+    };
+    const char *extra_no_lease[] = {
         size_header,
         NULL
     };
+
+    const char **extra;
+    if (lease_id && lease_id[0] != '\0') {
+        snprintf(lease_header, sizeof(lease_header),
+                 "x-ms-lease-id:%s", lease_id);
+        extra = extra_with_lease;
+    } else {
+        extra = extra_no_lease;
+    }
 
     return execute_with_retry(c, "PUT", name, "comp=properties",
                               extra, NULL, NULL, 0, NULL,
@@ -953,6 +1021,14 @@ azure_err_t azure_client_create(const azure_client_config_t *config,
     strncpy(c->account, account, sizeof(c->account) - 1);
     strncpy(c->container, container, sizeof(c->container) - 1);
 
+    /* Copy custom endpoint if provided (for Azurite support) */
+    const char *endpoint = config ? config->endpoint : NULL;
+    if (endpoint && *endpoint) {
+        strncpy(c->endpoint, endpoint, sizeof(c->endpoint) - 1);
+    } else {
+        c->endpoint[0] = '\0';  /* Empty = use default Azure endpoint */
+    }
+
     /* SAS preferred over Shared Key (per D9) */
     if (have_sas) {
         const char *tok = sas_token;
@@ -1026,4 +1102,171 @@ const azure_ops_t *azure_client_get_ops(void)
 void *azure_client_get_ctx(azure_client_t *client)
 {
     return (void *)client;
+}
+
+/*
+ * Create a container (idempotent).
+ * PUT /<container>?restype=container
+ * Returns OK on 201 (created) or 409 (already exists).
+ * This is a public API function (not part of azure_ops_t) used
+ * primarily during test setup.
+ */
+azure_err_t azure_container_create(azure_client_t *client,
+                                   azure_error_t *err)
+{
+    if (!client || !err) {
+        if (err) {
+            err->code = AZURE_ERR_INVALID_ARG;
+            snprintf(err->error_message, sizeof(err->error_message),
+                     "client and err must be non-NULL");
+        }
+        return AZURE_ERR_INVALID_ARG;
+    }
+
+    azure_error_init(err);
+
+    CURL *curl = (CURL *)client->curl_handle;
+    CURLcode res;
+
+    /* Build container URL (no blob name) */
+    char url[4096];
+    if (client->endpoint[0]) {
+        /* Custom endpoint (Azurite): endpoint/account/container?restype=container */
+        snprintf(url, sizeof(url), "%s/%s/%s?restype=container",
+                 client->endpoint, client->account, client->container);
+    } else {
+        /* Production Azure */
+        snprintf(url, sizeof(url),
+                 "https://%s.blob.core.windows.net/%s?restype=container",
+                 client->account, client->container);
+    }
+
+    /* Add SAS token if using SAS auth */
+    if (client->use_sas) {
+        size_t url_len = strlen(url);
+        snprintf(url + url_len, sizeof(url) - url_len, "&%s", client->sas_token);
+    }
+
+    /* Build x-ms-date and x-ms-version headers */
+    char date_buf[64];
+    azure_rfc1123_time(date_buf, sizeof(date_buf));
+
+    char date_header[128];
+    snprintf(date_header, sizeof(date_header), "x-ms-date:%s", date_buf);
+
+    char version_header[64];
+    snprintf(version_header, sizeof(version_header),
+             "x-ms-version:%s", AZURE_API_VERSION);
+
+    /* Shared Key auth signing (skip for SAS) */
+    char auth_header[512] = "";
+    if (!client->use_sas) {
+        /* Canonicalized resource for container creation */
+        char path[1024];
+        if (client->endpoint[0]) {
+            /* Azurite quirk: double account name */
+            snprintf(path, sizeof(path), "/%s/%s",
+                     client->account, client->container);
+        } else {
+            /* Production Azure */
+            snprintf(path, sizeof(path), "/%s", client->container);
+        }
+
+        const char *x_ms_headers[] = { date_header, version_header, NULL };
+
+        azure_err_t rc = azure_auth_sign_request(
+            client, "PUT", path, "restype=container",
+            "",  /* content_length = "" for zero-length */
+            "",  /* content_type */
+            "",  /* range */
+            x_ms_headers,
+            auth_header, sizeof(auth_header));
+        if (rc != AZURE_OK) {
+            err->code = rc;
+            snprintf(err->error_message, sizeof(err->error_message),
+                     "Failed to sign container create request");
+            return rc;
+        }
+    }
+
+    /* Execute the PUT request */
+    curl_easy_reset(curl);
+    curl_easy_setopt(curl, CURLOPT_URL, url);
+    curl_easy_setopt(curl, CURLOPT_CUSTOMREQUEST, "PUT");
+    curl_easy_setopt(curl, CURLOPT_UPLOAD, 0L);
+    curl_easy_setopt(curl, CURLOPT_POSTFIELDS, "");
+    curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, 0L);
+
+    /* Build headers */
+    struct curl_slist *headers = NULL;
+    char h_date[256];
+    snprintf(h_date, sizeof(h_date), "x-ms-date: %s", date_buf);
+    headers = curl_slist_append(headers, h_date);
+
+    char h_version[128];
+    snprintf(h_version, sizeof(h_version), "x-ms-version: %s", AZURE_API_VERSION);
+    headers = curl_slist_append(headers, h_version);
+
+    if (auth_header[0]) {
+        char h_auth[600];
+        snprintf(h_auth, sizeof(h_auth), "Authorization: %s", auth_header);
+        headers = curl_slist_append(headers, h_auth);
+    }
+
+    headers = curl_slist_append(headers, "Content-Length: 0");
+    headers = curl_slist_append(headers, "Content-Type:");
+
+    curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+
+    /* Response capture */
+    azure_buffer_t response_body;
+    azure_buffer_init(&response_body);
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, curl_write_cb);
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response_body);
+
+    azure_response_headers_t resp_headers;
+    memset(&resp_headers, 0, sizeof(resp_headers));
+    curl_easy_setopt(curl, CURLOPT_HEADERFUNCTION, curl_header_cb);
+    curl_easy_setopt(curl, CURLOPT_HEADERDATA, &resp_headers);
+
+    /* Execute */
+    res = curl_easy_perform(curl);
+    curl_slist_free_all(headers);
+
+    if (res != CURLE_OK) {
+        err->code = AZURE_ERR_NETWORK;
+        snprintf(err->error_message, sizeof(err->error_message),
+                 "curl_easy_perform() failed: %s", curl_easy_strerror(res));
+        azure_buffer_free(&response_body);
+        return AZURE_ERR_NETWORK;
+    }
+
+    long http_status = 0;
+    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_status);
+    err->http_status = (int)http_status;
+
+    /* 201 Created or 409 ContainerAlreadyExists are both success */
+    if (http_status == 201 || http_status == 409) {
+        azure_buffer_free(&response_body);
+        return AZURE_OK;
+    }
+
+    /* Error case: parse Azure error response */
+    if (response_body.size > 0) {
+        azure_parse_error_xml((const char *)response_body.data,
+                              response_body.size, err);
+    }
+    azure_buffer_free(&response_body);
+
+    err->code = azure_classify_http_error(http_status, resp_headers.error_code);
+    if (resp_headers.request_id[0]) {
+        strncpy(err->request_id, resp_headers.request_id,
+                sizeof(err->request_id) - 1);
+    }
+    if (!err->error_message[0]) {
+        snprintf(err->error_message, sizeof(err->error_message),
+                 "Container create failed with HTTP %ld", http_status);
+    }
+
+    return err->code;
 }

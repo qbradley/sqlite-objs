@@ -88,7 +88,7 @@ TEST(page_blob_write_basic) {
 
     uint8_t data[512];
     memset(data, 0xAB, sizeof(data));
-    azure_err_t rc = g_ops->page_blob_write(g_ctx, "test.db", 0, data, 512, &err);
+    azure_err_t rc = g_ops->page_blob_write(g_ctx, "test.db", 0, data, 512, NULL, &err);
     ASSERT_AZURE_OK(rc);
 
     const uint8_t *blob = mock_get_page_blob_data(g_ctx, "test.db");
@@ -103,7 +103,7 @@ TEST(page_blob_write_at_offset) {
 
     uint8_t data[512];
     memset(data, 0xCD, sizeof(data));
-    azure_err_t rc = g_ops->page_blob_write(g_ctx, "test.db", 1024, data, 512, &err);
+    azure_err_t rc = g_ops->page_blob_write(g_ctx, "test.db", 1024, data, 512, NULL, &err);
     ASSERT_AZURE_OK(rc);
 
     const uint8_t *blob = mock_get_page_blob_data(g_ctx, "test.db");
@@ -122,7 +122,7 @@ TEST(page_blob_write_unaligned_offset_fails) {
     g_ops->page_blob_create(g_ctx, "test.db", 4096, &err);
 
     uint8_t data[512];
-    azure_err_t rc = g_ops->page_blob_write(g_ctx, "test.db", 100, data, 512, &err);
+    azure_err_t rc = g_ops->page_blob_write(g_ctx, "test.db", 100, data, 512, NULL, &err);
     ASSERT_AZURE_ERR(rc, AZURE_ERR_ALIGNMENT);
 }
 
@@ -132,7 +132,7 @@ TEST(page_blob_write_unaligned_length_fails) {
     g_ops->page_blob_create(g_ctx, "test.db", 4096, &err);
 
     uint8_t data[100];
-    azure_err_t rc = g_ops->page_blob_write(g_ctx, "test.db", 0, data, 100, &err);
+    azure_err_t rc = g_ops->page_blob_write(g_ctx, "test.db", 0, data, 100, NULL, &err);
     ASSERT_AZURE_ERR(rc, AZURE_ERR_ALIGNMENT);
 }
 
@@ -140,7 +140,7 @@ TEST(page_blob_write_nonexistent_fails) {
     setup();
     azure_error_t err;
     uint8_t data[512];
-    azure_err_t rc = g_ops->page_blob_write(g_ctx, "ghost.db", 0, data, 512, &err);
+    azure_err_t rc = g_ops->page_blob_write(g_ctx, "ghost.db", 0, data, 512, NULL, &err);
     ASSERT_AZURE_ERR(rc, AZURE_ERR_NOT_FOUND);
 }
 
@@ -152,7 +152,7 @@ TEST(page_blob_write_grows_blob) {
     uint8_t data[512];
     memset(data, 0xEF, sizeof(data));
     /* Write at offset 512 — past current size */
-    azure_err_t rc = g_ops->page_blob_write(g_ctx, "test.db", 512, data, 512, &err);
+    azure_err_t rc = g_ops->page_blob_write(g_ctx, "test.db", 512, data, 512, NULL, &err);
     ASSERT_AZURE_OK(rc);
     ASSERT_EQ(mock_get_page_blob_size(g_ctx, "test.db"), 1024);
 }
@@ -168,7 +168,7 @@ TEST(page_blob_write_multiple_pages) {
         memset(data, (uint8_t)(i + 1), sizeof(data));
         azure_err_t rc = g_ops->page_blob_write(g_ctx, "test.db",
                                                   (int64_t)(i * 512),
-                                                  data, 512, &err);
+                                                  data, 512, NULL, &err);
         ASSERT_AZURE_OK(rc);
     }
 
@@ -187,8 +187,8 @@ TEST(page_blob_write_overwrite) {
     memset(data1, 0xAA, sizeof(data1));
     memset(data2, 0xBB, sizeof(data2));
 
-    g_ops->page_blob_write(g_ctx, "test.db", 0, data1, 512, &err);
-    g_ops->page_blob_write(g_ctx, "test.db", 0, data2, 512, &err);
+    g_ops->page_blob_write(g_ctx, "test.db", 0, data1, 512, NULL, &err);
+    g_ops->page_blob_write(g_ctx, "test.db", 0, data2, 512, NULL, &err);
 
     const uint8_t *blob = mock_get_page_blob_data(g_ctx, "test.db");
     ASSERT_MEM_EQ(blob, data2, 512);
@@ -201,7 +201,7 @@ TEST(page_blob_read_basic) {
 
     uint8_t data[512];
     memset(data, 0xDE, sizeof(data));
-    g_ops->page_blob_write(g_ctx, "test.db", 0, data, 512, &err);
+    g_ops->page_blob_write(g_ctx, "test.db", 0, data, 512, NULL, &err);
 
     azure_buffer_t buf;
     azure_buffer_init(&buf);
@@ -219,7 +219,7 @@ TEST(page_blob_read_at_offset) {
 
     uint8_t data[512];
     memset(data, 0xFE, sizeof(data));
-    g_ops->page_blob_write(g_ctx, "test.db", 1024, data, 512, &err);
+    g_ops->page_blob_write(g_ctx, "test.db", 1024, data, 512, NULL, &err);
 
     azure_buffer_t buf;
     azure_buffer_init(&buf);
@@ -246,7 +246,7 @@ TEST(page_blob_read_past_eof_zero_fills) {
 
     uint8_t data[512];
     memset(data, 0xAA, sizeof(data));
-    g_ops->page_blob_write(g_ctx, "test.db", 0, data, 512, &err);
+    g_ops->page_blob_write(g_ctx, "test.db", 0, data, 512, NULL, &err);
 
     /* Read 1024 bytes but blob is only 512 */
     azure_buffer_t buf;
@@ -285,7 +285,7 @@ TEST(page_blob_write_then_read_roundtrip) {
         uint8_t data[512];
         memset(data, (uint8_t)(0x10 + i), sizeof(data));
         g_ops->page_blob_write(g_ctx, "test.db", (int64_t)(i * 512),
-                               data, 512, &err);
+                               data, 512, NULL, &err);
     }
 
     /* Read back and verify each page */
@@ -307,7 +307,7 @@ TEST(page_blob_resize_grow) {
     setup();
     azure_error_t err;
     g_ops->page_blob_create(g_ctx, "test.db", 4096, &err);
-    azure_err_t rc = g_ops->page_blob_resize(g_ctx, "test.db", 8192, &err);
+    azure_err_t rc = g_ops->page_blob_resize(g_ctx, "test.db", 8192, NULL, &err);
     ASSERT_AZURE_OK(rc);
     ASSERT_EQ(mock_get_page_blob_size(g_ctx, "test.db"), 8192);
 }
@@ -316,7 +316,7 @@ TEST(page_blob_resize_shrink) {
     setup();
     azure_error_t err;
     g_ops->page_blob_create(g_ctx, "test.db", 8192, &err);
-    azure_err_t rc = g_ops->page_blob_resize(g_ctx, "test.db", 4096, &err);
+    azure_err_t rc = g_ops->page_blob_resize(g_ctx, "test.db", 4096, NULL, &err);
     ASSERT_AZURE_OK(rc);
     ASSERT_EQ(mock_get_page_blob_size(g_ctx, "test.db"), 4096);
 }
@@ -325,14 +325,14 @@ TEST(page_blob_resize_unaligned_fails) {
     setup();
     azure_error_t err;
     g_ops->page_blob_create(g_ctx, "test.db", 4096, &err);
-    azure_err_t rc = g_ops->page_blob_resize(g_ctx, "test.db", 5000, &err);
+    azure_err_t rc = g_ops->page_blob_resize(g_ctx, "test.db", 5000, NULL, &err);
     ASSERT_AZURE_ERR(rc, AZURE_ERR_ALIGNMENT);
 }
 
 TEST(page_blob_resize_nonexistent_fails) {
     setup();
     azure_error_t err;
-    azure_err_t rc = g_ops->page_blob_resize(g_ctx, "ghost.db", 4096, &err);
+    azure_err_t rc = g_ops->page_blob_resize(g_ctx, "ghost.db", 4096, NULL, &err);
     ASSERT_AZURE_ERR(rc, AZURE_ERR_NOT_FOUND);
 }
 
@@ -343,9 +343,9 @@ TEST(page_blob_resize_preserves_data) {
 
     uint8_t data[512];
     memset(data, 0xAB, sizeof(data));
-    g_ops->page_blob_write(g_ctx, "test.db", 0, data, 512, &err);
+    g_ops->page_blob_write(g_ctx, "test.db", 0, data, 512, NULL, &err);
 
-    g_ops->page_blob_resize(g_ctx, "test.db", 8192, &err);
+    g_ops->page_blob_resize(g_ctx, "test.db", 8192, NULL, &err);
 
     azure_buffer_t buf;
     azure_buffer_init(&buf);
@@ -358,7 +358,7 @@ TEST(page_blob_resize_to_zero) {
     setup();
     azure_error_t err;
     g_ops->page_blob_create(g_ctx, "test.db", 4096, &err);
-    azure_err_t rc = g_ops->page_blob_resize(g_ctx, "test.db", 0, &err);
+    azure_err_t rc = g_ops->page_blob_resize(g_ctx, "test.db", 0, NULL, &err);
     ASSERT_AZURE_OK(rc);
     ASSERT_EQ(mock_get_page_blob_size(g_ctx, "test.db"), 0);
 }
@@ -781,7 +781,7 @@ TEST(fail_at_specific_call) {
     ASSERT_AZURE_OK(rc1);
 
     uint8_t data[512];
-    azure_err_t rc2 = g_ops->page_blob_write(g_ctx, "test.db", 0, data, 512, &err);
+    azure_err_t rc2 = g_ops->page_blob_write(g_ctx, "test.db", 0, data, 512, NULL, &err);
     ASSERT_AZURE_ERR(rc2, AZURE_ERR_NETWORK);
 }
 
@@ -808,10 +808,10 @@ TEST(fail_operation_always) {
     g_ops->page_blob_create(g_ctx, "test.db", 4096, &err);
 
     uint8_t data[512];
-    azure_err_t rc1 = g_ops->page_blob_write(g_ctx, "test.db", 0, data, 512, &err);
+    azure_err_t rc1 = g_ops->page_blob_write(g_ctx, "test.db", 0, data, 512, NULL, &err);
     ASSERT_AZURE_ERR(rc1, AZURE_ERR_NETWORK);
 
-    azure_err_t rc2 = g_ops->page_blob_write(g_ctx, "test.db", 0, data, 512, &err);
+    azure_err_t rc2 = g_ops->page_blob_write(g_ctx, "test.db", 0, data, 512, NULL, &err);
     ASSERT_AZURE_ERR(rc2, AZURE_ERR_NETWORK);
 }
 
@@ -933,9 +933,9 @@ TEST(call_count_per_operation) {
     g_ops->page_blob_create(g_ctx, "test.db", 4096, &err);
 
     uint8_t data[512] = {0};
-    g_ops->page_blob_write(g_ctx, "test.db", 0, data, 512, &err);
-    g_ops->page_blob_write(g_ctx, "test.db", 512, data, 512, &err);
-    g_ops->page_blob_write(g_ctx, "test.db", 1024, data, 512, &err);
+    g_ops->page_blob_write(g_ctx, "test.db", 0, data, 512, NULL, &err);
+    g_ops->page_blob_write(g_ctx, "test.db", 512, data, 512, NULL, &err);
+    g_ops->page_blob_write(g_ctx, "test.db", 1024, data, 512, NULL, &err);
 
     ASSERT_EQ(mock_get_call_count(g_ctx, "page_blob_create"), 1);
     ASSERT_EQ(mock_get_call_count(g_ctx, "page_blob_write"), 3);
@@ -1033,7 +1033,7 @@ TEST(buffer_reuse) {
 
     uint8_t data[512];
     memset(data, 0xAA, sizeof(data));
-    g_ops->page_blob_write(g_ctx, "test.db", 0, data, 512, &err);
+    g_ops->page_blob_write(g_ctx, "test.db", 0, data, 512, NULL, &err);
 
     /* Reuse the same buffer for multiple reads */
     azure_buffer_t buf;
@@ -1043,7 +1043,7 @@ TEST(buffer_reuse) {
     ASSERT_EQ(buf.size, 512);
 
     memset(data, 0xBB, sizeof(data));
-    g_ops->page_blob_write(g_ctx, "test.db", 512, data, 512, &err);
+    g_ops->page_blob_write(g_ctx, "test.db", 512, data, 512, NULL, &err);
 
     g_ops->page_blob_read(g_ctx, "test.db", 512, 512, &buf, &err);
     ASSERT_EQ(buf.size, 512);
@@ -1123,7 +1123,7 @@ TEST(page_ops_on_block_blob_fails) {
     /* Try page blob write on block blob */
     uint8_t page_data[512] = {0};
     azure_err_t rc = g_ops->page_blob_write(g_ctx, "test", 0,
-                                              page_data, 512, &err);
+                                              page_data, 512, NULL, &err);
     ASSERT_AZURE_ERR(rc, AZURE_ERR_NOT_FOUND);
 }
 
@@ -1164,8 +1164,8 @@ TEST(multiple_blobs_independent) {
     memset(data_a, 0xAA, sizeof(data_a));
     memset(data_b, 0xBB, sizeof(data_b));
 
-    g_ops->page_blob_write(g_ctx, "a.db", 0, data_a, 512, &err);
-    g_ops->page_blob_write(g_ctx, "b.db", 0, data_b, 512, &err);
+    g_ops->page_blob_write(g_ctx, "a.db", 0, data_a, 512, NULL, &err);
+    g_ops->page_blob_write(g_ctx, "b.db", 0, data_b, 512, NULL, &err);
 
     const uint8_t *a = mock_get_page_blob_data(g_ctx, "a.db");
     const uint8_t *b = mock_get_page_blob_data(g_ctx, "b.db");
@@ -1231,7 +1231,7 @@ TEST(page_blob_write_4096_page_size) {
 
     uint8_t page[4096];
     memset(page, 0x42, sizeof(page));
-    azure_err_t rc = g_ops->page_blob_write(g_ctx, "test.db", 4096, page, 4096, &err);
+    azure_err_t rc = g_ops->page_blob_write(g_ctx, "test.db", 4096, page, 4096, NULL, &err);
     ASSERT_AZURE_OK(rc);
 
     azure_buffer_t buf;
@@ -1248,7 +1248,7 @@ TEST(delete_and_recreate) {
 
     uint8_t data[512];
     memset(data, 0xFF, sizeof(data));
-    g_ops->page_blob_write(g_ctx, "test.db", 0, data, 512, &err);
+    g_ops->page_blob_write(g_ctx, "test.db", 0, data, 512, NULL, &err);
 
     g_ops->blob_delete(g_ctx, "test.db", &err);
     g_ops->page_blob_create(g_ctx, "test.db", 4096, &err);
@@ -1288,7 +1288,7 @@ TEST(blob_properties_after_write) {
     g_ops->page_blob_create(g_ctx, "test.db", 4096, &err);
 
     uint8_t data[512] = {0};
-    g_ops->page_blob_write(g_ctx, "test.db", 0, data, 512, &err);
+    g_ops->page_blob_write(g_ctx, "test.db", 0, data, 512, NULL, &err);
 
     int64_t size;
     char ls[32], lst[32];

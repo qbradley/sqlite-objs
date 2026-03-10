@@ -136,19 +136,23 @@ struct azure_ops {
                                     int64_t size, azure_error_t *err);
 
     /* Write data to a page blob at the given offset.
-    ** offset and len must be 512-byte aligned. */
+    ** offset and len must be 512-byte aligned.
+    ** lease_id may be NULL if no lease is held. */
     azure_err_t (*page_blob_write)(void *ctx, const char *name,
                                    int64_t offset, const uint8_t *data,
-                                   size_t len, azure_error_t *err);
+                                   size_t len, const char *lease_id,
+                                   azure_error_t *err);
 
     /* Read data from a page blob at the given offset. */
     azure_err_t (*page_blob_read)(void *ctx, const char *name,
                                   int64_t offset, size_t len,
                                   azure_buffer_t *out, azure_error_t *err);
 
-    /* Resize a page blob (new_size must be 512-byte aligned). */
+    /* Resize a page blob (new_size must be 512-byte aligned).
+    ** lease_id may be NULL if no lease is held. */
     azure_err_t (*page_blob_resize)(void *ctx, const char *name,
-                                    int64_t new_size, azure_error_t *err);
+                                    int64_t new_size, const char *lease_id,
+                                    azure_error_t *err);
 
     /* ---- Block Blob Operations (for MAIN_JOURNAL) ---- */
 
@@ -225,6 +229,7 @@ typedef struct azure_client_config {
     const char *container;      /* Container name */
     const char *sas_token;      /* SAS token (preferred), or NULL */
     const char *account_key;    /* Shared Key (fallback), or NULL */
+    const char *endpoint;       /* Optional custom endpoint (for Azurite), or NULL for Azure */
 } azure_client_config_t;
 
 /*
@@ -251,6 +256,14 @@ const azure_ops_t *azure_client_get_ops(void);
 ** This is the azure_client_t* cast to void*.
 */
 void *azure_client_get_ctx(azure_client_t *client);
+
+/*
+** Create a container (idempotent).
+** Returns AZURE_OK if the container was created (201) or already exists (409).
+** This is typically called once during test setup.
+*/
+azure_err_t azure_container_create(azure_client_t *client,
+                                   azure_error_t *err);
 
 #ifdef __cplusplus
 }

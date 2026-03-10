@@ -27,8 +27,9 @@ static azure_err_t stub_page_blob_create(void *ctx, const char *name,
 
 static azure_err_t stub_page_blob_write(void *ctx, const char *name,
                                          int64_t offset, const uint8_t *data,
-                                         size_t len, azure_error_t *err) {
-    (void)ctx; (void)name; (void)offset; (void)data; (void)len;
+                                         size_t len, const char *lease_id,
+                                         azure_error_t *err) {
+    (void)ctx; (void)name; (void)offset; (void)data; (void)len; (void)lease_id;
     if (err) {
         err->code = AZURE_ERR_UNKNOWN;
         snprintf(err->error_message, sizeof(err->error_message),
@@ -50,8 +51,10 @@ static azure_err_t stub_page_blob_read(void *ctx, const char *name,
 }
 
 static azure_err_t stub_page_blob_resize(void *ctx, const char *name,
-                                          int64_t new_size, azure_error_t *err) {
-    (void)ctx; (void)name; (void)new_size;
+                                          int64_t new_size,
+                                          const char *lease_id,
+                                          azure_error_t *err) {
+    (void)ctx; (void)name; (void)new_size; (void)lease_id;
     if (err) {
         err->code = AZURE_ERR_UNKNOWN;
         snprintf(err->error_message, sizeof(err->error_message),
