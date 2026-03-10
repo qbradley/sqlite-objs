@@ -85,3 +85,45 @@
 - **Frodo will deliver** refactored azure_client exporting these as vtable members. PoC code in `research/azure-poc/` shows the patterns.
 - **Samwise will provide** mock_azure_ops.c for layer 1 unit tests.
 - **See design-review.md Appendix A** for full azure_ops_t contract definition.
+
+### MVP 1 VFS Implementation Complete (2026-03-10)
+
+**Files created:**
+- `src/azqlite.h` — Public API header with `azqlite_vfs_register()` and `azqlite_vfs_register_with_config()`, `azqlite_config_t` with test-seam (ops/ops_ctx override)
+- `src/azure_client.h` — Internal header defining `azure_ops_t` vtable (13 ops), `azure_err_t` enum, `azure_error_t`, `azure_buffer_t`, `azure_client_t` lifecycle functions
+- `src/azqlite_vfs.c` — Complete VFS: azqliteFile struct, io_methods v1 (12 methods), VFS methods (xOpen/xDelete/xAccess/xFullPathname + delegated), registration, dirty bitmap, lease management
+- `src/azure_client_stub.c` — Stub ops returning AZURE_ERR_UNKNOWN for all 13 operations. Frodo replaces this.
+- `src/azqlite_shell.c` — CLI wrapper: renames shell.c main to shell_main via #define, registers VFS as default, forwards to shell_main
+- `Makefile` — Targets: all (libazqlite.a + azqlite-shell), test-unit, test-integration, test, clean, amalgamation (stub)
+
+**Key patterns:**
+- azqliteFile struct embeds `const sqlite3_io_methods *pMethod` as first member (sqlite3_file subclass contract)
+- Dirty page bitmap: 1 bit per page, `dirtyMarkPage()` tracks writes, `dirtyClearAll()` after sync
+- Buffer grows geometrically via `bufferEnsure()` / `jrnlBufferEnsure()`
+- Journal files (MAIN_JOURNAL) use separate aJrnlData buffer, uploaded as block blob on xSync
+- Lease: acquire at xLock(RESERVED+), renew inline at xSync and xWrite (>15s), release at xUnlock(≤SHARED)
+- `azureErrToSqlite()` maps CONFLICT/THROTTLED→SQLITE_BUSY, all else→SQLITE_IOERR variants
+- xOpen routes by flag bits: MAIN_DB/MAIN_JOURNAL→Azure, everything else→default VFS xOpen
+- szOsFile = max(sizeof(azqliteFile), defaultVfs->szOsFile) to handle delegation
+- xOpen sets pMethod=NULL initially (prevents xClose on failure), sets it last on success
+- Page size detected from SQLite header bytes 16-17 on existing databases
+- xFullPathname strips leading slashes, rejects ".." paths
+- xFileControl intercepts PRAGMA journal_mode=WAL → returns "delete"
+- xDeviceCharacteristics: ATOMIC512 | SAFE_APPEND
+- xSectorSize: 512 (Azure page blob alignment)
+- Shell uses #define main shell_main trick to include shell.c as a translation unit
+
+**Build system:**
+- `-w` flag on sqlite3.c and shell.c compilation (suppress upstream warnings)
+- Platform detection: Darwin omits -ldl, Linux includes it
+- Static library: build/libazqlite.a containing sqlite3.o + azqlite_vfs.o + azure_client_stub.o
+
+### Integration Fix — Headers & Build Reconciliation (2026-03-10)
+
+**Problem:** Three agents built in parallel with divergent type definitions. Headers had conflicting azure_err_t enums, different struct layouts, different buffer field names. Makefile linked tests against the stub instead of the mock.
+
+**Header reconciliation:** `azure_client.h` is now the single canonical header. Merged azure_err_t as superset of all codes. Added `#define AZURE_ERR_THROTTLE AZURE_ERR_THROTTLED` alias. Unified azure_buffer_t to `data`/`size`/`capacity`. Added `error_code[128]` to azure_error_t. `azure_client_impl.h` and `mock_azure_ops.h` now include `azure_client.h` instead of duplicating types. Production `azure_client_create` updated to match canonical config-struct signature.
+
+**Build:** Test binary links `sqlite3.o + azqlite_vfs.o + azure_client_stub.o + mock_azure_ops.o`. Added `make all-production` target. Fixed `##__VA_ARGS__` to C11-compliant split fprintf. Added `azqlite_vfs_register_with_ops()` convenience wrapper. Fixed 2 test logic bugs (invalid blob content, fast-test lease timing).
+
+**Result:** `make all` + `make test-unit` (148/148) both pass clean.

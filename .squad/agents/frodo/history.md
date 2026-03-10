@@ -56,3 +56,17 @@
 - **How it's used:** Aragorn's VFS layer receives a pointer to azure_ops_t at startup, calls functions through it. For production: real Azure. For tests: Samwise's mock.
 - **PoC location:** `research/azure-poc/` already has the basic patterns. Refactor into `src/azure_client.c` with function pointers.
 - **See design-review.md Appendix A** for full contract definition and usage patterns.
+
+### Production Azure Client Layer (2026-03-10)
+
+- **Files created:** `src/azure_client.c`, `src/azure_auth.c`, `src/azure_error.c`, `src/azure_client_impl.h`
+- **Architecture:** All 13 azure_ops_t vtable functions implemented as static `az_*` functions, exposed via `azure_client_get_ops()` returning a const static vtable pointer. Every HTTP call goes through `execute_with_retry` → `execute_single`, so retry is guaranteed for all operations.
+- **Retry-After support added:** Response header `Retry-After` (seconds format) is now parsed and used to override exponential backoff. This was a TODO from the PoC.
+- **AZURE_ERR_THROTTLED added:** New error code separating 429 (→ SQLITE_BUSY) from 5xx transient errors (→ SQLITE_IOERR). This is critical for Decision 8 error mapping.
+- **Client lifecycle changed:** `azure_client_create(account, container, sas_token, shared_key)` takes explicit params (PoC read from env vars). VFS layer handles env var reading. SAS token leading `?` is auto-stripped.
+- **Connection reuse:** Single curl handle per client with `curl_easy_reset()` between requests. TCP keep-alive enabled (60s idle, 30s interval). This avoids TLS handshake overhead on sequential operations.
+- **Key security:** `azure_client_destroy()` scrubs key material (key_raw, key_b64, sas_token) with memset before free.
+- **blob_exists uses blob_get_properties:** Lightweight HEAD request; 404 mapped to exists=0 (not an error). Error struct cleared on "not found" so VFS sees clean AZURE_OK.
+- **curl timeout handling:** CURLE_OPERATION_TIMEDOUT and CURLE_COULDNT_CONNECT classified as AZURE_ERR_TRANSIENT (retryable), not AZURE_ERR_CURL (fatal).
+- **Internal header `azure_client_impl.h`:** Contains all public types (azure_ops_t, azure_err_t, azure_error_t, azure_buffer_t) temporarily. When Aragorn creates `azure_client.h`, public types move there. Reconciliation should be straightforward — types follow Appendix A exactly.
+- **Compiles clean** with `-Wall -Wextra -pedantic -std=c11`. Links against `-lcurl -lssl -lcrypto`.

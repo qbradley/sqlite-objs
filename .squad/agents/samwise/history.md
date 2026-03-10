@@ -17,6 +17,24 @@
 
 <!-- Append new learnings below. Each entry is something lasting about the project. -->
 
+### Layer 1 Test Infrastructure Delivered (2026-03-10)
+
+- **124 tests, all passing.** Zero external dependencies — pure C, no test frameworks needed.
+- **Files created:**
+  - `test/test_harness.h` — Minimal test framework (TEST, ASSERT_*, RUN_TEST, color output, summary). Uses setjmp/longjmp for assertion failure recovery.
+  - `test/mock_azure_ops.h` — Canonical `azure_ops_t` interface definition + mock API. Also defines `azure_err_t`, `azure_error_t`, `azure_buffer_t`. This is the interface contract until Frodo delivers `azure_client.h`.
+  - `test/mock_azure_ops.c` — Full mock implementation: page blobs (512-byte alignment enforced), block blobs (key-value), lease state machine (AVAILABLE→LEASED→BREAKING), failure injection (by call number or operation name), call counting, state inspection.
+  - `test/test_vfs.c` — 89 active tests (mock infrastructure) + 28 VFS integration tests behind `ENABLE_VFS_INTEGRATION` flag (waiting for Aragorn's VFS).
+  - `test/test_azure_client.c` — 35 active tests + 9 auth tests behind `ENABLE_AZURE_CLIENT_TESTS` flag (waiting for Frodo's client).
+  - `test/test_main.c` — Test runner. Includes test files directly (shared static counters pattern).
+- **Build command:** `cc -o test_runner test/test_main.c test/mock_azure_ops.c sqlite-autoconf-3520000/sqlite3.c -I sqlite-autoconf-3520000 -I test -lpthread -ldl -lm`
+- **Key patterns:**
+  - Test files use `#include "test_file.c"` in test_main.c (not separate compilation) to share test_harness.h statics.
+  - VFS integration tests gated behind `ENABLE_VFS_INTEGRATION` — define it when linking with azqlite_vfs.o.
+  - Azure client tests gated behind `ENABLE_AZURE_CLIENT_TESTS` — define it when linking with azure_client.o.
+  - mock_azure_ops.h IS the authoritative interface definition until reconciliation with azure_client.h.
+- **Lease state machine:** AVAILABLE → LEASED (on acquire) → BREAKING (on break with period > 0) → AVAILABLE. Immediate break (period=0) goes straight to AVAILABLE. Acquire during BREAKING returns CONFLICT.
+
 ### Testing Strategy Research (2026-03-10)
 
 - **Four-layer test pyramid recommended:** (1) In-process C mocks via `azure_ops_t` vtable, (2) Azurite integration tests, (3) Toxiproxy fault injection, (4) Real Azure validation in CI.
