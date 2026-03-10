@@ -46,3 +46,22 @@
 - **Source layout:** `src/` (azqlite_vfs.c, azure_client.c/.h, azure_auth.c, azure_error.c, azqlite.h), `test/` (test_main.c, test_vfs.c, mock_azure_ops.c, test_integration.c).
 - **Top risks:** (1) Lease expiry during long transactions, (2) Partial sync failure — both mitigated by journal-first ordering and inline lease renewal.
 - **Decisions written to:** `.squad/decisions.md` — all 11 decisions (D1-D11) now approved and merged from inbox.
+
+### MVP 1 Code Review — Reviewer Gate (2026-03-10)
+
+- **Full review at `research/code-review.md`.** Reviewed all 7 source files against D1–D11.
+- **Overall verdict: APPROVE WITH CONDITIONS** — 2 critical issues must fix before demo, 5 important issues for follow-up.
+- **C1 (CRITICAL): Device characteristics in `azqlite_vfs.c` claim ATOMIC512 + SAFE_APPEND.** Design spec (D4) says NOT ATOMIC. ATOMIC512 tells SQLite it can skip journal entries for 512-byte writes, which is dangerous — our multi-page xSync is not atomic. Must change to `SEQUENTIAL | POWERSAFE_OVERWRITE | SUBPAGE_READ`.
+- **C2 (CRITICAL): URL construction in `azure_client.c` uses unbounded `strcat` on a 2048-byte stack buffer.** SAS tokens + long paths can overflow. Must use snprintf with bounds checking.
+- **Everything else is architecturally sound.** The azure_ops_t vtable is correctly implemented (all 13 operations, signatures match Appendix A). Lease-based locking has no race conditions. Journal workflow is correct. Error mapping follows D8. Both auth paths work.
+- **Key learning:** ATOMIC in SQLite device characteristics is a loaded term — it's about whether the pager can skip journal entries, not about whether individual writes are reliable. Always cross-check io capabilities against pager behavior, not just the underlying storage semantics.
+
+### Agent-11: Code Review Complete (2026-03-10 — 07:43:07Z)
+
+Completed comprehensive design review (D1-D11). Verdict: **APPROVE WITH CONDITIONS**.
+
+**Blockers (must fix before demo):**
+- C1: Device flags (Aragorn) — change `ATOMIC512|SAFE_APPEND` to `SEQUENTIAL|POWERSAFE_OVERWRITE|SUBPAGE_READ`
+- C2: URL buffer (Frodo) — replace `strcat` with bounds-checked `snprintf`
+
+**Status:** SUCCESS. Awaiting C1/C2 fixes. Code review re-check not required — fixes are mechanical.

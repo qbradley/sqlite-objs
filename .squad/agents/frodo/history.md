@@ -70,3 +70,49 @@
 - **curl timeout handling:** CURLE_OPERATION_TIMEDOUT and CURLE_COULDNT_CONNECT classified as AZURE_ERR_TRANSIENT (retryable), not AZURE_ERR_CURL (fatal).
 - **Internal header `azure_client_impl.h`:** Contains all public types (azure_ops_t, azure_err_t, azure_error_t, azure_buffer_t) temporarily. When Aragorn creates `azure_client.h`, public types move there. Reconciliation should be straightforward — types follow Appendix A exactly.
 - **Compiles clean** with `-Wall -Wextra -pedantic -std=c11`. Links against `-lcurl -lssl -lcrypto`.
+
+### Production Build System — pkg-config Integration (2026-03-10)
+
+- **Problem:** `make all-production` failed on macOS because OpenSSL headers weren't found. Homebrew installs OpenSSL in non-standard paths (`/opt/homebrew/opt/openssl@3`), not `/usr/local`.
+- **Solution:** Refactored Makefile to use pkg-config for OpenSSL and libcurl with graceful fallbacks:
+  - `OPENSSL_CFLAGS := $(shell pkg-config --cflags openssl 2>/dev/null || echo "")`
+  - `OPENSSL_LDFLAGS := $(shell pkg-config --libs openssl 2>/dev/null || echo "-lssl -lcrypto")`
+  - `CURL_CFLAGS` and `CURL_LDFLAGS` similarly
+  - New `CFLAGS_PROD` and `LDFLAGS_PROD` variables combine base flags with pkg-config results
+- **Makefile structure:** Production object files (`azure_client.o`, `azure_auth.o`, `azure_error.o`) now use `CFLAGS_PROD`. The `all-production` target uses `CFLAGS_PROD` and `LDFLAGS_PROD`. Stub build (`make all`) remains unchanged — no OpenSSL/curl dependency.
+- **Portability:** Works on macOS (Homebrew), Linux (system packages), and any environment where pkg-config is available. Falls back to hardcoded flags if pkg-config is missing.
+- **Format warning fixed:** `azure_client.c:439` had `%ld` for `err->http_status` (int). Changed to `%d`.
+- **Error enum completeness:** Added missing cases to `azure_err_str()` switch: `AZURE_ERR_LEASE_EXPIRED`, `AZURE_ERR_IO`, `AZURE_ERR_TIMEOUT`, `AZURE_ERR_ALIGNMENT`. Eliminated compiler warnings.
+- **Compatibility alias cleanup:** Removed duplicate switch cases caused by `#define AZURE_ERR_OPENSSL AZURE_ERR_AUTH` etc. The `azure_err_str` function now uses only canonical error codes from `azure_client.h`.
+- **Build verification:** Both `make all` (stub) and `make all-production` compile cleanly with zero errors. All 148 unit tests pass.
+
+### Demo Script for Azure Integration (2026-03-10)
+
+- **Created:** `demo/azure-demo.sh` — executable bash script demonstrating azqlite with real Azure Blob Storage.
+- **Functionality:**
+  1. Validates environment variables (AZURE_STORAGE_ACCOUNT, AZURE_STORAGE_CONTAINER, AZURE_STORAGE_SAS or AZURE_STORAGE_KEY)
+  2. Builds `azqlite-shell` with `make all-production`
+  3. Runs a SQLite session that creates a table, inserts rows, queries, and updates
+  4. Displays results and cleanup instructions
+- **Documentation:** `demo/README.md` provides setup instructions, prerequisites (libcurl/OpenSSL installation), troubleshooting guide, and explanation of what gets created in Azure.
+- **Configuration flow confirmed:** `azqlite_shell.c` reads env vars in `main()` and passes them to `azqlite_vfs_register(1)`. The VFS internally calls `azqlite_vfs_register_with_config()` which creates an `azure_client_t` with the credentials. No changes needed to shell — it already works correctly.
+- **Ready to test:** Script is executable, production build works, and all prerequisites are documented. Waiting for real Azure credentials to verify end-to-end.
+
+### Agent-10: Production Build & Demo (2026-03-10 — 07:43:07Z)
+
+Completed orchestration summary:
+- ✅ `Makefile` refactored with pkg-config integration (D12)
+- ✅ Format specifiers fixed in `azure_client.c` and `azure_error.c`
+- ✅ Demo resources created (`demo/azure-demo.sh`, `demo/README.md`)
+- ✅ All 148 unit tests passing
+- ✅ Production build verified on macOS
+
+**Status:** SUCCESS. Next: Await C2 review from Gandalf (URL buffer fix complete); watch for auth investigation results (Agent-13).
+
+### Agent-13: Shared Key Auth Investigation (2026-03-10 — in progress)
+
+**Issue:** Layer 2 integration tests (Samwise) discovered Shared Key auth fails with Azurite on blob modifications (403 Forbidden after first PUT). Needs investigation to determine if root cause is Azurite validator behavior or client implementation.
+
+**Impact:** Blocks full Layer 2 validation and production auth path. Workaround: use SAS tokens for testing.
+
+**Status:** IN PROGRESS. Research phase started.

@@ -127,3 +127,23 @@
 **Build:** Test binary links `sqlite3.o + azqlite_vfs.o + azure_client_stub.o + mock_azure_ops.o`. Added `make all-production` target. Fixed `##__VA_ARGS__` to C11-compliant split fprintf. Added `azqlite_vfs_register_with_ops()` convenience wrapper. Fixed 2 test logic bugs (invalid blob content, fast-test lease timing).
 
 **Result:** `make all` + `make test-unit` (148/148) both pass clean.
+
+### Code Review Blockers — Pending Fixes (2026-03-10)
+
+Gandalf's review identified two critical issues (C1, C2) that must be fixed before demo:
+
+**C1 (MY RESPONSIBILITY): Device Characteristics Flag Error (azqlite_vfs.c:693)**
+- **Current:** Claims `SQLITE_IOCAP_ATOMIC512 | SQLITE_IOCAP_SAFE_APPEND`
+- **Issue:** ATOMIC512 tells SQLite it can skip journal entries for 512-byte writes. Our multi-page xSync is NOT atomic — dangerous data corruption risk.
+- **Fix Required:** Change to `SQLITE_IOCAP_SEQUENTIAL | SQLITE_IOCAP_POWERSAFE_OVERWRITE | SQLITE_IOCAP_SUBPAGE_READ`
+- **Status:** PENDING. Frodo fixing URL buffer overflow (C2) first; Aragorn (me) to tackle this next.
+
+**C2 (FRODO'S RESPONSIBILITY):** URL Buffer Overflow (azure_client.c:173–187)
+- **Current:** Uses unbounded `strcat` on 2048-byte stack buffer with SAS tokens
+- **Issue:** Long tokens + long paths can overflow
+- **Fix Required:** Replace with bounds-checked `snprintf` (4KB buffer recommended)
+- **Status:** IN PROGRESS (Frodo Agent-10 completed production build with pkg-config; C2 fix included)
+
+**Impact:** Code approved for demo once both fixes applied. No re-review needed — fixes are mechanical.
+
+

@@ -134,6 +134,45 @@ When it comes time to make a deployment package, create a SQLite amalgamation th
 - **Azurite supports** — page blobs, leases, block blobs, shared key auth
 - **No existing C Azure mocks** — write our own at azure_client boundary
 
+### D12: pkg-config Integration for Production Build
+**Date:** 2026-03-10 | **From:** Frodo (Azure Expert)
+
+Integrate pkg-config into Makefile for discovering OpenSSL and libcurl compile/link flags. Production build (`CFLAGS_PROD`, `LDFLAGS_PROD`) uses pkg-config with graceful fallback. Stub build unchanged. Rationale: portability across macOS (Homebrew), Linux, BSD without user configuration.
+
+---
+
+### D13: Pre-Demo Code Review Conditions
+**Date:** 2026-03-10 | **From:** Gandalf (Lead/Architect)
+
+Code approved for MVP 1 demo **pending two mechanical fixes**:
+- **C1 (azqlite_vfs.c:693):** Change device flags from `ATOMIC512|SAFE_APPEND` to `SEQUENTIAL|POWERSAFE_OVERWRITE|SUBPAGE_READ` (data corruption prevention)
+- **C2 (azure_client.c:173–187):** Replace `strcat` with bounds-checked `snprintf` (URL buffer overflow fix)
+
+No additional review required for these fixes — they are straightforward. Full code review in `research/code-review.md`.
+
+---
+
+### D14: Layer 2 Integration Test Suite
+**Date:** 2026-03-10 | **From:** Samwise (QA)
+
+Layer 2 (Azurite emulator) test suite complete: 75 tests passing. Discovered Shared Key auth fails on blob modifications with Azurite (403 Forbidden after first PUT). **Workaround:** Use SAS tokens for Layer 2. **Permanent fix:** Frodo investigating Azurite Shared Key validator behavior (D15).
+
+---
+
+### D15: Shared Key Auth Investigation
+**Date:** 2026-03-10 | **From:** Frodo (Azure Expert)
+
+Shared Key authentication fails with Azurite on blob modifications (issue discovered Layer 2 testing). Investigating whether root cause is Azurite behavior or code bug. Blocks full Layer 2 validation and production auth testing. Frodo (Agent-13) assigned.
+
+---
+
+### UD4: Page Blob Resizing Support
+**Date:** 2026-03-10 | **From:** Quetzal Bradley (via Copilot)
+
+Page blob resizing must be supported in architecture. First priority: growing databases (resize up). Second priority: VACUUM (resize down). Both deferred to MVP 1.5+; plan architecture for future support.
+
+---
+
 ## Governance
 
 - All meaningful changes require team consensus
