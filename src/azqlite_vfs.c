@@ -2,7 +2,7 @@
 ** azqlite_vfs.c — VFS implementation for Azure Blob Storage
 **
 ** This is the core of azqlite.  It implements sqlite3_vfs and
-** sqlite3_io_methods v1, routing MAIN_DB operations through Azure
+** sqlite3_io_methods v2, routing MAIN_DB operations through Azure
 ** Page Blobs, MAIN_JOURNAL through Block Blobs, and delegating
 ** all temporary/transient files to the platform's default VFS.
 **
@@ -80,6 +80,12 @@ static int azqliteFileControl(sqlite3_file*, int, void*);
 static int azqliteSectorSize(sqlite3_file*);
 static int azqliteDeviceCharacteristics(sqlite3_file*);
 
+/* io_methods v2 — shared memory stubs for WAL exclusive mode */
+static int azqliteShmMap(sqlite3_file*, int, int, int, void volatile**);
+static int azqliteShmLock(sqlite3_file*, int, int, int);
+static void azqliteShmBarrier(sqlite3_file*);
+static int azqliteShmUnmap(sqlite3_file*, int);
+
 /* ---------- Constants ---------- */
 
 #define AZQLITE_DEFAULT_PAGE_SIZE  4096
@@ -142,6 +148,13 @@ typedef struct azqliteFile {
     unsigned char *aJrnlData;           /* Journal buffer */
     sqlite3_int64 nJrnlData;           /* Journal logical size */
     sqlite3_int64 nJrnlAlloc;          /* Journal allocated size */
+
+    /* For WAL files (append blob) */
+    unsigned char *aWalData;            /* WAL buffer */
+    sqlite3_int64 nWalData;            /* WAL logical size */
+    sqlite3_int64 nWalAlloc;           /* WAL allocated size */
+    sqlite3_int64 nWalSynced;          /* Bytes already synced to Azure append blob */
+    int walNeedFullResync;              /* 1 if writes invalidated synced data */
 } azqliteFile;
 
 /*
@@ -163,10 +176,10 @@ struct azqliteVfsData {
     char journalBlobName[512];          /* Tracked journal blob name */
 };
 
-/* ---------- io_methods v1 ---------- */
+/* ---------- io_methods v2 ---------- */
 
 static const sqlite3_io_methods azqliteIoMethods = {
-    1,                              /* iVersion = 1 (no WAL/shm) */
+    2,                              /* iVersion = 2 (WAL via exclusive locking) */
     azqliteClose,
     azqliteRead,
     azqliteWrite,
@@ -179,8 +192,11 @@ static const sqlite3_io_methods azqliteIoMethods = {
     azqliteFileControl,
     azqliteSectorSize,
     azqliteDeviceCharacteristics,
-    /* v2+ methods (WAL) — omitted; iVersion=1 */
-    0, 0, 0, 0,
+    /* v2 methods (WAL shared memory stubs — exclusive mode only) */
+    azqliteShmMap,
+    azqliteShmLock,
+    azqliteShmBarrier,
+    azqliteShmUnmap,
     /* v3 methods (mmap) — omitted */
     0, 0
 };
@@ -284,6 +300,25 @@ static int jrnlBufferEnsure(azqliteFile *p, sqlite3_int64 newSize) {
     return SQLITE_OK;
 }
 
+/*
+** Ensure WAL buffer has room for at least newSize bytes.
+*/
+static int walBufferEnsure(azqliteFile *p, sqlite3_int64 newSize) {
+    if (newSize <= p->nWalAlloc) return SQLITE_OK;
+    sqlite3_int64 alloc = p->nWalAlloc;
+    if (alloc == 0) alloc = AZQLITE_INITIAL_ALLOC;
+    while (alloc < newSize) {
+        alloc *= 2;
+        if (alloc < 0) return SQLITE_NOMEM;
+    }
+    unsigned char *pNew = (unsigned char *)realloc(p->aWalData, (size_t)alloc);
+    if (!pNew) return SQLITE_NOMEM;
+    memset(pNew + p->nWalAlloc, 0, (size_t)(alloc - p->nWalAlloc));
+    p->aWalData = pNew;
+    p->nWalAlloc = alloc;
+    return SQLITE_OK;
+}
+
 
 /* ===================================================================
 ** Helper: lease management
@@ -361,8 +396,11 @@ static int azqliteClose(sqlite3_file *pFile) {
     azqliteFile *p = (azqliteFile *)pFile;
     int rc = SQLITE_OK;
 
-    /* Flush any remaining dirty pages before closing */
+    /* Flush any remaining dirty data before closing */
     if (p->nDirtyPages > 0 && p->ops && p->ops->page_blob_write) {
+        rc = azqliteSync(pFile, 0);
+    } else if (p->eFileType == SQLITE_OPEN_WAL &&
+               p->nWalData > p->nWalSynced && p->ops) {
         rc = azqliteSync(pFile, 0);
     }
 
@@ -380,6 +418,8 @@ static int azqliteClose(sqlite3_file *pFile) {
     p->aDirty = NULL;
     free(p->aJrnlData);
     p->aJrnlData = NULL;
+    free(p->aWalData);
+    p->aWalData = NULL;
     free(p->zBlobName);
     p->zBlobName = NULL;
 
@@ -399,7 +439,10 @@ static int azqliteRead(sqlite3_file *pFile, void *pBuf, int iAmt,
     unsigned char *src;
     sqlite3_int64 srcLen;
 
-    if (p->eFileType & SQLITE_OPEN_MAIN_JOURNAL) {
+    if (p->eFileType == SQLITE_OPEN_WAL) {
+        src = p->aWalData;
+        srcLen = p->nWalData;
+    } else if (p->eFileType & SQLITE_OPEN_MAIN_JOURNAL) {
         src = p->aJrnlData;
         srcLen = p->nJrnlData;
         g_xread_journal_count++;
@@ -436,6 +479,20 @@ static int azqliteWrite(sqlite3_file *pFile, const void *pBuf, int iAmt,
                          sqlite3_int64 iOfst) {
     azqliteFile *p = (azqliteFile *)pFile;
     int rc;
+
+    if (p->eFileType == SQLITE_OPEN_WAL) {
+        /* WAL file — write to WAL buffer */
+        sqlite3_int64 end = iOfst + iAmt;
+        rc = walBufferEnsure(p, end);
+        if (rc != SQLITE_OK) return rc;
+        memcpy(p->aWalData + iOfst, pBuf, iAmt);
+        if (end > p->nWalData) p->nWalData = end;
+        /* If overwriting data already synced to Azure, need full re-upload */
+        if (iOfst < p->nWalSynced) {
+            p->walNeedFullResync = 1;
+        }
+        return SQLITE_OK;
+    }
 
     if (p->eFileType & SQLITE_OPEN_MAIN_JOURNAL) {
         /* Journal file — write to journal buffer */
@@ -478,6 +535,42 @@ static int azqliteWrite(sqlite3_file *pFile, const void *pBuf, int iAmt,
 */
 static int azqliteTruncate(sqlite3_file *pFile, sqlite3_int64 size) {
     azqliteFile *p = (azqliteFile *)pFile;
+
+    if (p->eFileType == SQLITE_OPEN_WAL) {
+        /* WAL truncate — delete and recreate append blob */
+        if (size == 0) {
+            if (p->ops && p->ops->append_blob_delete) {
+                azure_error_t aerr;
+                azure_error_init(&aerr);
+                azure_err_t arc = p->ops->append_blob_delete(
+                    p->ops_ctx, p->zBlobName, NULL, &aerr);
+                if (arc != AZURE_OK && arc != AZURE_ERR_NOT_FOUND) {
+                    return SQLITE_IOERR_TRUNCATE;
+                }
+            }
+            if (p->ops && p->ops->append_blob_create) {
+                azure_error_t aerr;
+                azure_error_init(&aerr);
+                azure_err_t arc = p->ops->append_blob_create(
+                    p->ops_ctx, p->zBlobName, NULL, &aerr);
+                if (arc != AZURE_OK) {
+                    return SQLITE_IOERR_TRUNCATE;
+                }
+            }
+            p->nWalData = 0;
+            p->nWalSynced = 0;
+            p->walNeedFullResync = 0;
+            if (p->aWalData) {
+                memset(p->aWalData, 0, (size_t)p->nWalAlloc);
+            }
+        } else if (size < p->nWalData) {
+            p->nWalData = size;
+            if (size < p->nWalSynced) {
+                p->walNeedFullResync = 1;
+            }
+        }
+        return SQLITE_OK;
+    }
 
     if (p->eFileType & SQLITE_OPEN_MAIN_JOURNAL) {
         if (size < p->nJrnlData) {
@@ -583,11 +676,71 @@ static int coalesceDirtyRanges(
 ** xSync — Flush dirty pages to Azure.
 ** For MAIN_DB: coalesce dirty pages, then write via batch or sequential fallback.
 ** For MAIN_JOURNAL: upload entire journal via block_blob_upload.
+** For WAL: append new data to Azure append blob.
 */
 static int azqliteSync(sqlite3_file *pFile, int flags) {
     azqliteFile *p = (azqliteFile *)pFile;
     azure_error_t aerr;
     (void)flags;
+
+    if (p->eFileType == SQLITE_OPEN_WAL) {
+        /* WAL sync — append new data to Azure append blob */
+        if (p->nWalData <= p->nWalSynced && !p->walNeedFullResync) {
+            return SQLITE_OK;  /* Nothing new to sync */
+        }
+
+        if (!p->ops || !p->ops->append_blob_append) {
+            return SQLITE_IOERR_FSYNC;
+        }
+
+        if (p->walNeedFullResync) {
+            /* Writes invalidated previously synced data — recreate blob */
+            if (p->nWalSynced > 0 && p->ops->append_blob_delete) {
+                azure_error_init(&aerr);
+                azure_err_t arc = p->ops->append_blob_delete(
+                    p->ops_ctx, p->zBlobName, NULL, &aerr);
+                if (arc != AZURE_OK && arc != AZURE_ERR_NOT_FOUND) {
+                    return SQLITE_IOERR_FSYNC;
+                }
+            }
+            if (p->ops->append_blob_create) {
+                azure_error_init(&aerr);
+                azure_err_t arc = p->ops->append_blob_create(
+                    p->ops_ctx, p->zBlobName, NULL, &aerr);
+                if (arc != AZURE_OK) {
+                    return SQLITE_IOERR_FSYNC;
+                }
+            }
+            /* Upload entire WAL buffer */
+            if (p->nWalData > 0) {
+                azure_error_init(&aerr);
+                azure_err_t arc = p->ops->append_blob_append(
+                    p->ops_ctx, p->zBlobName,
+                    p->aWalData, (int)p->nWalData,
+                    NULL, &aerr);
+                if (arc != AZURE_OK) {
+                    return SQLITE_IOERR_FSYNC;
+                }
+            }
+            p->nWalSynced = p->nWalData;
+            p->walNeedFullResync = 0;
+        } else {
+            /* Incremental append — send only new data since last sync */
+            sqlite3_int64 pending = p->nWalData - p->nWalSynced;
+            if (pending > 0) {
+                azure_error_init(&aerr);
+                azure_err_t arc = p->ops->append_blob_append(
+                    p->ops_ctx, p->zBlobName,
+                    p->aWalData + p->nWalSynced, (int)pending,
+                    NULL, &aerr);
+                if (arc != AZURE_OK) {
+                    return SQLITE_IOERR_FSYNC;
+                }
+                p->nWalSynced = p->nWalData;
+            }
+        }
+        return SQLITE_OK;
+    }
 
     if (p->eFileType & SQLITE_OPEN_MAIN_JOURNAL) {
         /* Upload journal as block blob */
@@ -769,7 +922,9 @@ static int azqliteSync(sqlite3_file *pFile, int flags) {
 */
 static int azqliteFileSize(sqlite3_file *pFile, sqlite3_int64 *pSize) {
     azqliteFile *p = (azqliteFile *)pFile;
-    if (p->eFileType & SQLITE_OPEN_MAIN_JOURNAL) {
+    if (p->eFileType == SQLITE_OPEN_WAL) {
+        *pSize = p->nWalData;
+    } else if (p->eFileType & SQLITE_OPEN_MAIN_JOURNAL) {
         *pSize = p->nJrnlData;
     } else {
         *pSize = p->nData;
@@ -912,7 +1067,6 @@ static int azqliteCheckReservedLock(sqlite3_file *pFile, int *pResOut) {
 ** xFileControl — Handle pragmas and other file control operations.
 */
 static int azqliteFileControl(sqlite3_file *pFile, int op, void *pArg) {
-    (void)pFile;
 
     switch (op) {
         case SQLITE_FCNTL_PRAGMA: {
@@ -924,9 +1078,18 @@ static int azqliteFileControl(sqlite3_file *pFile, int op, void *pArg) {
             char **aArg = (char **)pArg;
             if (aArg[1] && sqlite3_stricmp(aArg[1], "journal_mode") == 0) {
                 if (aArg[2] && sqlite3_stricmp(aArg[2], "wal") == 0) {
-                    /* Reject WAL mode — return "delete" instead */
-                    aArg[0] = sqlite3_mprintf("delete");
-                    return SQLITE_OK;
+                    /* WAL mode requires append blob operations.
+                    ** If unavailable, reject and force "delete" mode. */
+                    azqliteFile *p = (azqliteFile *)pFile;
+                    if (!p->ops || !p->ops->append_blob_create ||
+                        !p->ops->append_blob_append ||
+                        !p->ops->append_blob_delete) {
+                        aArg[0] = sqlite3_mprintf("delete");
+                        return SQLITE_OK;
+                    }
+                    /* Append blob ops available — let SQLite set WAL mode.
+                    ** Requires: PRAGMA locking_mode=EXCLUSIVE set first. */
+                    return SQLITE_NOTFOUND;
                 }
             }
             return SQLITE_NOTFOUND;
@@ -971,6 +1134,39 @@ static int azqliteDeviceCharacteristics(sqlite3_file *pFile) {
 
 
 /* ===================================================================
+** Shared memory stubs — WAL exclusive locking mode
+**
+** In exclusive locking mode (PRAGMA locking_mode=EXCLUSIVE), SQLite
+** never calls these methods. They exist only to satisfy iVersion=2
+** requirements. If called outside exclusive mode, xShmMap returns
+** SQLITE_IOERR to prevent unsafe operation.
+** =================================================================== */
+
+static int azqliteShmMap(sqlite3_file *pFile, int iRegion, int szRegion,
+                          int bExtend, void volatile **pp) {
+    (void)pFile; (void)iRegion; (void)szRegion; (void)bExtend;
+    *pp = NULL;
+    /* Never called in exclusive mode. Return SQLITE_IOERR to fail safely
+    ** if the user forgot PRAGMA locking_mode=EXCLUSIVE. */
+    return SQLITE_IOERR;
+}
+
+static int azqliteShmLock(sqlite3_file *pFile, int offset, int n, int flags) {
+    (void)pFile; (void)offset; (void)n; (void)flags;
+    return SQLITE_OK;
+}
+
+static void azqliteShmBarrier(sqlite3_file *pFile) {
+    (void)pFile;
+}
+
+static int azqliteShmUnmap(sqlite3_file *pFile, int deleteFlag) {
+    (void)pFile; (void)deleteFlag;
+    return SQLITE_OK;
+}
+
+
+/* ===================================================================
 ** sqlite3_vfs method implementations
 ** =================================================================== */
 
@@ -987,12 +1183,13 @@ static int azqliteOpen(sqlite3_vfs *pVfs, sqlite3_filename zName,
     azqliteFile *p = (azqliteFile *)pFile;
     int isMainDb = (flags & SQLITE_OPEN_MAIN_DB) != 0;
     int isMainJournal = (flags & SQLITE_OPEN_MAIN_JOURNAL) != 0;
+    int isWal = (flags & SQLITE_OPEN_WAL) != 0;
 
     /* Initialize pMethod to NULL — prevents xClose call on failure */
     memset(p, 0, sizeof(azqliteFile));
 
     /* Temp files, sub-journals, etc. → delegate to default VFS */
-    if (!isMainDb && !isMainJournal) {
+    if (!isMainDb && !isMainJournal && !isWal) {
         return pVfsData->pDefaultVfs->xOpen(
             pVfsData->pDefaultVfs, zName, pFile, flags, pOutFlags);
     }
@@ -1011,6 +1208,7 @@ static int azqliteOpen(sqlite3_vfs *pVfs, sqlite3_filename zName,
     p->ops_ctx = pVfsData->ops_ctx;
     p->pVfsData = pVfsData;             /* R1: back-pointer for cache access */
     p->eFileType = flags & 0x0000FF00;  /* Extract type flags */
+    if (isWal) p->eFileType = SQLITE_OPEN_WAL;  /* WAL flag outside 0xFF00 mask */
     p->eLock = SQLITE_LOCK_NONE;
     p->leaseId[0] = '\0';
     p->leaseDuration = AZQLITE_LEASE_DURATION;
@@ -1124,7 +1322,7 @@ static int azqliteOpen(sqlite3_vfs *pVfs, sqlite3_filename zName,
 
         dirtyClearAll(p);
 
-    } else {
+    } else if (isMainJournal) {
         /* MAIN_JOURNAL → Azure block blob */
         p->nJrnlData = 0;
         p->nJrnlAlloc = 0;
@@ -1172,6 +1370,72 @@ static int azqliteOpen(sqlite3_vfs *pVfs, sqlite3_filename zName,
                 free(buf.data);
             }
         }
+
+    } else if (isWal) {
+        /* WAL → Azure append blob */
+
+        /* Verify append blob operations are available */
+        if (!p->ops || !p->ops->append_blob_create ||
+            !p->ops->append_blob_append || !p->ops->append_blob_delete) {
+            free(p->zBlobName);
+            p->zBlobName = NULL;
+            return SQLITE_CANTOPEN;
+        }
+
+        /* Check if WAL blob exists (for crash recovery) */
+        int walExists = 0;
+        if (p->ops->blob_exists) {
+            azure_error_t aerr;
+            azure_error_init(&aerr);
+            azure_err_t arc = p->ops->blob_exists(p->ops_ctx, zName,
+                                                    &walExists, &aerr);
+            if (arc != AZURE_OK && arc != AZURE_ERR_NOT_FOUND) {
+                free(p->zBlobName);
+                p->zBlobName = NULL;
+                return azureErrToSqlite(arc, SQLITE_CANTOPEN);
+            }
+        }
+
+        if (walExists && p->ops->block_blob_download) {
+            /* Download existing WAL for crash recovery.
+            ** block_blob_download uses GET Blob which works on all blob types. */
+            azure_buffer_t buf = {0};
+            azure_error_t aerr;
+            azure_error_init(&aerr);
+            azure_err_t arc = p->ops->block_blob_download(
+                p->ops_ctx, zName, &buf, &aerr);
+            if (arc == AZURE_OK && buf.data && buf.size > 0) {
+                int rc = walBufferEnsure(p, (sqlite3_int64)buf.size);
+                if (rc == SQLITE_OK) {
+                    memcpy(p->aWalData, buf.data, buf.size);
+                    p->nWalData = (sqlite3_int64)buf.size;
+                    p->nWalSynced = p->nWalData;
+                }
+                free(buf.data);
+                if (rc != SQLITE_OK) {
+                    free(p->aWalData);
+                    p->aWalData = NULL;
+                    free(p->zBlobName);
+                    p->zBlobName = NULL;
+                    return rc;
+                }
+            } else {
+                free(buf.data);
+            }
+        } else if (!walExists) {
+            /* Create new empty append blob */
+            azure_error_t aerr;
+            azure_error_init(&aerr);
+            azure_err_t arc = p->ops->append_blob_create(
+                p->ops_ctx, zName, NULL, &aerr);
+            if (arc != AZURE_OK) {
+                free(p->zBlobName);
+                p->zBlobName = NULL;
+                return azureErrToSqlite(arc, SQLITE_CANTOPEN);
+            }
+        }
+
+        p->walNeedFullResync = 0;
     }
 
     /* Set pMethod last — this tells SQLite to call xClose */
@@ -1225,23 +1489,13 @@ static int azqliteDelete(sqlite3_vfs *pVfs, const char *zName, int syncDir) {
 ** R1 optimization: We cache journal blob existence state. Since we are the
 ** single writer, we know when the journal exists (we uploaded it in xSync)
 ** or doesn't exist (we deleted it in xDelete). This eliminates ~4 HEAD
-** requests per transaction (~110ms saved). WAL is disabled (iVersion=1),
-** so -wal blobs never exist.
+** requests per transaction (~110ms saved).
 */
 static int azqliteAccess(sqlite3_vfs *pVfs, const char *zName,
                           int flags, int *pResOut) {
     azqliteVfsData *pVfsData = (azqliteVfsData *)pVfs->pAppData;
 
     if (pVfsData->ops && pVfsData->ops->blob_exists) {
-        /* R1: WAL is disabled (iVersion=1) — WAL files never exist */
-        if (zName) {
-            size_t len = strlen(zName);
-            if (len >= 4 && strcmp(zName + len - 4, "-wal") == 0) {
-                *pResOut = 0;
-                return SQLITE_OK;
-            }
-        }
-
         /* R1: Use cached journal existence when available */
         if (zName && pVfsData->journalCacheState >= 0 &&
             pVfsData->journalBlobName[0] &&

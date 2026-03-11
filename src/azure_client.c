@@ -1460,6 +1460,129 @@ static azure_err_t az_page_blob_write_batch(
 }
 
 /* ================================================================
+ * APPEND BLOB OPERATIONS (for WAL mode)
+ *
+ * Append blobs support sequential append-only writes — a natural
+ * fit for WAL files.  Create, append data, delete on checkpoint.
+ * ================================================================ */
+
+/*
+ * Create an empty append blob.
+ * PUT with x-ms-blob-type: AppendBlob, Content-Length: 0
+ */
+static azure_err_t az_append_blob_create(void *ctx, const char *blob_name,
+                                          const char *lease_id,
+                                          azure_error_t *err)
+{
+    azure_client_t *c = (azure_client_t *)ctx;
+
+    char lease_header[128];
+    const char *extra_with_lease[] = {
+        "x-ms-blob-type:AppendBlob",
+        lease_header,
+        NULL
+    };
+    const char *extra_no_lease[] = {
+        "x-ms-blob-type:AppendBlob",
+        NULL
+    };
+
+    const char *const *extra;
+    if (lease_id && *lease_id) {
+        snprintf(lease_header, sizeof(lease_header),
+                 "x-ms-lease-id:%s", lease_id);
+        extra = extra_with_lease;
+    } else {
+        extra = extra_no_lease;
+    }
+
+    return execute_with_retry(c, "PUT", blob_name, NULL,
+                              extra, NULL, NULL, 0, NULL,
+                              NULL, NULL, err);
+}
+
+/*
+ * Append data to an existing append blob.
+ * PUT ?comp=appendblock with raw body bytes.
+ * Max 4 MiB per call — caller is responsible for splitting.
+ */
+static azure_err_t az_append_blob_append(void *ctx, const char *blob_name,
+                                          const unsigned char *data,
+                                          int data_len,
+                                          const char *lease_id,
+                                          azure_error_t *err)
+{
+    azure_client_t *c = (azure_client_t *)ctx;
+
+    if (!data || data_len <= 0) {
+        err->code = AZURE_ERR_INVALID_ARG;
+        snprintf(err->error_message, sizeof(err->error_message),
+                 "Append data must be non-NULL with length > 0");
+        return AZURE_ERR_INVALID_ARG;
+    }
+    if (data_len > AZURE_MAX_PAGE_WRITE) {  /* 4 MiB limit */
+        err->code = AZURE_ERR_INVALID_ARG;
+        snprintf(err->error_message, sizeof(err->error_message),
+                 "Append data length %d exceeds 4 MiB maximum", data_len);
+        return AZURE_ERR_INVALID_ARG;
+    }
+
+    char lease_header[128];
+    const char *extra_with_lease[] = {
+        "x-ms-blob-type:AppendBlob",
+        lease_header,
+        NULL
+    };
+    const char *extra_no_lease[] = {
+        "x-ms-blob-type:AppendBlob",
+        NULL
+    };
+
+    const char *const *extra;
+    if (lease_id && *lease_id) {
+        snprintf(lease_header, sizeof(lease_header),
+                 "x-ms-lease-id:%s", lease_id);
+        extra = extra_with_lease;
+    } else {
+        extra = extra_no_lease;
+    }
+
+    return execute_with_retry(c, "PUT", blob_name, "comp=appendblock",
+                              extra, "application/octet-stream",
+                              data, (size_t)data_len, NULL,
+                              NULL, NULL, err);
+}
+
+/*
+ * Delete an append blob.
+ * Reuses the same DELETE logic as block_blob_delete.
+ * If lease_id is provided, includes x-ms-lease-id header.
+ */
+static azure_err_t az_append_blob_delete(void *ctx, const char *blob_name,
+                                          const char *lease_id,
+                                          azure_error_t *err)
+{
+    azure_client_t *c = (azure_client_t *)ctx;
+
+    char lease_header[128];
+    const char *extra_with_lease[] = {
+        lease_header,
+        NULL
+    };
+
+    const char *const *extra = NULL;
+    if (lease_id && *lease_id) {
+        snprintf(lease_header, sizeof(lease_header),
+                 "x-ms-lease-id:%s", lease_id);
+        extra = extra_with_lease;
+    }
+
+    return execute_with_retry(c, "DELETE", blob_name, NULL,
+                              extra, NULL, NULL, 0, NULL,
+                              NULL, NULL, err);
+}
+
+/* ================================================================
  * Static vtable instance — populated with all production functions
  * ================================================================ */
 
@@ -1483,6 +1606,10 @@ static const azure_ops_t azure_production_ops = {
     .lease_break   = az_lease_break,
     /* Batch write — parallel flush via curl_multi (Phase 2) */
     .page_blob_write_batch = az_page_blob_write_batch,
+    /* Append blob — WAL mode */
+    .append_blob_create = az_append_blob_create,
+    .append_blob_append = az_append_blob_append,
+    .append_blob_delete = az_append_blob_delete,
 };
 
 /* ================================================================

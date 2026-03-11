@@ -159,6 +159,20 @@ mock_write_record_t mock_get_write_record(mock_azure_ctx_t *ctx, int idx);
 /* Clear all write records. Also called by mock_reset(). */
 void mock_clear_write_records(mock_azure_ctx_t *ctx);
 
+/* ══════════════════════════════════════════════════════════════════════
+** Append blob state inspection (for WAL mode tests)
+** ══════════════════════════════════════════════════════════════════════ */
+
+/* Get append blob accumulated data. Returns NULL if blob doesn't exist. */
+const unsigned char *mock_get_append_data(mock_azure_ctx_t *ctx,
+                                           const char *name);
+
+/* Get total size of append blob data. Returns -1 if not found. */
+int64_t mock_get_append_size(mock_azure_ctx_t *ctx, const char *name);
+
+/* Clear append blob data (reset buffer to empty, keep blob alive). */
+void mock_reset_append_data(mock_azure_ctx_t *ctx, const char *name);
+
 #ifdef __cplusplus
 }
 #endif

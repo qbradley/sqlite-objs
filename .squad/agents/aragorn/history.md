@@ -294,3 +294,28 @@ Implemented two optimizations from the performance diagnosis (aragorn-perf-diagn
 **Test updates:** Two tests adjusted for R2 behavior — `vfs_lease_expire_during_sync` now fails `page_blob_write` (resize may not be called), `vfs_sync_resize_failure_before_flush` inserts zeroblob(65536) to force DB growth.
 
 **Result:** TPC-C Azure throughput: 2.9 tps → 5.0 tps (~72% improvement). All 207 unit tests pass.
+
+### WAL Mode VFS Support (2026-03-11)
+
+**Implemented WAL mode with exclusive locking in azqlite_vfs.c.** This enables `PRAGMA journal_mode=WAL` when append blob operations are available in the vtable, providing a projected 5-16× throughput improvement over journal mode (1 HTTP call per commit vs 9).
+
+**Key VFS changes:**
+- **iVersion bumped 1→2** on `sqlite3_io_methods` to enable WAL support
+- **xShm* stubs added:** `azqliteShmMap` returns `SQLITE_IOERR` (safety net if user forgets exclusive mode), others return `SQLITE_OK`/no-op. In exclusive mode, these are never called.
+- **WAL buffer system:** New fields `aWalData`/`nWalData`/`nWalAlloc`/`nWalSynced`/`walNeedFullResync` on `azqliteFile`. Pattern mirrors journal buffer but tracks sync offset for incremental Azure appends.
+- **xOpen WAL path:** Checks append blob ops availability, downloads existing WAL for crash recovery (via `block_blob_download` — GET works on all blob types), or creates new empty append blob.
+- **xWrite WAL:** Buffers locally, flags `walNeedFullResync` if overwriting already-synced data.
+- **xSync WAL:** Incremental append (sends only bytes since last sync) or full resync (delete+recreate+upload all) if data was rewritten.
+- **xTruncate WAL:** For size=0, deletes and recreates append blob (checkpoint reset). For partial truncate, flags resync if needed.
+- **xFileControl:** Conditionally allows WAL — checks `append_blob_create/append/delete` are non-NULL. If NULL, forces "delete" mode (backward compatible).
+- **xAccess:** Removed `-wal` short-circuit that previously returned "does not exist". WAL files now go through normal blob existence checks.
+
+**Design decisions:**
+- WAL file type (`SQLITE_OPEN_WAL = 0x00080000`) is outside the `0x0000FF00` mask used for `eFileType`. Added explicit override in xOpen.
+- No leasing on WAL blob itself — the main DB blob's lease protects against concurrent access in exclusive mode.
+- `block_blob_download` reused for reading append blobs (Azure GET Blob is type-agnostic).
+- `xShmMap` returns `SQLITE_IOERR` (not `SQLITE_OK`) to safely prevent WAL without exclusive mode. If called, it means the user didn't set exclusive mode — failing here is better than a NULL pointer crash.
+
+**Test updates:** 3 WAL rejection tests updated: `vfs_pragma_wal_refused`→`vfs_pragma_wal_allowed` (WAL accepted with mock ops), `vfs_wal_mode_returns_delete` (tests rejection with NULL append ops), `vfs_wal_mode_case_insensitive` (WAL accepted for all case variants).
+
+**Result:** Clean build (zero warnings), all 207 unit tests pass. WAL mode is ready for integration testing once Frodo's production append blob client is available.

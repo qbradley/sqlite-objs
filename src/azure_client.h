@@ -230,6 +230,41 @@ struct azure_ops {
         void *ctx, const char *name,
         const azure_page_range_t *ranges, int nRanges,
         const char *lease_id, azure_error_t *err);
+
+    /* ---- Append Blob Operations (for WAL mode) ---- */
+
+    /* Create an empty append blob.
+    ** If lease_id is non-NULL, includes x-ms-lease-id header.
+    ** Returns AZURE_OK on 201 Created. */
+    azure_err_t (*append_blob_create)(
+        void *ctx,
+        const char *blob_name,
+        const char *lease_id,     /* NULL if no lease */
+        azure_error_t *err
+    );
+
+    /* Append data to an existing append blob.
+    ** data_len max 4 MiB per call — caller splits if needed.
+    ** If lease_id is non-NULL, includes x-ms-lease-id header.
+    ** Returns AZURE_OK on 201 Created. */
+    azure_err_t (*append_blob_append)(
+        void *ctx,
+        const char *blob_name,
+        const unsigned char *data,
+        int data_len,             /* max 4 MiB per append */
+        const char *lease_id,     /* NULL if no lease */
+        azure_error_t *err
+    );
+
+    /* Delete an append blob.
+    ** If lease_id is non-NULL, includes x-ms-lease-id header.
+    ** Returns AZURE_OK on 202 Accepted. */
+    azure_err_t (*append_blob_delete)(
+        void *ctx,
+        const char *blob_name,
+        const char *lease_id,     /* NULL if no lease */
+        azure_error_t *err
+    );
 };
 
 

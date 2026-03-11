@@ -38,6 +38,9 @@ typedef enum {
     OP_LEASE_RENEW,
     OP_LEASE_RELEASE,
     OP_LEASE_BREAK,
+    OP_APPEND_BLOB_CREATE,
+    OP_APPEND_BLOB_APPEND,
+    OP_APPEND_BLOB_DELETE,
     OP_COUNT
 } op_index_t;
 
@@ -55,6 +58,9 @@ static const char *op_names[OP_COUNT] = {
     "lease_renew",
     "lease_release",
     "lease_break",
+    "append_blob_create",
+    "append_blob_append",
+    "append_blob_delete",
 };
 
 static op_index_t op_name_to_index(const char *name) {
@@ -67,9 +73,10 @@ static op_index_t op_name_to_index(const char *name) {
 /* ── Blob storage structures ──────────────────────────────────────── */
 
 typedef enum {
-    BLOB_TYPE_NONE  = 0,
-    BLOB_TYPE_PAGE  = 1,
-    BLOB_TYPE_BLOCK = 2,
+    BLOB_TYPE_NONE   = 0,
+    BLOB_TYPE_PAGE   = 1,
+    BLOB_TYPE_BLOCK  = 2,
+    BLOB_TYPE_APPEND = 3,
 } blob_type_t;
 
 typedef struct {
@@ -676,6 +683,96 @@ static azure_err_t mock_lease_break_impl(void *vctx, const char *name,
     return AZURE_OK;
 }
 
+/* ── Append Blob Operations ───────────────────────────────────────── */
+
+static azure_err_t mock_append_blob_create_impl(void *vctx,
+                                                  const char *blob_name,
+                                                  const char *lease_id,
+                                                  azure_error_t *err) {
+    mock_azure_ctx_t *ctx = (mock_azure_ctx_t *)vctx;
+    (void)lease_id;
+    azure_err_t rc = pre_call(ctx, OP_APPEND_BLOB_CREATE, err);
+    if (rc != AZURE_OK) return rc;
+
+    mock_blob_t *b = find_blob(ctx, blob_name);
+    if (b) {
+        /* Already exists — if same type, just reset to empty */
+        if (b->type != BLOB_TYPE_APPEND) {
+            set_error(err, 409, "BlobTypeMismatch",
+                      "Blob exists as different type");
+            return AZURE_ERR_CONFLICT;
+        }
+        /* Reset data for re-creation (checkpoint pattern) */
+        b->size = 0;
+        return AZURE_OK;
+    }
+
+    b = create_blob(ctx, blob_name, BLOB_TYPE_APPEND);
+    if (!b) {
+        set_error(err, 500, "OutOfMemory", "Too many blobs");
+        return AZURE_ERR_NOMEM;
+    }
+    return AZURE_OK;
+}
+
+static azure_err_t mock_append_blob_append_impl(void *vctx,
+                                                  const char *blob_name,
+                                                  const unsigned char *data,
+                                                  int data_len,
+                                                  const char *lease_id,
+                                                  azure_error_t *err) {
+    mock_azure_ctx_t *ctx = (mock_azure_ctx_t *)vctx;
+    (void)lease_id;
+    azure_err_t rc = pre_call(ctx, OP_APPEND_BLOB_APPEND, err);
+    if (rc != AZURE_OK) return rc;
+
+    if (!data || data_len <= 0) {
+        set_error(err, 400, "InvalidHeaderValue",
+                  "Append data must be non-NULL with length > 0");
+        return AZURE_ERR_INVALID_ARG;
+    }
+
+    mock_blob_t *b = find_blob(ctx, blob_name);
+    if (!b || b->type != BLOB_TYPE_APPEND) {
+        set_error(err, 404, "BlobNotFound", "Append blob not found");
+        return AZURE_ERR_NOT_FOUND;
+    }
+
+    int64_t new_size = b->size + data_len;
+    if (ensure_capacity(b, new_size) != 0) {
+        set_error(err, 500, "OutOfMemory", "Failed to grow append blob");
+        return AZURE_ERR_NOMEM;
+    }
+    memcpy(b->data + b->size, data, (size_t)data_len);
+    b->size = new_size;
+    return AZURE_OK;
+}
+
+static azure_err_t mock_append_blob_delete_impl(void *vctx,
+                                                  const char *blob_name,
+                                                  const char *lease_id,
+                                                  azure_error_t *err) {
+    mock_azure_ctx_t *ctx = (mock_azure_ctx_t *)vctx;
+    (void)lease_id;
+    azure_err_t rc = pre_call(ctx, OP_APPEND_BLOB_DELETE, err);
+    if (rc != AZURE_OK) return rc;
+
+    for (int i = 0; i < ctx->blob_count; i++) {
+        if (strcmp(ctx->blobs[i].name, blob_name) == 0) {
+            free_blob_data(&ctx->blobs[i]);
+            if (i < ctx->blob_count - 1) {
+                memmove(&ctx->blobs[i], &ctx->blobs[i + 1],
+                        sizeof(mock_blob_t) * (size_t)(ctx->blob_count - 1 - i));
+            }
+            ctx->blob_count--;
+            return AZURE_OK;
+        }
+    }
+
+    set_error(err, 404, "BlobNotFound", "Blob not found");
+    return AZURE_ERR_NOT_FOUND;
+}
+
 /* ── The vtable singleton ─────────────────────────────────────────── */
 
 static azure_ops_t mock_ops = {
@@ -694,6 +791,10 @@ static azure_ops_t mock_ops = {
     .lease_break        = mock_lease_break_impl,
     /* Batch write — not implemented in mock (Phase 2) */
     .page_blob_write_batch = NULL,
+    /* Append blob — WAL mode */
+    .append_blob_create = mock_append_blob_create_impl,
+    .append_blob_append = mock_append_blob_append_impl,
+    .append_blob_delete = mock_append_blob_delete_impl,
 };
 
 /* ══════════════════════════════════════════════════════════════════════
@@ -877,4 +978,30 @@ mock_write_record_t mock_get_write_record(mock_azure_ctx_t *ctx, int idx) {
 void mock_clear_write_records(mock_azure_ctx_t *ctx) {
     if (!ctx) return;
     ctx->write_record_count = 0;
+}
+
+/* ══════════════════════════════════════════════════════════════════════
+** Public API — append blob state inspection
+** ══════════════════════════════════════════════════════════════════════ */
+
+const unsigned char *mock_get_append_data(mock_azure_ctx_t *ctx,
+                                           const char *name) {
+    if (!ctx) return NULL;
+    mock_blob_t *b = find_blob(ctx, name);
+    if (!b || b->type != BLOB_TYPE_APPEND) return NULL;
+    return b->data;
+}
+
+int64_t mock_get_append_size(mock_azure_ctx_t *ctx, const char *name) {
+    if (!ctx) return -1;
+    mock_blob_t *b = find_blob(ctx, name);
+    if (!b || b->type != BLOB_TYPE_APPEND) return -1;
+    return b->size;
+}
+
+void mock_reset_append_data(mock_azure_ctx_t *ctx, const char *name) {
+    if (!ctx) return;
+    mock_blob_t *b = find_blob(ctx, name);
+    if (!b || b->type != BLOB_TYPE_APPEND) return;
+    b->size = 0;
 }

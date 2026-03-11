@@ -191,7 +191,10 @@ static azure_ops_t g_stubOps = {
     stub_lease_renew,
     stub_lease_release,
     stub_lease_break,
-    NULL  /* page_blob_write_batch — not implemented in stub */
+    NULL  /* page_blob_write_batch — not implemented in stub */,
+    NULL  /* append_blob_create — not implemented in stub */,
+    NULL  /* append_blob_append — not implemented in stub */,
+    NULL  /* append_blob_delete — not implemented in stub */
 };
 
 /* ---- Public functions ---- */

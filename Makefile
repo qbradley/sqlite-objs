@@ -166,8 +166,8 @@ test-unit: $(BUILD_DIR)/test_main
 	$(BUILD_DIR)/test_main
 	@echo "=== All unit tests passed ==="
 
-$(BUILD_DIR)/test_main: $(TEST_DIR)/test_main.c $(TEST_DIR)/test_vfs.c $(TEST_DIR)/test_azure_client.c $(TEST_DIR)/test_coalesce.c $(TEST_DIR)/mock_azure_ops.h $(TEST_DIR)/test_harness.h $(TEST_OBJS) | $(BUILD_DIR)
-	$(CC) $(TEST_CFLAGS) -DENABLE_VFS_INTEGRATION -o $@ $(TEST_DIR)/test_main.c $(TEST_OBJS) $(LDFLAGS)
+$(BUILD_DIR)/test_main: $(TEST_DIR)/test_main.c $(TEST_DIR)/test_vfs.c $(TEST_DIR)/test_azure_client.c $(TEST_DIR)/test_coalesce.c $(TEST_DIR)/test_wal.c $(TEST_DIR)/mock_azure_ops.h $(TEST_DIR)/test_harness.h $(TEST_OBJS) | $(BUILD_DIR)
+	$(CC) $(TEST_CFLAGS) -DENABLE_VFS_INTEGRATION -DENABLE_WAL_TESTS -o $@ $(TEST_DIR)/test_main.c $(TEST_OBJS) $(LDFLAGS)
 
 # Layer 2: Integration tests (requires Azurite)
 # These tests link against the REAL azure_client.c (not stubs/mocks)

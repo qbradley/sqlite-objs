@@ -161,3 +161,22 @@ Completed orchestration summary:
 - **Easy handle lifecycle unchanged:** Still created per-range, destroyed after each batch call. Only the CURLM multi handle persists — it owns the connection pool.
 - **Thread-safety documented:** Safe because xSync is serialized by SQLite's btree mutex (D17). No concurrent access to the multi handle is possible.
 - **Build:** Production compiles clean with zero warnings. All 205 unit tests pass.
+
+### Append Blob Operations for WAL Mode (2026-03-11)
+
+- **Files modified:** `src/azure_client.h`, `src/azure_client.c`, `src/azure_client_stub.c`, `test/mock_azure_ops.h`, `test/mock_azure_ops.c`
+- **3 new azure_ops_t vtable entries:** `append_blob_create`, `append_blob_append`, `append_blob_delete` — added at END of struct after `page_blob_write_batch` for backward compatibility.
+- **Production implementations in azure_client.c:**
+  - `az_append_blob_create`: PUT with `x-ms-blob-type: AppendBlob`, Content-Length: 0. Optional lease header. Returns on 201.
+  - `az_append_blob_append`: PUT `?comp=appendblock` with raw body. Max 4 MiB enforced. Optional lease header. Returns on 201.
+  - `az_append_blob_delete`: DELETE with optional lease header. Reuses same `execute_with_retry` pattern as `az_blob_delete`. Returns on 202.
+- **All 3 support optional lease_id** — NULL means no lease header, non-NULL adds `x-ms-lease-id` header. Matches WAL's exclusive-mode lease pattern.
+- **Stub vtable:** All 3 set to NULL (same pattern as `page_blob_write_batch`).
+- **Mock implementations in mock_azure_ops.c:**
+  - New `BLOB_TYPE_APPEND` enum value for blob type tracking.
+  - New op indices: `OP_APPEND_BLOB_CREATE`, `OP_APPEND_BLOB_APPEND`, `OP_APPEND_BLOB_DELETE` — integrated with failure injection and call counting.
+  - `mock_append_blob_create_impl`: Creates append blob, or resets to empty if re-created (checkpoint pattern).
+  - `mock_append_blob_append_impl`: Appends data to buffer via `ensure_capacity` + `memcpy`.
+  - `mock_append_blob_delete_impl`: Removes blob from array (same logic as `mock_blob_delete_impl`).
+  - Accessor functions: `mock_get_append_data()`, `mock_get_append_size()`, `mock_reset_append_data()`.
+- **Build:** Stub and production compile clean. All 207 unit tests pass.

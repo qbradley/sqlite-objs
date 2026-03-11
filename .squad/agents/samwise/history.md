@@ -148,3 +148,26 @@ Completed Layer 2 infrastructure: 75 integration test cases written against Azur
 - **Helper assertions:** `assert_writes_aligned()`, `assert_writes_ordered_nonoverlapping()`, `assert_writes_within_4mb()` — reusable validators for any test that checks write patterns.
 - **Mock write recording:** Each `page_blob_write` call now records `{offset, len}` in `ctx->write_records[]` (up to 1024 entries). This is the key test seam for coalescing verification.
 - **Handoff for Aragorn:** When coalesceDirtyRanges is implemented, enable coalescing-specific assertions by defining `ENABLE_COALESCE_TESTS`. Also expose `azqlite_test_coalesce_dirty_ranges()` for test 8 (maxranges_overflow).
+
+### WAL Mode Test Suite (2026-03-11)
+
+- **12 tests across 5 suites**, all gated behind `ENABLE_WAL_TESTS`.
+- **File created:** `test/test_wal.c` — WAL mode unit tests for azqlite VFS.
+- **Files modified:**
+  - `test/test_main.c` — Added `#include "test_wal.c"` and `run_wal_tests()` call.
+  - `Makefile` — Added `test_wal.c` to test_main build dependencies.
+- **Test suites:**
+  1. **WAL Mode — Prerequisites (2 tests):** `wal_mode_requires_append_ops` (NULL append ops → WAL rejected), `wal_mode_allowed_with_append_ops` (non-NULL ops + EXCLUSIVE → WAL accepted).
+  2. **WAL Mode — Basic Operations (4 tests):** `wal_open_creates_append_blob` (verifies `-wal` blob name), `wal_write_and_sync` (append_blob_append called with ≥4120 bytes), `wal_read_after_write` (SELECT through WAL path), `wal_multiple_transactions` (3 sequential INSERTs each increment append count).
+  3. **WAL Mode — Checkpoint (2 tests):** `wal_checkpoint_writes_pages` (PRAGMA wal_checkpoint → page_blob_write calls), `wal_checkpoint_resets_wal` (append_blob_delete called, WAL size decreases).
+  4. **WAL Mode — Error Handling (2 tests):** `wal_append_failure_returns_error` (IO failure on append → transaction fails), `wal_create_failure_returns_error` (IO failure on create → WAL rejected or first write fails).
+  5. **WAL Mode — Data Integrity (2 tests):** `wal_insert_select_roundtrip` (write → checkpoint → close → reopen → verify), `wal_concurrent_reads_during_write` (read within active write transaction — placeholder for MVP 3+).
+- **Key design decisions:**
+  - **Gated behind `ENABLE_WAL_TESTS`** — existing 207 tests unaffected. Activate with `make test-unit CFLAGS+="-DENABLE_WAL_TESTS"` once Aragorn's VFS WAL support is complete.
+  - **Uses real mock append blob interface** — Frodo already implemented `mock_append_blob_create/append/delete` in mock_azure_ops.c and the azure_ops_t vtable fields in azure_client.h. No forward declarations needed.
+  - **`wal_make_no_append_ops()` helper** — creates an ops vtable with NULL append blob fields to test the prerequisite gate.
+  - **Every SQLite call checks return codes** with error messages logged to stderr on failure. Never ignores errors.
+  - **WAL blob naming convention:** `dbname + "-wal"` suffix (e.g., "waltest.db-wal"), consistent with D7 blob naming.
+  - **Setup pattern:** `wal_open_db()` does full 5-step WAL setup (register VFS, open DB, PRAGMA locking_mode=EXCLUSIVE, PRAGMA journal_mode=WAL, verify "wal"). Returns NULL on any step failure.
+- **Pre-existing test failures:** 3 old WAL-rejection tests (`vfs_pragma_wal_refused`, `vfs_wal_mode_returns_delete`, `vfs_wal_mode_case_insensitive`) now fail because Aragorn's in-progress VFS changes accept WAL mode. These need to be updated by Aragorn to reflect the new behavior.
+- **Handoff for Aragorn:** When WAL VFS support is ready, define `ENABLE_WAL_TESTS` and verify all 12 tests pass. Also update the 3 old WAL-rejection tests in test_vfs.c to match the new behavior (WAL accepted with append ops, rejected only when append ops are NULL).
