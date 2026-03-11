@@ -173,6 +173,35 @@ Page blob resizing must be supported in architecture. First priority: growing da
 
 ---
 
+### D12: Azurite SharedKey Authentication Workaround
+**Date:** 2026-03-10 | **From:** Frodo (Azure Client Layer)
+
+Azurite has a quirk in canonicalized resource path construction for SharedKey signature validation — it doubles the account name internally. Implemented endpoint-aware URL and resource path building: custom endpoints (Azurite) include account in path before auth signing (allowing Azurite to double it); production Azure uses standard format. Also explicitly set `Content-Type:` header to prevent curl auto-adding headers. Backward compatible (endpoint=NULL → standard Azure behavior).
+
+**Impact:** Integration testing with Azurite now succeeds with SharedKey auth. SharedKey auth works with both Azurite and production Azure.
+
+---
+
+### D13: Container Creation as Public API Function
+**Date:** 2026-03-10 | **From:** Frodo (Azure Client Layer)
+
+Added `azure_container_create(azure_client_t *client, azure_error_t *err)` as public API in azure_client.c. Leverages existing auth infrastructure and curl setup for clean, reusable code. Idempotent — treats both 201 (created) and 409 (already exists) as success. Test code calls this after client creation; bash script delegates to C code rather than attempting unauthenticated curl requests.
+
+**Impact:** All Azure client integration tests now pass (8 of 10 total). No breaking changes to existing API.
+
+---
+
+### D14: Benchmark Harness Design
+**Date:** 2026-03-10 | **From:** Aragorn (SQLite/C Dev)
+
+Three-binary architecture: lightweight harness that shells out to speedtest1 subprocesses. speedtest1 (standard SQLite) and speedtest1-azure (with azqlite VFS registered as default) run as isolated processes measured via `system()` and `gettimeofday()`. speedtest1.c used unmodified from SQLite upstream. Rejected embedding via #define main trick (speedtest1's `exit()` terminates harness before results capture) and patching upstream (maintenance burden).
+
+**Usage:** `./benchmark --local-only --size 25`, `./benchmark --size 50` (full comparison with Azure env vars), `./benchmark --output csv` (automation).
+
+**Implementation:** Clean separation, flexible output (text/CSV), supports stub and production builds. Subprocess overhead (~10ms) negligible for multi-second benchmarks. Only captures total elapsed time, not per-test breakdown.
+
+---
+
 ## Governance
 
 - All meaningful changes require team consensus

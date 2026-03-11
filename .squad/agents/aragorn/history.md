@@ -109,14 +109,57 @@
 - Page size detected from SQLite header bytes 16-17 on existing databases
 - xFullPathname strips leading slashes, rejects ".." paths
 - xFileControl intercepts PRAGMA journal_mode=WAL → returns "delete"
-- xDeviceCharacteristics: ATOMIC512 | SAFE_APPEND
-- xSectorSize: 512 (Azure page blob alignment)
+- xDeviceCharacteristics: SEQUENTIAL | POWERSAFE_OVERWRITE | SUBPAGE_READ (fixed from ATOMIC512)
+- xSectorSize: 4096 (SQLite page alignment, Azure compatible)
 - Shell uses #define main shell_main trick to include shell.c as a translation unit
 
 **Build system:**
 - `-w` flag on sqlite3.c and shell.c compilation (suppress upstream warnings)
 - Platform detection: Darwin omits -ldl, Linux includes it
 - Static library: build/libazqlite.a containing sqlite3.o + azqlite_vfs.o + azure_client_stub.o
+
+### Benchmark Harness Implementation (2026-03-10)
+
+**Problem:** Need to compare local SQLite vs azqlite performance using SQLite's official speedtest1 benchmark. speedtest1.c calls `exit()` directly, making it unsuitable for inclusion as a library.
+
+**Solution:** Three-binary approach:
+1. `benchmark` — Lightweight harness that shells out to speedtest1 binaries and measures wall-clock time
+2. `speedtest1` — Standard speedtest1 linked against vanilla SQLite
+3. `speedtest1-azure` — speedtest1 linked against azqlite VFS via wrapper
+
+**Files created:**
+- `benchmark/benchmark.c` — Main harness using `system()` to invoke speedtest1 binaries, timing via `gettimeofday()`, formatted output
+- `benchmark/speedtest1_wrapper.c` — Thin wrapper that registers azqlite VFS as default before calling speedtest1_main
+- `benchmark/speedtest1.c` — Downloaded from SQLite upstream (test/speedtest1.c)
+- `benchmark/Makefile` — Builds all three binaries, handles stub vs production builds
+- `benchmark/README.md` — Usage documentation
+
+**Key design decisions:**
+- **Process isolation:** Each speedtest1 run is a separate process via `system()`. This avoids the `exit()` problem and gives clean timing.
+- **Silent subprocess output:** speedtest1 output redirected to `/dev/null` to keep harness output clean. Users can run speedtest1 binaries directly for detailed output.
+- **Exit code tolerance:** speedtest1 returns 1 if optional features (rtree) are missing. Harness treats exit codes 0 and 1 as success.
+- **Two speedtest1 binaries:** One linked against vanilla SQLite, one against azqlite. Benchmark harness invokes the appropriate binary.
+- **Stub vs production:** `make all` builds with azure_client_stub (local-only), `make all-production` builds with real Azure client.
+
+**Usage patterns:**
+```bash
+# Build and run local-only
+make && ./benchmark --local-only --size 25
+
+# Build with Azure support and run full comparison  
+make all-production
+export AZURE_STORAGE_ACCOUNT=...
+export AZURE_STORAGE_KEY=...
+export AZURE_STORAGE_CONTAINER=...
+./benchmark --size 50
+
+# CSV output for automation
+./benchmark --output csv > results.csv
+```
+
+**Performance expectations:** Azure will be 2-50x slower than local depending on workload (per design decisions D4). The in-memory cache significantly reduces the gap.
+
+**Integration:** Benchmark lives in `benchmark/` subdirectory. Independent Makefile. Reuses parent `build/` objects via relative paths.
 
 ### Integration Fix — Headers & Build Reconciliation (2026-03-10)
 
