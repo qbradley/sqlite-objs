@@ -86,6 +86,7 @@ typedef struct azqliteFile {
     /* Dirty page tracking */
     unsigned char *aDirty;              /* Bitmap: 1 bit per page, 1=dirty */
     int nDirtyPages;                    /* Count of dirty pages */
+    int nDirtyAlloc;                    /* Allocated size of aDirty bitmap */
     int pageSize;                       /* Detected from header or default 4096 */
 
     /* Lock state */
@@ -179,13 +180,13 @@ static void dirtyClearAll(azqliteFile *p) {
 static int dirtyEnsureCapacity(azqliteFile *p) {
     int needed = dirtyBitmapSize(p->nAlloc, p->pageSize);
     if (needed <= 0) return SQLITE_OK;
+    if (needed <= p->nDirtyAlloc) return SQLITE_OK;
     unsigned char *pNew = (unsigned char *)realloc(p->aDirty, needed);
     if (!pNew) return SQLITE_NOMEM;
-    /* Zero new bytes if the bitmap grew */
-    if (p->aDirty == NULL) {
-        memset(pNew, 0, needed);
-    }
+    /* Zero new bytes (realloc doesn't guarantee zeroed memory) */
+    memset(pNew + p->nDirtyAlloc, 0, needed - p->nDirtyAlloc);
     p->aDirty = pNew;
+    p->nDirtyAlloc = needed;
     return SQLITE_OK;
 }
 
@@ -308,6 +309,11 @@ static int detectPageSize(const unsigned char *aData, sqlite3_int64 nData) {
 static int azqliteClose(sqlite3_file *pFile) {
     azqliteFile *p = (azqliteFile *)pFile;
     int rc = SQLITE_OK;
+
+    /* Flush any remaining dirty pages before closing */
+    if (p->nDirtyPages > 0 && p->ops && p->ops->page_blob_write) {
+        rc = azqliteSync(pFile, 0);
+    }
 
     /* Release lease if held */
     if (hasLease(p) && p->ops && p->ops->lease_release) {
@@ -498,8 +504,15 @@ static int azqliteSync(sqlite3_file *pFile, int flags) {
     }
 
     int nPages = (int)((p->nData + p->pageSize - 1) / p->pageSize);
+    int flushedCount = 0;
     for (int i = 0; i < nPages; i++) {
         if (!dirtyIsPageDirty(p, i)) continue;
+
+        /* Renew lease periodically during large flushes to prevent expiration */
+        if (hasLease(p) && (flushedCount % 50 == 0) && flushedCount > 0) {
+            rc = leaseRenewIfNeeded(p);
+            if (rc != SQLITE_OK) return SQLITE_IOERR_FSYNC;
+        }
 
         sqlite3_int64 offset = (sqlite3_int64)i * p->pageSize;
         size_t len = p->pageSize;
@@ -521,6 +534,7 @@ static int azqliteSync(sqlite3_file *pFile, int flags) {
         if (arc != AZURE_OK) {
             return SQLITE_IOERR_FSYNC;
         }
+        flushedCount++;
     }
 
     dirtyClearAll(p);

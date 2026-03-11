@@ -75,7 +75,12 @@ static int load_items(sqlite3 *db) {
     }
   }
   
-  sqlite3_exec(db, "COMMIT", NULL, NULL, NULL);
+  rc = sqlite3_exec(db, "COMMIT", NULL, NULL, NULL);
+  if (rc != SQLITE_OK) {
+    fprintf(stderr, "Item COMMIT failed: %s (rc=%d)\n", sqlite3_errmsg(db), rc);
+    sqlite3_finalize(stmt);
+    return rc;
+  }
   sqlite3_finalize(stmt);
   
   printf("  Loaded %d items\n", TPCC_NUM_ITEMS);
@@ -120,7 +125,7 @@ static int load_warehouse(sqlite3 *db, int w_id) {
   /* Prepare statements for bulk inserts */
   sqlite3_prepare_v2(db, "INSERT INTO district VALUES (?,?,?,?,?,?,?,?,?,?,?)", -1, &stmt_dist, NULL);
   sqlite3_prepare_v2(db, "INSERT INTO customer VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", -1, &stmt_cust, NULL);
-  sqlite3_prepare_v2(db, "INSERT INTO stock VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", -1, &stmt_stock, NULL);
+  sqlite3_prepare_v2(db, "INSERT INTO stock VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", -1, &stmt_stock, NULL);
   sqlite3_prepare_v2(db, "INSERT INTO orders VALUES (?,?,?,?,?,?,?,?)", -1, &stmt_ord, NULL);
   sqlite3_prepare_v2(db, "INSERT INTO order_line VALUES (?,?,?,?,?,?,?,?,?,?)", -1, &stmt_ol, NULL);
   sqlite3_prepare_v2(db, "INSERT INTO new_order VALUES (?,?,?)", -1, &stmt_no, NULL);
@@ -291,7 +296,11 @@ static int load_warehouse(sqlite3 *db, int w_id) {
   sqlite3_finalize(stmt_no);
   sqlite3_finalize(stmt_hist);
   
-  sqlite3_exec(db, "COMMIT", NULL, NULL, NULL);
+  rc = sqlite3_exec(db, "COMMIT", NULL, NULL, NULL);
+  if (rc != SQLITE_OK) {
+    fprintf(stderr, "Warehouse COMMIT failed: %s (rc=%d)\n", sqlite3_errmsg(db), rc);
+    return rc;
+  }
   
   return SQLITE_OK;
 }

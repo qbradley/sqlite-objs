@@ -44,22 +44,28 @@ txn_result_t tpcc_new_order_txn(sqlite3 *db, int w_id, int num_warehouses) {
   /* Get next order ID for this district */
   const char *sql = "SELECT d_next_o_id FROM district WHERE d_w_id = ? AND d_id = ?";
   rc = sqlite3_prepare_v2(db, sql, -1, &stmt, NULL);
-  if (rc == SQLITE_OK) {
-    sqlite3_bind_int(stmt, 1, w_id);
-    sqlite3_bind_int(stmt, 2, d_id);
-    
-    if (sqlite3_step(stmt) == SQLITE_ROW) {
-      o_id = sqlite3_column_int(stmt, 0);
-    }
-    sqlite3_finalize(stmt);
-  }
-  
-  if (o_id == 0) {
+  if (rc != SQLITE_OK) {
     sqlite3_exec(db, "ROLLBACK", NULL, NULL, NULL);
-    snprintf(result.error_msg, sizeof(result.error_msg), "Failed to get next order ID");
+    snprintf(result.error_msg, sizeof(result.error_msg), "Prepare failed: %s", sqlite3_errmsg(db));
     return result;
   }
   
+  sqlite3_bind_int(stmt, 1, w_id);
+  sqlite3_bind_int(stmt, 2, d_id);
+  
+  rc = sqlite3_step(stmt);
+  if (rc == SQLITE_ROW) {
+    o_id = sqlite3_column_int(stmt, 0);
+  } else {
+    const char *errmsg = sqlite3_errmsg(db);
+    sqlite3_finalize(stmt);
+    sqlite3_exec(db, "ROLLBACK", NULL, NULL, NULL);
+    snprintf(result.error_msg, sizeof(result.error_msg), 
+             "District lookup failed (w=%d,d=%d): rc=%d %s", w_id, d_id, rc, errmsg);
+    return result;
+  }
+  sqlite3_finalize(stmt);
+    
   /* Update district's next order ID */
   sql = "UPDATE district SET d_next_o_id = ? WHERE d_w_id = ? AND d_id = ?";
   rc = sqlite3_prepare_v2(db, sql, -1, &stmt, NULL);
@@ -258,19 +264,26 @@ txn_result_t tpcc_order_status_txn(sqlite3 *db, int w_id, int num_warehouses) {
   const char *sql = "SELECT c_balance, c_first, c_middle, c_last FROM customer "
                     "WHERE c_w_id = ? AND c_d_id = ? AND c_id = ?";
   rc = sqlite3_prepare_v2(db, sql, -1, &stmt, NULL);
-  if (rc == SQLITE_OK) {
-    sqlite3_bind_int(stmt, 1, w_id);
-    sqlite3_bind_int(stmt, 2, d_id);
-    sqlite3_bind_int(stmt, 3, c_id);
-    
-    if (sqlite3_step(stmt) != SQLITE_ROW) {
-      sqlite3_finalize(stmt);
-      sqlite3_exec(db, "ROLLBACK", NULL, NULL, NULL);
-      snprintf(result.error_msg, sizeof(result.error_msg), "Customer not found");
-      return result;
-    }
-    sqlite3_finalize(stmt);
+  if (rc != SQLITE_OK) {
+    sqlite3_exec(db, "ROLLBACK", NULL, NULL, NULL);
+    snprintf(result.error_msg, sizeof(result.error_msg), "Customer prepare: %s", sqlite3_errmsg(db));
+    return result;
   }
+  
+  sqlite3_bind_int(stmt, 1, w_id);
+  sqlite3_bind_int(stmt, 2, d_id);
+  sqlite3_bind_int(stmt, 3, c_id);
+  
+  rc = sqlite3_step(stmt);
+  if (rc != SQLITE_ROW) {
+    const char *errmsg = sqlite3_errmsg(db);
+    sqlite3_finalize(stmt);
+    sqlite3_exec(db, "ROLLBACK", NULL, NULL, NULL);
+    snprintf(result.error_msg, sizeof(result.error_msg), 
+             "Customer not found (w=%d,d=%d,c=%d): rc=%d %s", w_id, d_id, c_id, rc, errmsg);
+    return result;
+  }
+  sqlite3_finalize(stmt);
   
   /* Get most recent order for customer */
   sql = "SELECT o_id, o_entry_d, o_carrier_id FROM orders "

@@ -58,10 +58,15 @@ VFS_PROD_OBJS = $(BUILD_DIR)/azqlite_vfs.o \
 # TPC-C source files
 TPCC_SRCS = tpcc.c tpcc_load.c tpcc_txn.c
 
-# TPC-C objects
-TPCC_OBJS = $(TPCC_BUILD)/tpcc.o \
-            $(TPCC_BUILD)/tpcc_load.o \
-            $(TPCC_BUILD)/tpcc_txn.o
+# TPC-C objects (local version - no VFS)
+TPCC_LOCAL_OBJS = $(TPCC_BUILD)/tpcc_local.o \
+                  $(TPCC_BUILD)/tpcc_load_local.o \
+                  $(TPCC_BUILD)/tpcc_txn_local.o
+
+# TPC-C objects (Azure version - with VFS)
+TPCC_AZURE_OBJS = $(TPCC_BUILD)/tpcc_azure.o \
+                  $(TPCC_BUILD)/tpcc_load_azure.o \
+                  $(TPCC_BUILD)/tpcc_txn_azure.o
 
 # Binaries
 TPCC_LOCAL_BIN = tpcc-local
@@ -78,16 +83,20 @@ all: $(TPCC_LOCAL_BIN)
 all-production: $(TPCC_LOCAL_BIN) $(TPCC_AZURE_BIN)
 
 # Build TPC-C local version
-$(TPCC_LOCAL_BIN): $(TPCC_OBJS) $(SQLITE_OBJ) | $(TPCC_BUILD)
-	$(CC) $(CFLAGS) -o $@ $(TPCC_OBJS) $(SQLITE_OBJ) $(LDFLAGS)
+$(TPCC_LOCAL_BIN): $(TPCC_LOCAL_OBJS) $(SQLITE_OBJ) | $(TPCC_BUILD)
+	$(CC) $(CFLAGS) -o $@ $(TPCC_LOCAL_OBJS) $(SQLITE_OBJ) $(LDFLAGS)
 
 # Build TPC-C Azure version
-$(TPCC_AZURE_BIN): $(TPCC_OBJS) $(SQLITE_OBJ) $(VFS_PROD_OBJS) | $(TPCC_BUILD)
-	$(CC) $(CFLAGS_PROD) -DAZQLITE_VFS_AVAILABLE -o $@ $(TPCC_OBJS) $(SQLITE_OBJ) $(VFS_PROD_OBJS) $(LDFLAGS_PROD)
+$(TPCC_AZURE_BIN): $(TPCC_AZURE_OBJS) $(SQLITE_OBJ) $(VFS_PROD_OBJS) | $(TPCC_BUILD)
+	$(CC) $(CFLAGS_PROD) -DAZQLITE_VFS_AVAILABLE -o $@ $(TPCC_AZURE_OBJS) $(SQLITE_OBJ) $(VFS_PROD_OBJS) $(LDFLAGS_PROD)
 
-# TPC-C object files
-$(TPCC_BUILD)/%.o: %.c tpcc_schema.h | $(TPCC_BUILD)
+# TPC-C object files (local version - no VFS flag)
+$(TPCC_BUILD)/%_local.o: %.c tpcc_schema.h | $(TPCC_BUILD)
 	$(CC) $(CFLAGS) -c -o $@ $<
+
+# TPC-C object files (Azure version - with VFS flag)
+$(TPCC_BUILD)/%_azure.o: %.c tpcc_schema.h | $(TPCC_BUILD)
+	$(CC) $(CFLAGS_PROD) -DAZQLITE_VFS_AVAILABLE -c -o $@ $<
 
 # Build directory
 $(TPCC_BUILD):

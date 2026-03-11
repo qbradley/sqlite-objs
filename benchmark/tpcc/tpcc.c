@@ -46,6 +46,7 @@ typedef struct {
   int num_warehouses;
   int duration_seconds;
   int num_threads;
+  int force_reload;
   char *db_path;
 } benchmark_config_t;
 
@@ -113,6 +114,7 @@ static void print_usage(const char *prog) {
   fprintf(stderr, "  --warehouses N     Number of warehouses (default: 1)\n");
   fprintf(stderr, "  --duration S       Benchmark duration in seconds (default: 60)\n");
   fprintf(stderr, "  --threads N        Number of concurrent threads (default: 1)\n");
+  fprintf(stderr, "  --reload           Force reload data (drops existing tables)\n");
   fprintf(stderr, "  --help             Show this help message\n");
   fprintf(stderr, "\n");
   fprintf(stderr, "For Azure mode, set these environment variables:\n");
@@ -194,8 +196,11 @@ static int run_benchmark(benchmark_config_t *config) {
   sqlite3_exec(db, "PRAGMA synchronous=NORMAL", NULL, NULL, NULL);
   sqlite3_exec(db, "PRAGMA cache_size=10000", NULL, NULL, NULL);
   
-  /* Check if database is empty (needs loading) */
+  /* Check if database has data (not just tables) */
   sqlite3_stmt *stmt = NULL;
+  int needs_load = 0;
+  
+  /* Check if tables exist */
   rc = sqlite3_prepare_v2(db, "SELECT COUNT(*) FROM sqlite_master WHERE type='table'", -1, &stmt, NULL);
   int table_count = 0;
   if (rc == SQLITE_OK) {
@@ -206,6 +211,38 @@ static int run_benchmark(benchmark_config_t *config) {
   }
   
   if (table_count == 0) {
+    needs_load = 1;
+  } else if (!config->force_reload) {
+    /* Tables exist - check if data was loaded */
+    rc = sqlite3_prepare_v2(db, "SELECT COUNT(*) FROM district", -1, &stmt, NULL);
+    int district_count = 0;
+    if (rc == SQLITE_OK) {
+      if (sqlite3_step(stmt) == SQLITE_ROW) {
+        district_count = sqlite3_column_int(stmt, 0);
+      }
+      sqlite3_finalize(stmt);
+    }
+    if (district_count == 0) {
+      printf("\nWarning: Tables exist but no data found. Use --reload to force reload.\n");
+      needs_load = 1;
+    }
+  }
+  
+  if (config->force_reload) {
+    printf("\nDropping existing tables...\n");
+    sqlite3_exec(db, "DROP TABLE IF EXISTS warehouse", NULL, NULL, NULL);
+    sqlite3_exec(db, "DROP TABLE IF EXISTS district", NULL, NULL, NULL);
+    sqlite3_exec(db, "DROP TABLE IF EXISTS customer", NULL, NULL, NULL);
+    sqlite3_exec(db, "DROP TABLE IF EXISTS history", NULL, NULL, NULL);
+    sqlite3_exec(db, "DROP TABLE IF EXISTS orders", NULL, NULL, NULL);
+    sqlite3_exec(db, "DROP TABLE IF EXISTS new_order", NULL, NULL, NULL);
+    sqlite3_exec(db, "DROP TABLE IF EXISTS order_line", NULL, NULL, NULL);
+    sqlite3_exec(db, "DROP TABLE IF EXISTS item", NULL, NULL, NULL);
+    sqlite3_exec(db, "DROP TABLE IF EXISTS stock", NULL, NULL, NULL);
+    needs_load = 1;
+  }
+  
+  if (needs_load) {
     printf("\nCreating schema...\n");
     rc = sqlite3_exec(db, TPCC_CREATE_TABLES, NULL, NULL, NULL);
     if (rc != SQLITE_OK) {
@@ -221,11 +258,26 @@ static int run_benchmark(benchmark_config_t *config) {
       sqlite3_close(db);
       return 1;
     }
+    
+    /* Verify data was loaded successfully */
+    sqlite3_stmt *vstmt = NULL;
+    sqlite3_prepare_v2(db, "SELECT COUNT(*) FROM district", -1, &vstmt, NULL);
+    int verify_count = 0;
+    if (sqlite3_step(vstmt) == SQLITE_ROW) {
+      verify_count = sqlite3_column_int(vstmt, 0);
+    }
+    sqlite3_finalize(vstmt);
+    if (verify_count == 0) {
+      fprintf(stderr, "ERROR: Data load reported success but no districts found!\n");
+      sqlite3_close(db);
+      return 1;
+    }
+    printf("\nVerified: %d districts loaded successfully.\n", verify_count);
   } else {
     printf("\nUsing existing database (skipping data load)\n");
   }
   
-  printf("\nStarting benchmark run...\n");
+  printf("\nStarting benchmark run...\n");;
   printf("=================================================================\n");
   
   srand(time(NULL));
@@ -406,6 +458,8 @@ int main(int argc, char **argv) {
         fprintf(stderr, "Warning: multi-threading not yet implemented, using 1 thread\n");
         config.num_threads = 1;
       }
+    } else if (strcmp(argv[i], "--reload") == 0) {
+      config.force_reload = 1;
     } else if (strcmp(argv[i], "--help") == 0) {
       print_usage(argv[0]);
       return 0;
