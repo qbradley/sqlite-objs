@@ -47,6 +47,7 @@ typedef struct {
   int duration_seconds;
   int num_threads;
   int force_reload;
+  int skip_load;
   char *db_path;
 } benchmark_config_t;
 
@@ -115,6 +116,7 @@ static void print_usage(const char *prog) {
   fprintf(stderr, "  --duration S       Benchmark duration in seconds (default: 60)\n");
   fprintf(stderr, "  --threads N        Number of concurrent threads (default: 1)\n");
   fprintf(stderr, "  --reload           Force reload data (drops existing tables)\n");
+  fprintf(stderr, "  --skip-load        Skip data loading (use existing data)\n");
   fprintf(stderr, "  --help             Show this help message\n");
   fprintf(stderr, "\n");
   fprintf(stderr, "For Azure mode, set these environment variables:\n");
@@ -200,46 +202,51 @@ static int run_benchmark(benchmark_config_t *config) {
   sqlite3_stmt *stmt = NULL;
   int needs_load = 0;
   
-  /* Check if tables exist */
-  rc = sqlite3_prepare_v2(db, "SELECT COUNT(*) FROM sqlite_master WHERE type='table'", -1, &stmt, NULL);
-  int table_count = 0;
-  if (rc == SQLITE_OK) {
-    if (sqlite3_step(stmt) == SQLITE_ROW) {
-      table_count = sqlite3_column_int(stmt, 0);
-    }
-    sqlite3_finalize(stmt);
-  }
-  
-  if (table_count == 0) {
-    needs_load = 1;
-  } else if (!config->force_reload) {
-    /* Tables exist - check if data was loaded */
-    rc = sqlite3_prepare_v2(db, "SELECT COUNT(*) FROM district", -1, &stmt, NULL);
-    int district_count = 0;
+  if (config->skip_load) {
+    printf("\nSkipping data load (--skip-load)\n");
+    needs_load = 0;
+  } else {
+    /* Check if tables exist */
+    rc = sqlite3_prepare_v2(db, "SELECT COUNT(*) FROM sqlite_master WHERE type='table'", -1, &stmt, NULL);
+    int table_count = 0;
     if (rc == SQLITE_OK) {
       if (sqlite3_step(stmt) == SQLITE_ROW) {
-        district_count = sqlite3_column_int(stmt, 0);
+        table_count = sqlite3_column_int(stmt, 0);
       }
       sqlite3_finalize(stmt);
     }
-    if (district_count == 0) {
-      printf("\nWarning: Tables exist but no data found. Use --reload to force reload.\n");
+    
+    if (table_count == 0) {
+      needs_load = 1;
+    } else if (!config->force_reload) {
+      /* Tables exist - check if data was loaded */
+      rc = sqlite3_prepare_v2(db, "SELECT COUNT(*) FROM district", -1, &stmt, NULL);
+      int district_count = 0;
+      if (rc == SQLITE_OK) {
+        if (sqlite3_step(stmt) == SQLITE_ROW) {
+          district_count = sqlite3_column_int(stmt, 0);
+        }
+        sqlite3_finalize(stmt);
+      }
+      if (district_count == 0) {
+        printf("\nWarning: Tables exist but no data found. Use --reload to force reload.\n");
+        needs_load = 1;
+      }
+    }
+    
+    if (config->force_reload) {
+      printf("\nDropping existing tables...\n");
+      sqlite3_exec(db, "DROP TABLE IF EXISTS warehouse", NULL, NULL, NULL);
+      sqlite3_exec(db, "DROP TABLE IF EXISTS district", NULL, NULL, NULL);
+      sqlite3_exec(db, "DROP TABLE IF EXISTS customer", NULL, NULL, NULL);
+      sqlite3_exec(db, "DROP TABLE IF EXISTS history", NULL, NULL, NULL);
+      sqlite3_exec(db, "DROP TABLE IF EXISTS orders", NULL, NULL, NULL);
+      sqlite3_exec(db, "DROP TABLE IF EXISTS new_order", NULL, NULL, NULL);
+      sqlite3_exec(db, "DROP TABLE IF EXISTS order_line", NULL, NULL, NULL);
+      sqlite3_exec(db, "DROP TABLE IF EXISTS item", NULL, NULL, NULL);
+      sqlite3_exec(db, "DROP TABLE IF EXISTS stock", NULL, NULL, NULL);
       needs_load = 1;
     }
-  }
-  
-  if (config->force_reload) {
-    printf("\nDropping existing tables...\n");
-    sqlite3_exec(db, "DROP TABLE IF EXISTS warehouse", NULL, NULL, NULL);
-    sqlite3_exec(db, "DROP TABLE IF EXISTS district", NULL, NULL, NULL);
-    sqlite3_exec(db, "DROP TABLE IF EXISTS customer", NULL, NULL, NULL);
-    sqlite3_exec(db, "DROP TABLE IF EXISTS history", NULL, NULL, NULL);
-    sqlite3_exec(db, "DROP TABLE IF EXISTS orders", NULL, NULL, NULL);
-    sqlite3_exec(db, "DROP TABLE IF EXISTS new_order", NULL, NULL, NULL);
-    sqlite3_exec(db, "DROP TABLE IF EXISTS order_line", NULL, NULL, NULL);
-    sqlite3_exec(db, "DROP TABLE IF EXISTS item", NULL, NULL, NULL);
-    sqlite3_exec(db, "DROP TABLE IF EXISTS stock", NULL, NULL, NULL);
-    needs_load = 1;
   }
   
   if (needs_load) {
@@ -460,6 +467,8 @@ int main(int argc, char **argv) {
       }
     } else if (strcmp(argv[i], "--reload") == 0) {
       config.force_reload = 1;
+    } else if (strcmp(argv[i], "--skip-load") == 0) {
+      config.skip_load = 1;
     } else if (strcmp(argv[i], "--help") == 0) {
       print_usage(argv[0]);
       return 0;
