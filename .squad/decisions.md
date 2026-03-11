@@ -202,6 +202,88 @@ Three-binary architecture: lightweight harness that shells out to speedtest1 sub
 
 ---
 
+### D15: Performance Optimization Design (D-PERF)
+**Date:** 2026-03-11 | **From:** Gandalf (Synthesis), Frodo (Azure Research), Aragorn (VFS Analysis)
+
+4-phase optimization design to eliminate xSync bottleneck (serial page writes = 500s for 5000 pages). Combined techniques reduce clustered commits from 500s → 0.2–0.5s (1000×) and scattered commits from 500s → 5–10s (50–100×).
+
+**Phase 1: Page Coalescing** — Merge contiguous dirty pages into single PUT requests (up to 4 MiB per Azure limit). Low complexity, 5–50× speedup for sequential workloads.
+
+**Phase 2: Parallel Flush via curl_multi** — Issue all coalesced PUTs concurrently through single-threaded event loop. Medium complexity, 5–15× speedup for scattered workloads. **Key decision: curl_multi over pthreads** for simplicity, determinism, and native connection pooling.
+
+**Phase 3: Connection Pooling + Proactive Lease Renewal** — Sustain throughput during large flushes (64 concurrent connections, renew lease every 15s during long sync). Deferred to MVP 1.5.
+
+**Phase 4: Journal Chunking** — Parallelize block blob journal upload. Speculative; deferred.
+
+**Concurrency:** 32 parallel connections (per Gandalf analysis, balances connection overhead against Azure's 60 MiB/s throughput limit).
+
+**PRAGMA synchronous:** Recommend NORMAL by default (skips pre-nRec sync, saves one journal upload per commit without violating durability). Users can override to FULL or OFF.
+
+**xSync durability:** Confirmed non-negotiable. Parallel flush happens **within xSync boundaries** — all writes must be confirmed before xSync returns. No pre-flush (corruption window before journal sync). No page copies needed (btree mutex guarantees aData stability during xSync).
+
+**Thread pool:** Not needed for MVP 1 (curl_multi is sufficient). If pre-flush implemented later, use 8–16 worker threads with own curl handles.
+
+---
+
+### D16: Azure Put Page Batch Capability — curl_multi is Winning Strategy
+**Date:** 2026-03-11 | **From:** Frodo (Azure Expert)
+
+**Azure Batch API does NOT support Put Page.** Azure Batch (`POST ?comp=batch`) only supports Delete Blob and Set Blob Tier; Put Page operations cannot be batched. This invalidates the Batch API research direction.
+
+**Alternative: curl_multi parallelism with page coalescing** emerges as the winning strategy:
+- Page coalescing: merge contiguous runs up to 4 MiB per PUT request (application-level, not Azure)
+- curl_multi: parallel HTTP via single-threaded event loop (64 concurrent connections well under Azure's 500 req/s limit)
+- Connection pooling and TLS session caching reduce per-request overhead
+- HTTP/2 multiplexing not available (Azure only supports HTTP/1.1); parallelism requires multiple connections
+
+**Impact:** Frodo + Aragorn research combined into D-PERF design above.
+
+---
+
+### D17: VFS Write-Back Cache with Parallel xSync Flush
+**Date:** 2026-03-11 | **From:** Aragorn (SQLite/C Dev)
+
+**Architectural confirmation:** Parallel flush at xSync time is safe and non-negotiable properties:
+
+1. **btree mutex guarantees aData stability** — During xSync, btree mutex is held; SQLite cannot call xWrite. Background (or parallel curl) reads from aData safely without copy-on-write.
+
+2. **No pre-flush** — Uploading DB pages before journal sync creates corruption window (journal hasn't proven durability yet). SQLite may overwrite pages multiple times before xSync (wasted uploads). Parallelism must happen **within xSync**, not before.
+
+3. **xSync durability is non-negotiable** — When xSync returns SQLITE_OK, all dirty pages must be confirmed durable in Azure. Cannot return early. This is the foundational invariant of SQLite's crash-recovery model.
+
+4. **PRAGMA synchronous=NORMAL is safe** — Skips pre-nRec journal sync (saves one journal upload per commit). Post-nRec sync and DB sync still performed. SQLite's recovery path handles nRec recomputation on power failure (well-tested).
+
+5. **Lease renewal during long flush** — Implement proactive renewal (every 15s) from main thread with own connection to prevent 30s lease expiry during large parallel flush.
+
+6. **Thread pool design** — If ever needed for pre-flush (Phase 4 future work): 8–16 workers, each with own curl handle. Current MVP 1 uses curl_multi (single-threaded) — sufficient and simpler.
+
+**Impact:** Research findings locked in; implementation can proceed with confidence on thread safety and durability.
+
+---
+
+### D18: TPC-C OLTP Benchmark Implementation
+**Date:** 2026-03-11 | **From:** Aragorn (SQLite/C Dev)
+
+Created custom TPC-C simplified OLTP benchmark to measure realistic transaction workloads (vs. upstream SQLite speedtest1 which is I/O focused). Benchmark suite:
+
+- **Two binaries:** `tpcc-local` (local SQLite only, no Azure deps), `tpcc-azure` (with azqlite VFS)
+- **Schema:** 8 tables (warehouse, district, customer, item, stock, orders, history)
+- **Transactions:** New Order (45%), Payment (43%), Order Status (12%)
+- **Metrics:** Per-transaction latency (p50, p95, p99), throughput (tps)
+
+**Baseline (local SQLite, 1 warehouse, 10s run):**
+- Throughput: 3,138 tps
+- New Order: avg 0.4ms, p95 0.5ms
+- Payment: avg 0.2ms, p95 0.3ms
+
+**Expected Azure performance:** 5–20 tps (100–600× slower due to network latency, mitigated by in-memory cache).
+
+**Rationale:** Industry-standard benchmark, models real OLTP workloads, two-binary approach avoids forcing Azure dependencies on users, latency percentiles more relevant than total throughput for OLTP.
+
+**Impact:** Performance comparison baseline established; can measure impact of D-PERF optimization phases.
+
+---
+
 ## Governance
 
 - All meaningful changes require team consensus

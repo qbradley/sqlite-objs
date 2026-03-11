@@ -189,4 +189,71 @@ Gandalf's review identified two critical issues (C1, C2) that must be fixed befo
 
 **Impact:** Code approved for demo once both fixes applied. No re-review needed — fixes are mechanical.
 
+### TPC-C OLTP Benchmark Implementation (2026-03-11)
+
+**Problem:** Need a realistic OLTP benchmark to compare local SQLite vs azqlite performance. Existing speedtest1 benchmark is good for basic performance but doesn't reflect realistic transaction workloads with complex multi-table operations.
+
+**Solution:** Implemented custom TPC-C style benchmark in `benchmark/tpcc/`:
+
+**Files created:**
+- `tpcc_schema.h` (155 lines) — TPC-C schema SQL and constants (8 tables: warehouse, district, customer, item, stock, orders, order_line, new_order, history)
+- `tpcc_load.c` (332 lines) — Data loader populating 100K items + W warehouses + 10 districts/warehouse + 3K customers/district
+- `tpcc_txn.c` (321 lines) — Three core transactions: New Order (45%), Payment (43%), Order Status (12%)
+- `tpcc.c` (430 lines) — Main benchmark driver with latency tracking, percentile calculation, and formatted output
+- `Makefile` (155 lines) — Builds `tpcc-local` (default VFS) and `tpcc-azure` (azqlite VFS) versions
+- `README.md` (161 lines) — Usage documentation and TPC-C schema overview
+
+**Key design patterns:**
+- **Two binaries:** `tpcc-local` (no Azure deps) and `tpcc-azure` (requires production VFS build)
+- **Conditional compilation:** `#ifdef AZQLITE_VFS_AVAILABLE` to avoid linker errors in local-only build
+- **Auto schema/load:** Detects empty database and creates schema + loads data automatically
+- **Latency tracking:** Stores all transaction latencies for percentile calculation (p50, p95, p99)
+- **Transaction mix:** Randomized 45/43/12 split matching TPC-C spec (simplified to 3 transactions)
+- **Progress indicator:** Shows transaction count every 100 txns during benchmark run
+
+**Performance baseline (local, 1 warehouse, 10s run):**
+- Throughput: ~3,138 tps (31,380 transactions in 10 seconds)
+- New Order: avg 0.4ms, p95 0.5ms, p99 0.8ms
+- Payment: avg 0.2ms, p95 0.3ms, p99 0.5ms
+- Database size: ~46 MB (100K items, 10 districts, 30K customers)
+
+**Transaction implementations:**
+- **New Order:** Get next order ID from district, insert order + new_order + 5-15 order_line rows, update stock quantities
+- **Payment:** Update warehouse/district/customer YTD amounts, insert history record
+- **Order Status:** Query customer's most recent order and all order lines (read-only)
+
+**Scale factors:** 1 warehouse = 100K items + 30K customers (~100 MB DB). 10 warehouses = ~750 MB DB.
+
+**Integration:** Lives in `benchmark/tpcc/` subdirectory. Independent Makefile. Reuses parent `build/` objects. Parallel to existing `benchmark/` speedtest1 harness.
+
+**Usage examples:**
+```bash
+# Local baseline
+make all && ./tpcc-local --local --warehouses 1 --duration 60
+
+# Azure comparison (after make all-production)
+export AZURE_STORAGE_ACCOUNT=...
+./tpcc-azure --azure --warehouses 1 --duration 60
+```
+
+**Remaining work:** Multi-threading support (--threads N currently warns and forces N=1). Azure VFS testing requires production build completion.
+
+### VFS Async I/O & Write-Back Cache Research (2026-03-11)
+
+**xSync durability contract is absolute.** When xSync returns SQLITE_OK, all prior xWrite data MUST be durable. The journal cannot protect against a lying xSync — it's the foundational assumption, not a recoverable error. We CANNOT return from xSync before Azure confirms all writes. Verified by tracing sqlite3PagerCommitPhaseOne (sqlite3.c:65528): journal sync → dirty page write → DB sync → journal delete. If any sync lies, the next step proceeds under false assumptions.
+
+**Threading is safe for parallel flush at xSync time.** The btree mutex (pBt->mutex) is held by the caller during xSync (sqlite3.c:72395), so SQLite cannot call xWrite concurrently. This means background threads can read aData directly during xSync without copies or locks. SQLite provides SQLITE_MUTEX_STATIC_VFS3 (sqlite3.c:8915) explicitly for custom VFS concurrency. sqlite3_malloc is thread-safe. Each worker thread needs its own curl handle (not thread-safe).
+
+**Page coalescing is the biggest single win.** Azure Put Page supports up to 4MB per request. Contiguous dirty pages (common in sequential workloads like INSERT) can be coalesced into single PUTs. 100 contiguous 4KB pages → one 400KB PUT instead of 100 PUTs. Algorithm: scan dirty bitmap for contiguous runs, cap at 4MB. Combined with parallelism, this transforms 100-page sync from ~10s to ~150ms.
+
+**No page copies needed during xSync.** Since btree mutex prevents concurrent xWrite, aData is stable during the entire xSync. Background threads can read directly. Copy-on-write only needed for future pre-flush optimization (not recommended for MVP).
+
+**synchronous=NORMAL saves one journal sync per commit.** FULL does 2 journal syncs + 1 DB sync. NORMAL does 1 journal sync + 1 DB sync. For block blob journal, this saves one complete blob upload per commit. Trade-off is acceptable for remote storage.
+
+**Pre-flush (uploading before xSync) is dangerous.** Before journal sync, DB page writes to Azure create a corruption window. If crash occurs after partial pre-flush but before journal sync, original pages are lost with no journal to roll back. Defer to future optimization if ever.
+
+**Key risks:** (1) Partial flush failure — retry within xSync, fall back to SQLITE_IOERR_FSYNC after exhaustion; journal rollback handles recovery. (2) Lease expiry during long flush — renew proactively from main thread. (3) curl handles not thread-safe — each worker needs its own.
+
+**Findings written to:** `.squad/decisions/inbox/aragorn-vfs-async-constraints.md`
+
 

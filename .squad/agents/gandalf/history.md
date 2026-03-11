@@ -65,3 +65,16 @@ Completed comprehensive design review (D1-D11). Verdict: **APPROVE WITH CONDITIO
 - C2: URL buffer (Frodo) — replace `strcat` with bounds-checked `snprintf`
 
 **Status:** SUCCESS. Awaiting C1/C2 fixes. Code review re-check not required — fixes are mechanical.
+
+### Performance Optimization Design (2026-03-11)
+
+- **Produced comprehensive performance design:** `.squad/decisions/inbox/gandalf-performance-design.md` (D-PERF). Synthesized research from Frodo (Azure parallel writes, curl_multi, batch API) and Aragorn (VFS async constraints, threading model, xSync durability contract).
+- **Key decision: curl_multi over pthreads.** Single-threaded event loop eliminates all threading hazards (no mutexes, no data races, no curl handle sharing issues). Lease renewal trivially integrates into the event loop. Frodo was right; Aragorn's pthread design is sound but unnecessary complexity for I/O-bound work.
+- **Key decision: 32 parallel connections.** Halved Frodo's recommendation of 64 — 32 already exceeds Azure's 60 MiB/s per-blob throughput limit with 4 MiB coalesced writes. Tunable via compile-time `#define`.
+- **Key decision: No page copies during xSync.** Aragorn proved btree mutex is held during xSync → aData is stable → zero-copy parallel flush is safe. This only holds because we use curl_multi (single-threaded), not pthreads.
+- **Key decision: PRAGMA synchronous=NORMAL default.** Saves one journal upload per commit. FULL costs an extra HTTP round-trip for marginal safety gain (SQLite handles nRec recovery gracefully).
+- **Key decision: No pre-flush.** Both researchers agree. Pre-flush creates corruption windows (journal not yet synced) and data races (xWrite vs in-flight uploads). Parallel-at-xSync delivers 50–1000× improvement.
+- **Addressed user's write-through/write-back request directly.** azqlite is already write-through (xWrite→memcpy). Pure async write-back is unsafe (xSync cannot lie). The design gives the user what they want: instant writes + parallel flush at sync time.
+- **4-phase implementation plan:** (1) Coalescing only — 1–2 days, ≥5× for sequential, (2) curl_multi parallel — 3–5 days, ≥50× for bulk, (3) Connection pooling + lease hardening — 1–2 days, (4) Journal chunked upload — 2–3 days. Each phase delivers measurable value.
+- **Projected performance:** 100-page clustered commit drops from 10s → ~200ms. 5,000-page bulk load drops from 500s → ~500ms. VACUUM 100MB drops from 2500s → ~2s.
+- **9-item risk register** covering partial failure, lease expiry, throttling, Azurite compatibility, memory, vtable changes, TLS caching, alignment bugs, and event loop starvation.

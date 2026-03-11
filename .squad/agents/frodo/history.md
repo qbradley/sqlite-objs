@@ -116,3 +116,16 @@ Completed orchestration summary:
 **Impact:** Blocks full Layer 2 validation and production auth path. Workaround: use SAS tokens for testing.
 
 **Status:** IN PROGRESS. Research phase started.
+
+### Azure Parallel Write Performance Research (2026-03-10)
+
+- **Problem:** xSync flushes dirty pages one-by-one via sequential HTTP PUT. 5000 dirty pages × ~100ms = 500 seconds. Unacceptable.
+- **Azure Put Page:** One contiguous range per request, max 4 MiB, 512-byte aligned. No multi-range support in a single call.
+- **Azure Batch API:** Dead end — only supports Delete Blob and Set Blob Tier. Put Page NOT supported.
+- **HTTP/2:** Dead end — Azure Blob Storage only supports HTTP/1.1. No multiplexing available.
+- **Azure per-blob limits:** 500 requests/sec, 60 MiB/s throughput. Plenty of headroom.
+- **Recommended optimization — Phase 1 (Coalesce):** Scan dirty bitmap, merge adjacent dirty pages into single PUT requests up to 4 MiB (1024 × 4KB pages per request). Application-level optimization. Could reduce 5000 PUTs to 5-50 if writes are clustered (common for SQLite B-tree mods).
+- **Recommended optimization — Phase 2 (curl_multi):** Use libcurl's multi interface for parallel HTTP requests. Single-threaded event loop, 64 concurrent connections, connection pooling. Key settings: CURLMOPT_MAX_HOST_CONNECTIONS=64, CURLMOPT_MAXCONNECTS=64. Requires new CURLM handle + pool of easy handles (replaces single curl_easy reuse pattern).
+- **New API proposed:** `page_blob_write_batch(ctx, name, ranges[], nRanges, lease_id, err)` with `azure_page_range_t` struct. Additive to azure_ops_t vtable — backward compatible. Mock can loop over ranges sequentially.
+- **Combined impact:** Clustered 5000 pages: 500s → ~0.2-0.5s. Scattered 5000 pages: 500s → ~5-10s.
+- **Full report:** `.squad/decisions/inbox/frodo-azure-parallel-writes.md`
