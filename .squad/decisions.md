@@ -261,6 +261,30 @@ Three-binary architecture: lightweight harness that shells out to speedtest1 sub
 
 ---
 
+### Phase 1 Page Coalescing Implementation (2026-03-11)
+
+**Problem:** xSync flushed each dirty page as a separate Azure Put Page request. For sequential workloads (100 contiguous dirty pages), this meant 100 HTTP round-trips (~10s).
+
+**Solution:** Implemented `coalesceDirtyRanges()` in `azqlite_vfs.c` — scans dirty bitmap left-to-right, merges contiguous dirty pages into single `azure_page_range_t` ranges, caps each at 4 MiB (Azure Put Page limit). Sequential fallback iterates coalesced ranges instead of individual pages.
+
+**Files modified:**
+- `src/azure_client.h` — Added `azure_page_range_t` struct and `AZQLITE_MAX_PARALLEL_PUTS` define. Added `page_blob_write_batch` to end of `azure_ops_t` vtable (NULL until Phase 2 curl_multi).
+- `src/azqlite_vfs.c` — Added `coalesceDirtyRanges()`, rewrote `azqliteSync` MAIN_DB path: coalesce → try batch (NULL for now) → sequential fallback with lease renewal every 50 ranges.
+- `src/azure_client.c` — Added `.page_blob_write_batch = NULL` to production vtable.
+- `src/azure_client_stub.c` — Added `NULL` for `page_blob_write_batch` to stub vtable.
+- `test/mock_azure_ops.c` — Added `.page_blob_write_batch = NULL` to mock vtable.
+- `test/test_vfs.c` — Updated `vfs_sync_mid_flush_failure` test: fail at call 1 instead of call 2 (coalescing reduces write count below 2 for contiguous pages).
+
+**Key design choices:**
+- Stack-allocate range array for ≤64 ranges, heap-allocate via `sqlite3_malloc64` for larger flushes.
+- `page_blob_write_batch` added at END of struct — existing code with NULL-initialized vtables (mocks, stubs) gets implicit NULL without code changes.
+- Sequential fallback renews lease every 50 coalesced ranges (matching old per-page renewal cadence).
+- No copies of aData needed — btree mutex guarantees stability during xSync (per D17).
+
+**Result:** 196/196 unit tests pass. Clean build with zero warnings. Phase 2 (curl_multi parallel batch) can now slot in by implementing `page_blob_write_batch`.
+
+---
+
 ### D18: TPC-C OLTP Benchmark Implementation
 **Date:** 2026-03-11 | **From:** Aragorn (SQLite/C Dev)
 
@@ -281,6 +305,28 @@ Created custom TPC-C simplified OLTP benchmark to measure realistic transaction 
 **Rationale:** Industry-standard benchmark, models real OLTP workloads, two-binary approach avoids forcing Azure dependencies on users, latency percentiles more relevant than total throughput for OLTP.
 
 **Impact:** Performance comparison baseline established; can measure impact of D-PERF optimization phases.
+
+---
+
+### D19: Phase 1 Coalescing Test Suite
+**Date:** 2026-03-11 | **From:** Samwise (QA)
+
+10 unit tests for Phase 1 page coalescing. 9 active, 1 gated. All 205 tests passing.
+
+**Test design:**
+- **Approach:** Option B (test via xSync) — tests the full VFS integration path, validates real code execution
+- **Mock write recording:** `mock_write_record_t` tracking records `{offset, len}` for each page blob write call
+- **Gating strategy:** Coalescing-specific assertions (e.g., "100 contiguous pages → ≤2 writes") gated behind `ENABLE_COALESCE_TESTS`; correctness assertions always run
+- **maxranges_overflow test:** Requires `azqlite_test_coalesce_dirty_ranges()` exposed behind `AZQLITE_TESTING` flag for direct algorithm testing
+
+**Impact:** Write recording seam enables coalescing algorithm verification without exposing internals. All 9 coalescing tests pass; 1 gated test awaits algorithm exposure.
+
+---
+
+### UD5: User Directive — Use claude-opus-4.6 for Performance Optimization
+**Date:** 2026-03-11 | **From:** Quetzal Bradley (via Copilot)
+
+Use claude-opus-4.6 for all agents during performance optimization implementation. Complicated feature requires highest quality reasoning.
 
 ---
 

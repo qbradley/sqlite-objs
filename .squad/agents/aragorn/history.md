@@ -257,3 +257,14 @@ export AZURE_STORAGE_ACCOUNT=...
 **Findings written to:** `.squad/decisions/inbox/aragorn-vfs-async-constraints.md`
 
 
+
+### Phase 1 Page Coalescing Implementation (2026-03-11)
+
+**What:** Implemented `coalesceDirtyRanges()` — scans dirty bitmap, merges contiguous pages into ≤4MiB ranges, rewrites azqliteSync to flush coalesced ranges instead of individual pages. Added `azure_page_range_t` and `page_blob_write_batch` (NULL) to azure_ops_t vtable for Phase 2 readiness.
+
+**Key learnings:**
+- Adding fields to END of azure_ops_t is backward-compatible — C zero-initializes trailing struct members.
+- Stack-allocating 64 ranges (64 × 24 bytes = 1.5 KiB) is cheap and covers most workloads.
+- `vfs_sync_mid_flush_failure` test assumed per-page write count. Coalescing reduces calls — test updated to fail at call 1.
+- `sqlite3_malloc64`/`sqlite3_free` preferred over raw malloc/free inside VFS code for SQLite memory accounting.
+- 4MiB cap = 1024 × 4096-byte pages per range. Most workloads will produce 1-3 ranges per sync.

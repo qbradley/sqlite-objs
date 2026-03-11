@@ -12,6 +12,7 @@
 - Test network failures: Azure unreachable mid-write, partial writes, auth failures
 - Test locking: single writer, many readers (MVP 1), multi-machine (MVP 3-4)
 - License: MIT
+- **Test count:** 205 unit tests (196 original + 9 coalescing tests active, 1 gated behind ENABLE_COALESCE_TESTS)
 
 ## Learnings
 
@@ -122,3 +123,28 @@ Completed Layer 2 infrastructure: 75 integration test cases written against Azur
   - `azure_lease_release(ctx, blob_name, lease_id)` → return success/error
   - `azure_lease_check(ctx, blob_name)` → return 1 if held, 0 if not, <0 if error
 - **Mock testing strategies:** Fault injection (simulate Azure errors), latency (inject delays), state (track blob contents, leases), edge cases (EOF reads, partial writes).
+
+### Phase 1 Page Coalescing Test Suite (2026-03-11)
+
+- **9 active tests, 1 gated** (total: 205 unit tests now passing).
+- **Files modified:**
+  - `test/test_coalesce.c` — New file. 10 tests for dirty-page coalescing validation.
+  - `test/mock_azure_ops.h` — Added `mock_write_record_t`, write recording API (`mock_get_write_record_count`, `mock_get_write_record`, `mock_clear_write_records`).
+  - `test/mock_azure_ops.c` — Added write recording in `mock_page_blob_write`: captures offset/len of every write call. Write records reset on `mock_reset()`.
+  - `test/test_main.c` — Added `#include "test_coalesce.c"` and `run_coalesce_tests()` call.
+  - `Makefile` — Added `test_coalesce.c` to test_main dependencies.
+- **Test coverage (all 10 from D15 spec Section 9):**
+  1. `coalesce_empty` — No dirty pages after read-only ops → 0 writes. ✅ Active.
+  2. `coalesce_single` — Single insert → 1+ writes with correct alignment. ✅ Active.
+  3. `coalesce_contiguous` — 100 contiguous pages → verifies alignment/ordering. Coalescing assertion gated. ✅ Active.
+  4. `coalesce_scattered` — Multiple table updates → scattered writes. ✅ Active.
+  5. `coalesce_4mb_split` — 1200 pages (>4 MiB) → verifies 4 MiB limit respected. Coalescing assertion gated. ✅ Active.
+  6. `coalesce_every_other` — Scattered updates across indexed table → multiple non-contiguous writes. ✅ Active.
+  7. `coalesce_last_page_short` — Small DB → all writes 512-aligned including short last page. ✅ Active.
+  8. `coalesce_maxranges_overflow` — Direct algorithm test requiring `azqlite_test_coalesce_dirty_ranges` exposure. 🔒 Gated behind `ENABLE_COALESCE_TESTS`.
+  9. `sync_coalesced_sequential` — Full round-trip: write 50 rows, sync, close, reopen, verify all data intact. ✅ Active.
+  10. `sync_batch_null_fallback` — Confirms `page_blob_write_batch=NULL` → sequential `page_blob_write` fallback with correct data. ✅ Active.
+- **Test approach:** Option B (test via xSync) preferred for 9 of 10 tests. Creates known workload patterns through SQLite operations, verifies mock write records for alignment/ordering/limits, and checks data integrity through close/reopen cycles.
+- **Helper assertions:** `assert_writes_aligned()`, `assert_writes_ordered_nonoverlapping()`, `assert_writes_within_4mb()` — reusable validators for any test that checks write patterns.
+- **Mock write recording:** Each `page_blob_write` call now records `{offset, len}` in `ctx->write_records[]` (up to 1024 entries). This is the key test seam for coalescing verification.
+- **Handoff for Aragorn:** When coalesceDirtyRanges is implemented, enable coalescing-specific assertions by defining `ENABLE_COALESCE_TESTS`. Also expose `azqlite_test_coalesce_dirty_ranges()` for test 8 (maxranges_overflow).
