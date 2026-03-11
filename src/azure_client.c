@@ -937,6 +937,428 @@ static azure_err_t az_lease_break(void *ctx, const char *name,
 }
 
 /* ================================================================
+ * BATCH PAGE BLOB WRITES — curl_multi parallel flush (Phase 2)
+ *
+ * Writes multiple page ranges concurrently using libcurl's multi
+ * interface.  Each range becomes a separate PUT Page request driven
+ * by a single-threaded event loop.
+ *
+ * Retry: failed ranges are retried up to 3 times with exponential
+ * backoff.  Lease is renewed every 15 seconds during long flushes.
+ *
+ * Precondition: range data pointers are stable (btree mutex held
+ * during xSync — see decision D17).
+ * ================================================================ */
+
+#define BATCH_MAX_RETRIES        3
+#define BATCH_LEASE_RENEWAL_SEC  15
+
+/* Per-request context for one range in a batch */
+typedef struct {
+    CURL                     *easy;
+    struct curl_slist        *hdrs;
+    azure_buffer_t            resp_body;
+    azure_response_headers_t  resp_hdrs;
+    int                       range_idx;
+} batch_req_t;
+
+/*
+ * Configure one CURL easy handle for a Put Page request.
+ * url must remain valid for the handle's lifetime.
+ */
+static azure_err_t batch_init_easy(
+    azure_client_t *c,
+    const char *url,
+    const char *blob_name,
+    const azure_page_range_t *range,
+    const char *lease_id,
+    batch_req_t *req)
+{
+    req->easy = curl_easy_init();
+    if (!req->easy) return AZURE_ERR_NETWORK;
+
+    req->hdrs = NULL;
+    azure_buffer_init(&req->resp_body);
+    memset(&req->resp_hdrs, 0, sizeof(req->resp_hdrs));
+    req->resp_hdrs.retry_after = -1;
+
+    curl_easy_setopt(req->easy, CURLOPT_URL, url);
+    curl_easy_setopt(req->easy, CURLOPT_CUSTOMREQUEST, "PUT");
+
+    /* Body — pointer stable during xSync (D17: btree mutex held) */
+    curl_easy_setopt(req->easy, CURLOPT_POSTFIELDS, range->data);
+    curl_easy_setopt(req->easy, CURLOPT_POSTFIELDSIZE_LARGE,
+                     (curl_off_t)range->len);
+
+    /* Timestamp for this request */
+    char date_buf[64];
+    azure_rfc1123_time(date_buf, sizeof(date_buf));
+
+    char range_val[128];
+    snprintf(range_val, sizeof(range_val), "bytes=%lld-%lld",
+             (long long)range->offset,
+             (long long)(range->offset + (int64_t)range->len - 1));
+
+    /* ---- SharedKey auth signing ---- */
+    char auth_hdr[512] = "";
+    if (!c->use_sas) {
+        char h_date[128], h_ver[64], h_pw[64], h_rng[192], h_lid[192];
+        snprintf(h_date, sizeof(h_date), "x-ms-date:%s", date_buf);
+        snprintf(h_ver, sizeof(h_ver), "x-ms-version:%s", AZURE_API_VERSION);
+        snprintf(h_pw, sizeof(h_pw), "x-ms-page-write:update");
+        snprintf(h_rng, sizeof(h_rng), "x-ms-range:%s", range_val);
+
+        const char *xms[8];
+        int n = 0;
+        xms[n++] = h_date;
+        if (lease_id && *lease_id) {
+            snprintf(h_lid, sizeof(h_lid), "x-ms-lease-id:%s", lease_id);
+            xms[n++] = h_lid;
+        }
+        xms[n++] = h_pw;
+        xms[n++] = h_rng;
+        xms[n++] = h_ver;
+        xms[n] = NULL;
+
+        char path[1024];
+        if (c->endpoint[0]) {
+            /* Azurite: account doubled in canonicalized resource (D12) */
+            snprintf(path, sizeof(path), "/%s/%s/%s",
+                     c->account, c->container, blob_name);
+        } else {
+            snprintf(path, sizeof(path), "/%s/%s",
+                     c->container, blob_name);
+        }
+
+        char cl_str[32];
+        snprintf(cl_str, sizeof(cl_str), "%zu", range->len);
+
+        azure_err_t rc = azure_auth_sign_request(
+            c, "PUT", path, "comp=page",
+            cl_str, "application/octet-stream", "",
+            (const char *const *)xms,
+            auth_hdr, sizeof(auth_hdr));
+        if (rc != AZURE_OK) {
+            curl_easy_cleanup(req->easy);
+            req->easy = NULL;
+            return rc;
+        }
+    }
+
+    /* ---- HTTP headers (each handle owns its own list) ---- */
+    char h[600];
+
+    snprintf(h, sizeof(h), "x-ms-date: %s", date_buf);
+    req->hdrs = curl_slist_append(req->hdrs, h);
+
+    snprintf(h, sizeof(h), "x-ms-version: %s", AZURE_API_VERSION);
+    req->hdrs = curl_slist_append(req->hdrs, h);
+
+    req->hdrs = curl_slist_append(req->hdrs, "x-ms-page-write: update");
+
+    snprintf(h, sizeof(h), "x-ms-range: %s", range_val);
+    req->hdrs = curl_slist_append(req->hdrs, h);
+
+    if (lease_id && *lease_id) {
+        snprintf(h, sizeof(h), "x-ms-lease-id: %s", lease_id);
+        req->hdrs = curl_slist_append(req->hdrs, h);
+    }
+
+    snprintf(h, sizeof(h), "Content-Length: %zu", range->len);
+    req->hdrs = curl_slist_append(req->hdrs, h);
+
+    req->hdrs = curl_slist_append(req->hdrs,
+                                   "Content-Type: application/octet-stream");
+
+    if (auth_hdr[0]) {
+        snprintf(h, sizeof(h), "Authorization: %s", auth_hdr);
+        req->hdrs = curl_slist_append(req->hdrs, h);
+    }
+
+    curl_easy_setopt(req->easy, CURLOPT_HTTPHEADER, req->hdrs);
+
+    /* Response callbacks (per-handle buffers) */
+    curl_easy_setopt(req->easy, CURLOPT_WRITEFUNCTION, curl_write_cb);
+    curl_easy_setopt(req->easy, CURLOPT_WRITEDATA, &req->resp_body);
+    curl_easy_setopt(req->easy, CURLOPT_HEADERFUNCTION, curl_header_cb);
+    curl_easy_setopt(req->easy, CURLOPT_HEADERDATA, &req->resp_hdrs);
+
+    /* Timeouts and keep-alive (match execute_single settings) */
+    curl_easy_setopt(req->easy, CURLOPT_TIMEOUT, 60L);
+    curl_easy_setopt(req->easy, CURLOPT_CONNECTTIMEOUT, 10L);
+    curl_easy_setopt(req->easy, CURLOPT_TCP_KEEPALIVE, 1L);
+    curl_easy_setopt(req->easy, CURLOPT_TCP_KEEPIDLE, 60L);
+    curl_easy_setopt(req->easy, CURLOPT_TCP_KEEPINTVL, 30L);
+
+    /* Link back to batch context for result collection */
+    curl_easy_setopt(req->easy, CURLOPT_PRIVATE, (char *)req);
+
+    return AZURE_OK;
+}
+
+/* Free all resources owned by a batch request */
+static void batch_free_req(batch_req_t *req)
+{
+    if (req->easy) {
+        curl_easy_cleanup(req->easy);
+        req->easy = NULL;
+    }
+    if (req->hdrs) {
+        curl_slist_free_all(req->hdrs);
+        req->hdrs = NULL;
+    }
+    azure_buffer_free(&req->resp_body);
+}
+
+/*
+ * Write multiple page ranges in parallel using curl_multi.
+ *
+ * nRanges ≤ 1: delegates to az_page_blob_write (simple path).
+ * nRanges > 1: concurrent PUT Page with retry on transient errors.
+ * Returns AZURE_OK only when ALL ranges succeed.
+ */
+static azure_err_t az_page_blob_write_batch(
+    void *ctx, const char *name,
+    const azure_page_range_t *ranges, int nRanges,
+    const char *lease_id, azure_error_t *err)
+{
+    if (!ctx || !name || !err) return AZURE_ERR_INVALID_ARG;
+    azure_error_init(err);
+
+    if (nRanges <= 0) return AZURE_OK;
+
+    /* Single range — use sequential path (has its own retry logic) */
+    if (nRanges == 1) {
+        return az_page_blob_write(ctx, name, ranges[0].offset,
+                                  ranges[0].data, ranges[0].len,
+                                  lease_id, err);
+    }
+
+    azure_client_t *c = (azure_client_t *)ctx;
+
+    /* Build URL once — same for all ranges and retry attempts */
+    char url[4096];
+    build_blob_url(c, name, url, sizeof(url));
+    size_t url_len = strlen(url);
+    {
+        int n = snprintf(url + url_len, sizeof(url) - url_len, "?comp=page");
+        if (n > 0) url_len += (size_t)n;
+    }
+    if (c->use_sas) {
+        snprintf(url + url_len, sizeof(url) - url_len, "&%s", c->sas_token);
+    }
+
+    /* Per-range completion tracking across retry attempts */
+    int *done = calloc((size_t)nRanges, sizeof(int));
+    if (!done) {
+        err->code = AZURE_ERR_NOMEM;
+        snprintf(err->error_message, sizeof(err->error_message),
+                 "batch write: allocation failed");
+        return AZURE_ERR_NOMEM;
+    }
+
+    azure_err_t result = AZURE_OK;
+
+    for (int attempt = 0; attempt <= BATCH_MAX_RETRIES; attempt++) {
+        int pending = 0;
+        for (int i = 0; i < nRanges; i++) {
+            if (!done[i]) pending++;
+        }
+        if (pending == 0) break;
+
+        /* Exponential backoff before retry (skip first attempt) */
+        if (attempt > 0) {
+            int delay_ms = AZURE_RETRY_BASE_MS * (1 << (attempt - 1));
+            if (delay_ms > AZURE_RETRY_MAX_MS)
+                delay_ms = AZURE_RETRY_MAX_MS;
+            fprintf(stderr,
+                    "[azqlite] batch write: %d/%d ranges pending, "
+                    "retry %d/%d in %dms\n",
+                    pending, nRanges, attempt, BATCH_MAX_RETRIES, delay_ms);
+            azure_retry_sleep_ms(delay_ms);
+        }
+
+        /* ---- Create multi handle ---- */
+        CURLM *multi = curl_multi_init();
+        if (!multi) {
+            free(done);
+            err->code = AZURE_ERR_NETWORK;
+            snprintf(err->error_message, sizeof(err->error_message),
+                     "curl_multi_init() failed");
+            return AZURE_ERR_NETWORK;
+        }
+        curl_multi_setopt(multi, CURLMOPT_MAX_HOST_CONNECTIONS,
+                          (long)AZQLITE_MAX_PARALLEL_PUTS);
+        curl_multi_setopt(multi, CURLMOPT_MAXCONNECTS,
+                          (long)AZQLITE_MAX_PARALLEL_PUTS);
+
+        /* ---- Set up easy handles for pending ranges ---- */
+        batch_req_t *reqs = calloc((size_t)pending, sizeof(batch_req_t));
+        if (!reqs) {
+            curl_multi_cleanup(multi);
+            free(done);
+            err->code = AZURE_ERR_NOMEM;
+            return AZURE_ERR_NOMEM;
+        }
+
+        int req_count = 0;
+        int setup_ok = 1;
+        for (int i = 0; i < nRanges && setup_ok; i++) {
+            if (done[i]) continue;
+            reqs[req_count].range_idx = i;
+            azure_err_t rc = batch_init_easy(c, url, name, &ranges[i],
+                                              lease_id, &reqs[req_count]);
+            if (rc != AZURE_OK) {
+                result = rc;
+                err->code = rc;
+                snprintf(err->error_message, sizeof(err->error_message),
+                         "batch write: request setup failed");
+                setup_ok = 0;
+                break;
+            }
+            curl_multi_add_handle(multi, reqs[req_count].easy);
+            req_count++;
+        }
+
+        if (!setup_ok) {
+            for (int j = 0; j < req_count; j++) {
+                curl_multi_remove_handle(multi, reqs[j].easy);
+                batch_free_req(&reqs[j]);
+            }
+            free(reqs);
+            curl_multi_cleanup(multi);
+            free(done);
+            return result;
+        }
+
+        /* ---- Event loop ---- */
+        int still_running = 0;
+        time_t last_renewal = time(NULL);
+        int lease_lost = 0;
+
+        curl_multi_perform(multi, &still_running);
+
+        while (still_running > 0) {
+            curl_multi_wait(multi, NULL, 0, 1000, NULL);
+            curl_multi_perform(multi, &still_running);
+
+            /* Renew lease to prevent 30s expiry during large flushes */
+            if (lease_id && *lease_id) {
+                time_t now = time(NULL);
+                if (now - last_renewal >= BATCH_LEASE_RENEWAL_SEC) {
+                    azure_error_t le;
+                    azure_error_init(&le);
+                    azure_err_t lrc = az_lease_renew(ctx, name,
+                                                     lease_id, &le);
+                    if (lrc != AZURE_OK) {
+                        fprintf(stderr,
+                                "[azqlite] batch write: lease renewal "
+                                "failed (%s), aborting\n",
+                                azure_err_str(lrc));
+                        lease_lost = 1;
+                        break;
+                    }
+                    last_renewal = now;
+                }
+            }
+        }
+
+        /* ---- Collect results ---- */
+        azure_err_t attempt_err = AZURE_OK;
+        CURLMsg *msg;
+        int msgs_left;
+
+        while ((msg = curl_multi_info_read(multi, &msgs_left))) {
+            if (msg->msg != CURLMSG_DONE) continue;
+
+            char *priv = NULL;
+            curl_easy_getinfo(msg->easy_handle, CURLINFO_PRIVATE, &priv);
+            batch_req_t *req = (batch_req_t *)priv;
+            if (!req) continue;
+
+            if (msg->data.result != CURLE_OK) {
+                /* Classify curl-level errors as transient or fatal */
+                azure_err_t rc =
+                    (msg->data.result == CURLE_OPERATION_TIMEDOUT ||
+                     msg->data.result == CURLE_COULDNT_CONNECT)
+                    ? AZURE_ERR_SERVER : AZURE_ERR_NETWORK;
+                if (attempt_err == AZURE_OK) attempt_err = rc;
+                continue;
+            }
+
+            long http_status = 0;
+            curl_easy_getinfo(msg->easy_handle,
+                              CURLINFO_RESPONSE_CODE, &http_status);
+
+            if (http_status >= 200 && http_status < 300) {
+                done[req->range_idx] = 1;
+            } else {
+                azure_err_t rc = azure_classify_http_error(
+                    http_status, req->resp_hdrs.error_code);
+                if (attempt_err == AZURE_OK) {
+                    attempt_err = rc;
+                    err->http_status = (int)http_status;
+                    if (req->resp_body.size > 0)
+                        azure_parse_error_xml(
+                            (const char *)req->resp_body.data,
+                            req->resp_body.size, err);
+                    if (req->resp_hdrs.error_code[0])
+                        strncpy(err->error_code,
+                                req->resp_hdrs.error_code,
+                                sizeof(err->error_code) - 1);
+                }
+            }
+        }
+
+        /* ---- Cleanup this attempt ---- */
+        for (int j = 0; j < req_count; j++) {
+            curl_multi_remove_handle(multi, reqs[j].easy);
+            batch_free_req(&reqs[j]);
+        }
+        free(reqs);
+        curl_multi_cleanup(multi);
+
+        if (lease_lost) {
+            free(done);
+            err->code = AZURE_ERR_LEASE_EXPIRED;
+            snprintf(err->error_message, sizeof(err->error_message),
+                     "Lease lost during batch write");
+            return AZURE_ERR_LEASE_EXPIRED;
+        }
+
+        result = attempt_err;
+
+        /* All done? Or non-retryable error? */
+        int all_done = 1;
+        for (int i = 0; i < nRanges; i++) {
+            if (!done[i]) { all_done = 0; break; }
+        }
+        if (all_done) break;
+        if (!azure_is_retryable(attempt_err)) break;
+    }
+
+    /* ---- Final verdict ---- */
+    int all_ok = 1;
+    for (int i = 0; i < nRanges; i++) {
+        if (!done[i]) { all_ok = 0; break; }
+    }
+    free(done);
+
+    if (all_ok) {
+        azure_error_init(err);
+        return AZURE_OK;
+    }
+
+    if (result == AZURE_OK) result = AZURE_ERR_IO;
+    err->code = result;
+    if (!err->error_message[0])
+        snprintf(err->error_message, sizeof(err->error_message),
+                 "Batch write: ranges failed after %d retries",
+                 BATCH_MAX_RETRIES);
+    return result;
+}
+
+/* ================================================================
  * Static vtable instance — populated with all production functions
  * ================================================================ */
 
@@ -958,8 +1380,8 @@ static const azure_ops_t azure_production_ops = {
     .lease_renew   = az_lease_renew,
     .lease_release = az_lease_release,
     .lease_break   = az_lease_break,
-    /* Batch write — not yet implemented (Phase 2, curl_multi) */
-    .page_blob_write_batch = NULL,
+    /* Batch write — parallel flush via curl_multi (Phase 2) */
+    .page_blob_write_batch = az_page_blob_write_batch,
 };
 
 /* ================================================================
