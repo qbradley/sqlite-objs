@@ -39,6 +39,14 @@
       "created_at": "2026-03-12T16:30:00Z",
       "legacy_named": false,
       "status": "active"
+    },
+    "merry": {
+      "persistent_name": "Merry",
+      "universe": "The Lord of the Rings",
+      "role": "AWS/S3 Expert",
+      "created_at": "2026-03-12T17:51:00Z",
+      "legacy_named": false,
+      "status": "active"
     }
   }
 }

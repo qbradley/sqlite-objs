@@ -13,6 +13,8 @@ How to decide who handles what.
 | C development | Aragorn ⚔️ | Build system, compilation, linking, memory management |
 | In-memory cache | Aragorn ⚔️ | Read cache design and implementation (MVP 2) |
 | Rust crates & FFI | Gimli 🪓 | Crate packaging, build.rs, FFI bindings, Rust samples |
+| Amazon S3 storage | Merry 🏹 | S3 REST API, SigV4 auth, bucket ops, S3-backed VFS layer |
+| AWS SDK research | Merry 🏹 | Review SDK source for S3 patterns, SigV4 signing |
 | Code review | Gandalf 🏗️ | Review PRs, check design integrity, approve/reject |
 | Testing | Samwise 🧪 | Write tests, crash recovery, durability, network failures |
 | Scope & priorities | Gandalf 🏗️ | What to build next, trade-offs, MVP sequencing |
