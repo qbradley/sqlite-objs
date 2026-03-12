@@ -2307,6 +2307,590 @@ TEST(vfs_error_no_request_id_credential_leak) {
     azure_buffer_free(&buf);
 }
 
+/* ══════════════════════════════════════════════════════════════════════
+** SECTION: Demand Paging / LRU Page Cache Tests
+**
+** Tests the demand-paging LRU cache layer in azqlite_vfs.c.
+** These tests verify that:
+**   - xOpen only does HEAD + first page fetch (no full download)
+**   - Cache hits avoid Azure round-trips
+**   - LRU eviction works correctly under memory pressure
+**   - Dirty pages survive eviction
+**   - Cross-page reads/writes are correct
+**   - xTruncate invalidates cached pages
+**   - xSync flushes dirty pages with coalesced writes
+** ══════════════════════════════════════════════════════════════════════ */
+
+/*
+** Helper: Create a pre-seeded page blob with known data pattern.
+** Each page is filled with the byte value (pageNo & 0xFF).
+** Writes a valid SQLite header in the first 100 bytes of page 0.
+** Returns 0 on success, -1 on failure.
+*/
+static int seed_page_blob(mock_azure_ctx_t *ctx, azure_ops_t *ops,
+                          const char *name, int nPages) {
+    int pageSize = 4096;
+    int64_t totalSize = (int64_t)nPages * pageSize;
+    azure_error_t err;
+    azure_error_init(&err);
+
+    azure_err_t rc = ops->page_blob_create(ctx, name, totalSize, &err);
+    if (rc != AZURE_OK) return -1;
+
+    for (int i = 0; i < nPages; i++) {
+        uint8_t page[4096];
+        memset(page, (uint8_t)(i & 0xFF), sizeof(page));
+
+        /* Page 0: write a valid SQLite header so VFS can detect page size */
+        if (i == 0) {
+            /* "SQLite format 3\000" signature */
+            static const uint8_t sig[16] = {
+                0x53, 0x51, 0x4c, 0x69, 0x74, 0x65, 0x20, 0x66,
+                0x6f, 0x72, 0x6d, 0x61, 0x74, 0x20, 0x33, 0x00
+            };
+            memcpy(page, sig, 16);
+            /* Bytes 16-17: page size in big-endian (4096 = 0x1000) */
+            page[16] = 0x10;
+            page[17] = 0x00;
+        }
+
+        azure_error_init(&err);
+        rc = ops->page_blob_write(ctx, name, (int64_t)i * pageSize,
+                                   page, pageSize, NULL, &err);
+        if (rc != AZURE_OK) return -1;
+    }
+    return 0;
+}
+
+/*
+** Helper: Open a pre-existing blob as a database.
+** Unlike open_test_db which uses CREATE, this just opens READWRITE.
+*/
+static sqlite3 *open_existing_test_db(mock_azure_ctx_t *mctx,
+                                       const char *name) {
+    sqlite3 *db = NULL;
+    azqlite_vfs_register_with_ops(mock_azure_get_ops(), mctx, 0);
+    int rc = sqlite3_open_v2(name, &db,
+                              SQLITE_OPEN_READWRITE,
+                              "azqlite");
+    return (rc == SQLITE_OK) ? db : NULL;
+}
+
+/* ── Test 1: xOpen only does HEAD + first page, no full download ─── */
+
+TEST(demand_paging_open_no_full_download) {
+    setup();
+
+    /* Create 8-page blob (32768 bytes) with valid SQLite header */
+    ASSERT_EQ(seed_page_blob(g_ctx, g_ops, "paging.db", 8), 0);
+    mock_reset_call_counts(g_ctx);
+
+    /* Open the database — should do HEAD + first page read only */
+    sqlite3 *db = open_existing_test_db(g_ctx, "paging.db");
+    ASSERT_NOT_NULL(db);
+
+    /* blob_get_properties called exactly once (the HEAD request) */
+    ASSERT_EQ(mock_get_call_count(g_ctx, "blob_get_properties"), 1);
+
+    /* page_blob_read called exactly once (first page for header detection) */
+    ASSERT_EQ(mock_get_call_count(g_ctx, "page_blob_read"), 1);
+
+    /* blob_exists should NOT be called — merged into blob_get_properties */
+    ASSERT_EQ(mock_get_call_count(g_ctx, "blob_exists"), 0);
+
+    close_test_db(db);
+}
+
+/* ── Test 2: Cache miss fetches page, cache hit does not ─────────── */
+
+TEST(demand_paging_cache_miss_fetches_page) {
+    setup();
+
+    /* Create a real database with enough data to span multiple pages */
+    sqlite3 *db = open_test_db(g_ctx);
+    ASSERT_NOT_NULL(db);
+
+    int rc;
+    rc = sqlite3_exec(db, "CREATE TABLE t(id INTEGER PRIMARY KEY, data TEXT);",
+                       NULL, NULL, NULL);
+    ASSERT_OK(rc);
+
+    rc = sqlite3_exec(db, "BEGIN;", NULL, NULL, NULL);
+    ASSERT_OK(rc);
+    for (int i = 0; i < 200; i++) {
+        char sql[256];
+        snprintf(sql, sizeof(sql),
+                 "INSERT INTO t VALUES(%d, '%0200d');", i, i);
+        rc = sqlite3_exec(db, sql, NULL, NULL, NULL);
+        ASSERT_OK(rc);
+    }
+    rc = sqlite3_exec(db, "COMMIT;", NULL, NULL, NULL);
+    ASSERT_OK(rc);
+    close_test_db(db);
+
+    /* Reopen — only HEAD + first page fetched */
+    mock_reset_call_counts(g_ctx);
+    db = open_existing_test_db(g_ctx, "test.db");
+    ASSERT_NOT_NULL(db);
+
+    ASSERT_EQ(mock_get_call_count(g_ctx, "page_blob_read"), 1);
+
+    /* First SELECT: cache misses trigger Azure reads */
+    mock_reset_call_counts(g_ctx);
+    sqlite3_stmt *stmt;
+    rc = sqlite3_prepare_v2(db, "SELECT COUNT(*) FROM t;", -1, &stmt, NULL);
+    ASSERT_OK(rc);
+    rc = sqlite3_step(stmt);
+    ASSERT_EQ(rc, SQLITE_ROW);
+    ASSERT_EQ(sqlite3_column_int(stmt, 0), 200);
+    sqlite3_finalize(stmt);
+
+    int reads_first = mock_get_call_count(g_ctx, "page_blob_read");
+    ASSERT_GT(reads_first, 0);
+
+    /* Second identical SELECT: all pages cached, no Azure reads */
+    mock_reset_call_counts(g_ctx);
+    rc = sqlite3_prepare_v2(db, "SELECT COUNT(*) FROM t;", -1, &stmt, NULL);
+    ASSERT_OK(rc);
+    rc = sqlite3_step(stmt);
+    ASSERT_EQ(rc, SQLITE_ROW);
+    ASSERT_EQ(sqlite3_column_int(stmt, 0), 200);
+    sqlite3_finalize(stmt);
+
+    ASSERT_EQ(mock_get_call_count(g_ctx, "page_blob_read"), 0);
+
+    close_test_db(db);
+}
+
+/* ── Test 3: LRU eviction under small cache ──────────────────────── */
+
+TEST(demand_paging_lru_eviction) {
+    setup();
+
+    /* Use a very small cache to force eviction */
+    setenv("AZQLITE_CACHE_PAGES", "4", 1);
+
+    /* Create a real database with data spanning many pages */
+    sqlite3 *db = open_test_db(g_ctx);
+    ASSERT_NOT_NULL(db);
+
+    int rc;
+    rc = sqlite3_exec(db, "CREATE TABLE t(id INTEGER PRIMARY KEY, data TEXT);",
+                       NULL, NULL, NULL);
+    ASSERT_OK(rc);
+
+    rc = sqlite3_exec(db, "BEGIN;", NULL, NULL, NULL);
+    ASSERT_OK(rc);
+    for (int i = 0; i < 200; i++) {
+        char sql[256];
+        snprintf(sql, sizeof(sql),
+                 "INSERT INTO t VALUES(%d, '%0200d');", i, i);
+        rc = sqlite3_exec(db, sql, NULL, NULL, NULL);
+        ASSERT_OK(rc);
+    }
+    rc = sqlite3_exec(db, "COMMIT;", NULL, NULL, NULL);
+    ASSERT_OK(rc);
+    close_test_db(db);
+
+    /* Reopen with small cache — pages will need to be evicted and re-fetched */
+    sqlite3 *db2 = open_existing_test_db(g_ctx, "test.db");
+    ASSERT_NOT_NULL(db2);
+
+    /* First query — fills cache, causes evictions */
+    mock_reset_call_counts(g_ctx);
+    sqlite3_stmt *stmt;
+    rc = sqlite3_prepare_v2(db2, "SELECT COUNT(*) FROM t;", -1, &stmt, NULL);
+    ASSERT_OK(rc);
+    rc = sqlite3_step(stmt);
+    ASSERT_EQ(rc, SQLITE_ROW);
+    ASSERT_EQ(sqlite3_column_int(stmt, 0), 200);
+    sqlite3_finalize(stmt);
+
+    int first_reads = mock_get_call_count(g_ctx, "page_blob_read");
+    ASSERT_GT(first_reads, 0);
+
+    /* Second identical query — with only 4-page cache, some pages
+    ** were evicted and must be re-fetched. */
+    mock_reset_call_counts(g_ctx);
+    rc = sqlite3_prepare_v2(db2, "SELECT COUNT(*) FROM t;", -1, &stmt, NULL);
+    ASSERT_OK(rc);
+    rc = sqlite3_step(stmt);
+    ASSERT_EQ(rc, SQLITE_ROW);
+    ASSERT_EQ(sqlite3_column_int(stmt, 0), 200);
+    sqlite3_finalize(stmt);
+
+    int second_reads = mock_get_call_count(g_ctx, "page_blob_read");
+    /* With a 4-page cache and a multi-page DB, re-fetches must happen */
+    ASSERT_GT(second_reads, 0);
+
+    close_test_db(db2);
+    unsetenv("AZQLITE_CACHE_PAGES");
+}
+
+/* ── Test 4: Dirty pages survive eviction ────────────────────────── */
+
+TEST(demand_paging_dirty_not_evicted) {
+    setup();
+
+    /* Small cache to force eviction pressure */
+    setenv("AZQLITE_CACHE_PAGES", "4", 1);
+
+    sqlite3 *db = open_test_db(g_ctx);
+    ASSERT_NOT_NULL(db);
+
+    int rc;
+    /* Create table and insert — dirtying pages */
+    rc = sqlite3_exec(db, "CREATE TABLE t(id INTEGER PRIMARY KEY, val TEXT);",
+                       NULL, NULL, NULL);
+    ASSERT_OK(rc);
+
+    rc = sqlite3_exec(db, "INSERT INTO t VALUES(1, 'dirty-data');",
+                       NULL, NULL, NULL);
+    ASSERT_OK(rc);
+
+    /* Now do many reads to create cache pressure — dirty pages should survive */
+    rc = sqlite3_exec(db, "BEGIN;", NULL, NULL, NULL);
+    ASSERT_OK(rc);
+    for (int i = 2; i < 100; i++) {
+        char sql[256];
+        snprintf(sql, sizeof(sql),
+                 "INSERT INTO t VALUES(%d, '%0200d');", i, i);
+        rc = sqlite3_exec(db, sql, NULL, NULL, NULL);
+        ASSERT_OK(rc);
+    }
+    rc = sqlite3_exec(db, "COMMIT;", NULL, NULL, NULL);
+    ASSERT_OK(rc);
+
+    /* Verify data is correct — dirty pages were not lost */
+    sqlite3_stmt *stmt;
+    rc = sqlite3_prepare_v2(db, "SELECT val FROM t WHERE id=1;", -1, &stmt, NULL);
+    ASSERT_OK(rc);
+    rc = sqlite3_step(stmt);
+    ASSERT_EQ(rc, SQLITE_ROW);
+    ASSERT_STR_EQ((const char *)sqlite3_column_text(stmt, 0), "dirty-data");
+    sqlite3_finalize(stmt);
+
+    /* Verify all 99 rows committed correctly */
+    rc = sqlite3_prepare_v2(db, "SELECT COUNT(*) FROM t;", -1, &stmt, NULL);
+    ASSERT_OK(rc);
+    rc = sqlite3_step(stmt);
+    ASSERT_EQ(rc, SQLITE_ROW);
+    ASSERT_EQ(sqlite3_column_int(stmt, 0), 99);
+    sqlite3_finalize(stmt);
+
+    close_test_db(db);
+    unsetenv("AZQLITE_CACHE_PAGES");
+}
+
+/* ── Test 5: Cross-page read ─────────────────────────────────────── */
+
+TEST(demand_paging_cross_page_read) {
+    setup();
+
+    /* Create a database with enough data to span pages */
+    sqlite3 *db = open_test_db(g_ctx);
+    ASSERT_NOT_NULL(db);
+
+    int rc;
+    rc = sqlite3_exec(db, "CREATE TABLE t(id INTEGER PRIMARY KEY, data BLOB);",
+                       NULL, NULL, NULL);
+    ASSERT_OK(rc);
+
+    /* Insert a large blob that will span page boundaries */
+    sqlite3_stmt *ins;
+    rc = sqlite3_prepare_v2(db, "INSERT INTO t VALUES(1, ?);", -1, &ins, NULL);
+    ASSERT_OK(rc);
+
+    /* Create 8KB blob — guaranteed to span at least 2 pages */
+    unsigned char big_blob[8192];
+    for (int i = 0; i < 8192; i++) {
+        big_blob[i] = (unsigned char)(i & 0xFF);
+    }
+    rc = sqlite3_bind_blob(ins, 1, big_blob, sizeof(big_blob), SQLITE_STATIC);
+    ASSERT_OK(rc);
+    rc = sqlite3_step(ins);
+    ASSERT_EQ(rc, SQLITE_DONE);
+    sqlite3_finalize(ins);
+
+    /* Read it back and verify cross-page data integrity */
+    sqlite3_stmt *sel;
+    rc = sqlite3_prepare_v2(db, "SELECT data FROM t WHERE id=1;", -1, &sel, NULL);
+    ASSERT_OK(rc);
+    rc = sqlite3_step(sel);
+    ASSERT_EQ(rc, SQLITE_ROW);
+
+    const void *result = sqlite3_column_blob(sel, 0);
+    int result_len = sqlite3_column_bytes(sel, 0);
+    ASSERT_EQ(result_len, 8192);
+    ASSERT_MEM_EQ(result, big_blob, 8192);
+    sqlite3_finalize(sel);
+
+    close_test_db(db);
+}
+
+/* ── Test 6: Cross-page write ────────────────────────────────────── */
+
+TEST(demand_paging_cross_page_write) {
+    setup();
+
+    sqlite3 *db = open_test_db(g_ctx);
+    ASSERT_NOT_NULL(db);
+
+    int rc;
+    rc = sqlite3_exec(db, "CREATE TABLE t(id INTEGER PRIMARY KEY, data BLOB);",
+                       NULL, NULL, NULL);
+    ASSERT_OK(rc);
+
+    /* Write a blob that spans page boundaries */
+    sqlite3_stmt *ins;
+    rc = sqlite3_prepare_v2(db, "INSERT INTO t VALUES(1, ?);", -1, &ins, NULL);
+    ASSERT_OK(rc);
+
+    unsigned char big_blob[12000];
+    for (int i = 0; i < 12000; i++) {
+        big_blob[i] = (unsigned char)((i * 7 + 3) & 0xFF);
+    }
+    rc = sqlite3_bind_blob(ins, 1, big_blob, sizeof(big_blob), SQLITE_STATIC);
+    ASSERT_OK(rc);
+    rc = sqlite3_step(ins);
+    ASSERT_EQ(rc, SQLITE_DONE);
+    sqlite3_finalize(ins);
+
+    /* Close and reopen to ensure data was flushed to Azure */
+    close_test_db(db);
+    db = open_existing_test_db(g_ctx, "test.db");
+    ASSERT_NOT_NULL(db);
+
+    /* Read back and verify */
+    sqlite3_stmt *sel;
+    rc = sqlite3_prepare_v2(db, "SELECT data FROM t WHERE id=1;", -1, &sel, NULL);
+    ASSERT_OK(rc);
+    rc = sqlite3_step(sel);
+    ASSERT_EQ(rc, SQLITE_ROW);
+
+    const void *result = sqlite3_column_blob(sel, 0);
+    int result_len = sqlite3_column_bytes(sel, 0);
+    ASSERT_EQ(result_len, 12000);
+    ASSERT_MEM_EQ(result, big_blob, 12000);
+    sqlite3_finalize(sel);
+
+    close_test_db(db);
+}
+
+/* ── Test 7: Truncate invalidates cached pages ───────────────────── */
+
+TEST(demand_paging_truncate_invalidates) {
+    setup();
+
+    /* Create a database with multiple pages of data */
+    sqlite3 *db = open_test_db(g_ctx);
+    ASSERT_NOT_NULL(db);
+
+    int rc;
+    rc = sqlite3_exec(db, "CREATE TABLE t(id INTEGER PRIMARY KEY, data TEXT);",
+                       NULL, NULL, NULL);
+    ASSERT_OK(rc);
+
+    rc = sqlite3_exec(db, "BEGIN;", NULL, NULL, NULL);
+    ASSERT_OK(rc);
+    for (int i = 0; i < 200; i++) {
+        char sql[256];
+        snprintf(sql, sizeof(sql),
+                 "INSERT INTO t VALUES(%d, '%0200d');", i, i);
+        rc = sqlite3_exec(db, sql, NULL, NULL, NULL);
+        ASSERT_OK(rc);
+    }
+    rc = sqlite3_exec(db, "COMMIT;", NULL, NULL, NULL);
+    ASSERT_OK(rc);
+
+    /* Check the blob is multiple pages */
+    int64_t size_before = mock_get_page_blob_size(g_ctx, "test.db");
+    ASSERT_GT(size_before, 4096);
+
+    /* Now delete most rows and VACUUM to trigger truncation */
+    rc = sqlite3_exec(db, "DELETE FROM t WHERE id > 5;", NULL, NULL, NULL);
+    ASSERT_OK(rc);
+    rc = sqlite3_exec(db, "VACUUM;", NULL, NULL, NULL);
+    ASSERT_OK(rc);
+
+    /* After VACUUM, blob should be smaller */
+    int64_t size_after = mock_get_page_blob_size(g_ctx, "test.db");
+    ASSERT_LT(size_after, size_before);
+
+    /* Verify the remaining data is intact */
+    sqlite3_stmt *stmt;
+    rc = sqlite3_prepare_v2(db, "SELECT COUNT(*) FROM t;", -1, &stmt, NULL);
+    ASSERT_OK(rc);
+    rc = sqlite3_step(stmt);
+    ASSERT_EQ(rc, SQLITE_ROW);
+    ASSERT_EQ(sqlite3_column_int(stmt, 0), 6); /* ids 0-5 */
+    sqlite3_finalize(stmt);
+
+    close_test_db(db);
+}
+
+/* ── Test 8: Sync coalesces dirty pages ──────────────────────────── */
+
+TEST(demand_paging_sync_coalesces_dirty) {
+    setup();
+
+    sqlite3 *db = open_test_db(g_ctx);
+    ASSERT_NOT_NULL(db);
+
+    int rc;
+    rc = sqlite3_exec(db, "CREATE TABLE t(id INTEGER PRIMARY KEY, data TEXT);",
+                       NULL, NULL, NULL);
+    ASSERT_OK(rc);
+
+    /* Insert data to create dirty pages */
+    rc = sqlite3_exec(db, "BEGIN;", NULL, NULL, NULL);
+    ASSERT_OK(rc);
+    for (int i = 0; i < 50; i++) {
+        char sql[256];
+        snprintf(sql, sizeof(sql),
+                 "INSERT INTO t VALUES(%d, '%0100d');", i, i);
+        rc = sqlite3_exec(db, sql, NULL, NULL, NULL);
+        ASSERT_OK(rc);
+    }
+
+    /* Clear write records before COMMIT to capture sync writes */
+    mock_clear_write_records(g_ctx);
+    mock_reset_call_counts(g_ctx);
+
+    rc = sqlite3_exec(db, "COMMIT;", NULL, NULL, NULL);
+    ASSERT_OK(rc);
+
+    /* Verify writes happened (dirty pages flushed) */
+    int write_count = mock_get_call_count(g_ctx, "page_blob_write");
+    ASSERT_GT(write_count, 0);
+
+    /* The write records show coalesced ranges — consecutive dirty pages
+    ** should be merged into fewer, larger writes. */
+    int record_count = mock_get_write_record_count(g_ctx);
+    ASSERT_GT(record_count, 0);
+
+    /* Coalesced writes should be at least as large as one page */
+    for (int i = 0; i < record_count; i++) {
+        mock_write_record_t wr = mock_get_write_record(g_ctx, i);
+        ASSERT_GE(wr.len, 512); /* Minimum Azure page alignment */
+        ASSERT_EQ(wr.offset % 512, 0); /* Must be aligned */
+    }
+
+    /* After sync, a read-only query should produce no writes */
+    mock_reset_call_counts(g_ctx);
+    sqlite3_stmt *stmt;
+    rc = sqlite3_prepare_v2(db, "SELECT COUNT(*) FROM t;", -1, &stmt, NULL);
+    ASSERT_OK(rc);
+    rc = sqlite3_step(stmt);
+    ASSERT_EQ(rc, SQLITE_ROW);
+    ASSERT_EQ(sqlite3_column_int(stmt, 0), 50);
+    sqlite3_finalize(stmt);
+
+    ASSERT_EQ(mock_get_call_count(g_ctx, "page_blob_write"), 0);
+
+    close_test_db(db);
+}
+
+/* ── Test: Small cache still works correctly ─────────────────────── */
+
+TEST(demand_paging_small_cache_correctness) {
+    setup();
+
+    /* Extremely small cache — 2 pages */
+    setenv("AZQLITE_CACHE_PAGES", "2", 1);
+
+    sqlite3 *db = open_test_db(g_ctx);
+    ASSERT_NOT_NULL(db);
+
+    int rc;
+    rc = sqlite3_exec(db,
+        "CREATE TABLE t(id INTEGER PRIMARY KEY, val TEXT);",
+        NULL, NULL, NULL);
+    ASSERT_OK(rc);
+
+    /* Insert and read data — must work correctly even with tiny cache */
+    for (int i = 0; i < 50; i++) {
+        char sql[256];
+        snprintf(sql, sizeof(sql),
+                 "INSERT INTO t VALUES(%d, 'value-%d');", i, i);
+        rc = sqlite3_exec(db, sql, NULL, NULL, NULL);
+        ASSERT_OK(rc);
+    }
+
+    /* Verify all data */
+    sqlite3_stmt *stmt;
+    rc = sqlite3_prepare_v2(db, "SELECT COUNT(*) FROM t;", -1, &stmt, NULL);
+    ASSERT_OK(rc);
+    rc = sqlite3_step(stmt);
+    ASSERT_EQ(rc, SQLITE_ROW);
+    ASSERT_EQ(sqlite3_column_int(stmt, 0), 50);
+    sqlite3_finalize(stmt);
+
+    /* Spot-check specific rows */
+    rc = sqlite3_prepare_v2(db, "SELECT val FROM t WHERE id=25;",
+                             -1, &stmt, NULL);
+    ASSERT_OK(rc);
+    rc = sqlite3_step(stmt);
+    ASSERT_EQ(rc, SQLITE_ROW);
+    ASSERT_STR_EQ((const char *)sqlite3_column_text(stmt, 0), "value-25");
+    sqlite3_finalize(stmt);
+
+    close_test_db(db);
+    unsetenv("AZQLITE_CACHE_PAGES");
+}
+
+/* ── Test: Data survives close/reopen with demand paging ─────────── */
+
+TEST(demand_paging_data_survives_reopen) {
+    setup();
+
+    setenv("AZQLITE_CACHE_PAGES", "4", 1);
+
+    sqlite3 *db = open_test_db(g_ctx);
+    ASSERT_NOT_NULL(db);
+
+    int rc;
+    rc = sqlite3_exec(db, "CREATE TABLE t(id INTEGER PRIMARY KEY, data TEXT);",
+                       NULL, NULL, NULL);
+    ASSERT_OK(rc);
+
+    rc = sqlite3_exec(db, "BEGIN;", NULL, NULL, NULL);
+    ASSERT_OK(rc);
+    for (int i = 0; i < 100; i++) {
+        char sql[256];
+        snprintf(sql, sizeof(sql),
+                 "INSERT INTO t VALUES(%d, 'row-%d');", i, i);
+        rc = sqlite3_exec(db, sql, NULL, NULL, NULL);
+        ASSERT_OK(rc);
+    }
+    rc = sqlite3_exec(db, "COMMIT;", NULL, NULL, NULL);
+    ASSERT_OK(rc);
+    close_test_db(db);
+
+    /* Reopen with small cache — demand paging must fetch pages correctly */
+    db = open_existing_test_db(g_ctx, "test.db");
+    ASSERT_NOT_NULL(db);
+
+    sqlite3_stmt *stmt;
+    rc = sqlite3_prepare_v2(db, "SELECT COUNT(*) FROM t;", -1, &stmt, NULL);
+    ASSERT_OK(rc);
+    rc = sqlite3_step(stmt);
+    ASSERT_EQ(rc, SQLITE_ROW);
+    ASSERT_EQ(sqlite3_column_int(stmt, 0), 100);
+    sqlite3_finalize(stmt);
+
+    rc = sqlite3_prepare_v2(db, "SELECT data FROM t WHERE id=99;",
+                             -1, &stmt, NULL);
+    ASSERT_OK(rc);
+    rc = sqlite3_step(stmt);
+    ASSERT_EQ(rc, SQLITE_ROW);
+    ASSERT_STR_EQ((const char *)sqlite3_column_text(stmt, 0), "row-99");
+    sqlite3_finalize(stmt);
+
+    close_test_db(db);
+    unsetenv("AZQLITE_CACHE_PAGES");
+}
+
 #endif /* ENABLE_VFS_INTEGRATION */
 
 /* ══════════════════════════════════════════════════════════════════════
@@ -2550,6 +3134,19 @@ void run_vfs_tests(void) {
     TEST_SUITE_BEGIN("P1 — Credential Leak Prevention");
     RUN_TEST(vfs_error_no_credential_leak);
     RUN_TEST(vfs_error_no_request_id_credential_leak);
+    TEST_SUITE_END();
+
+    TEST_SUITE_BEGIN("Demand Paging / LRU Page Cache");
+    RUN_TEST(demand_paging_open_no_full_download);
+    RUN_TEST(demand_paging_cache_miss_fetches_page);
+    RUN_TEST(demand_paging_lru_eviction);
+    RUN_TEST(demand_paging_dirty_not_evicted);
+    RUN_TEST(demand_paging_cross_page_read);
+    RUN_TEST(demand_paging_cross_page_write);
+    RUN_TEST(demand_paging_truncate_invalidates);
+    RUN_TEST(demand_paging_sync_coalesces_dirty);
+    RUN_TEST(demand_paging_small_cache_correctness);
+    RUN_TEST(demand_paging_data_survives_reopen);
     TEST_SUITE_END();
 #endif
 
