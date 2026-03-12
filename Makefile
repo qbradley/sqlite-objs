@@ -24,13 +24,20 @@ CFLAGS    = -Wall -Wextra -Wpedantic -std=c11 -O2
 CFLAGS   += -DSQLITE_THREADSAFE=1
 CFLAGS   += -DSQLITE_ENABLE_FTS5
 CFLAGS   += -DSQLITE_ENABLE_JSON1
-CFLAGS   += -D_POSIX_C_SOURCE=200809L
+# Expose POSIX declarations hidden by -std=c11.
+# macOS: _DARWIN_C_SOURCE exposes POSIX + BSD (u_int, flock, etc.)
+# Linux: _POSIX_C_SOURCE + _DEFAULT_SOURCE exposes POSIX + BSD compat
+UNAME_S := $(shell uname -s)
+ifeq ($(UNAME_S),Darwin)
+CFLAGS   += -D_DARWIN_C_SOURCE
+else
+CFLAGS   += -D_POSIX_C_SOURCE=200809L -D_DEFAULT_SOURCE
+endif
 
 # Include paths: our src/ dir + SQLite source dir
 CFLAGS   += -I$(SRC_DIR) -I$(SQLITE_DIR)
 
 # Platform-specific linker flags
-UNAME_S := $(shell uname -s)
 ifeq ($(UNAME_S),Darwin)
     LDFLAGS  = -lpthread -lm
 else
