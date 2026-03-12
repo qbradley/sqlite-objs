@@ -1145,10 +1145,8 @@ static int azqliteFileControl(sqlite3_file *pFile, int op, void *pArg) {
                         return SQLITE_OK;
                     }
                     /* Append blob ops available — let SQLite set WAL mode.
-                    ** Requires: PRAGMA locking_mode=EXCLUSIVE set first. */
-                    fprintf(stderr,
-                        "azqlite: WARNING — journal_mode=WAL requires "
-                        "PRAGMA locking_mode=EXCLUSIVE for azqlite.\n");
+                    ** If locking_mode=EXCLUSIVE is not set, xShmMap will
+                    ** return SQLITE_IOERR and fail safely. */
                     return SQLITE_NOTFOUND;
                 }
             }
