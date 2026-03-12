@@ -116,7 +116,7 @@ static void print_usage(const char *prog) {
   fprintf(stderr, "Options:\n");
   fprintf(stderr, "  --local            Use local SQLite (default VFS)\n");
   fprintf(stderr, "  --azure            Use azqlite (Azure blob-backed VFS)\n");
-  fprintf(stderr, "  --wal              Enable WAL journal mode (requires --azure)\n");
+  fprintf(stderr, "  --wal              Enable WAL journal mode (default)\n");
   fprintf(stderr, "  --warehouses N     Number of warehouses (default: 1)\n");
   fprintf(stderr, "  --duration S       Benchmark duration in seconds (default: 60)\n");
   fprintf(stderr, "  --threads N        Number of concurrent threads (default: 1)\n");
@@ -481,6 +481,7 @@ int main(int argc, char **argv) {
   config.num_warehouses = 1;
   config.duration_seconds = 60;
   config.num_threads = 1;
+  config.use_wal = 1;  /* WAL mode by default */
   config.db_path = NULL;
   
   /* Parse arguments */
@@ -539,11 +540,7 @@ int main(int argc, char **argv) {
     }
   }
   
-  /* Validate --wal requires --azure */
-  if (config.use_wal && !config.use_azure) {
-    fprintf(stderr, "Error: --wal requires --azure (WAL mode is only meaningful for Azure VFS)\n");
-    return 1;
-  }
+  /* WAL mode is now the default and works with both local and Azure */
 
   /* Set database path */
   if (config.use_azure) {

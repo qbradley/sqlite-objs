@@ -116,6 +116,29 @@ void tpcc_finalize_stmts(void) {
 static void use(sqlite3_stmt *s) { sqlite3_reset(s); sqlite3_clear_bindings(s); }
 
 /*
+** Reset all cached statements.  Must be called after every COMMIT or
+** ROLLBACK so that no SELECT statement holds an open read-snapshot.
+** In WAL mode, an unreset SELECT prevents the auto-checkpoint from
+** advancing — the WAL grows without bound.
+*/
+static void reset_all(void) {
+  sqlite3_reset(S.no_get_dist);
+  sqlite3_reset(S.no_upd_dist);
+  sqlite3_reset(S.no_ins_order);
+  sqlite3_reset(S.no_ins_neworder);
+  sqlite3_reset(S.no_get_item);
+  sqlite3_reset(S.no_upd_stock);
+  sqlite3_reset(S.no_ins_ol);
+  sqlite3_reset(S.pay_upd_wh);
+  sqlite3_reset(S.pay_upd_dist);
+  sqlite3_reset(S.pay_upd_cust);
+  sqlite3_reset(S.pay_ins_hist);
+  sqlite3_reset(S.os_get_cust);
+  sqlite3_reset(S.os_get_order);
+  sqlite3_reset(S.os_get_ol);
+}
+
+/*
 ** NEW ORDER Transaction (TPC-C 2.4)
 **
 ** Creates a new order with 5-15 order lines
@@ -145,6 +168,7 @@ txn_result_t tpcc_new_order_txn(sqlite3 *db, int w_id, int num_warehouses) {
     o_id = sqlite3_column_int(S.no_get_dist, 0);
   } else {
     sqlite3_exec(db, "ROLLBACK", NULL, NULL, NULL);
+    reset_all();
     snprintf(result.error_msg, sizeof(result.error_msg),
              "District lookup failed (w=%d,d=%d): rc=%d %s", w_id, d_id, rc, sqlite3_errmsg(db));
     return result;
@@ -209,6 +233,7 @@ txn_result_t tpcc_new_order_txn(sqlite3 *db, int w_id, int num_warehouses) {
   }
 
   rc = sqlite3_exec(db, "COMMIT", NULL, NULL, NULL);
+  reset_all();
   if (rc != SQLITE_OK) {
     snprintf(result.error_msg, sizeof(result.error_msg), "COMMIT failed: %s", sqlite3_errmsg(db));
     sqlite3_exec(db, "ROLLBACK", NULL, NULL, NULL);
@@ -272,6 +297,7 @@ txn_result_t tpcc_payment_txn(sqlite3 *db, int w_id, int num_warehouses) {
   sqlite3_step(S.pay_ins_hist);
 
   rc = sqlite3_exec(db, "COMMIT", NULL, NULL, NULL);
+  reset_all();
   if (rc != SQLITE_OK) {
     snprintf(result.error_msg, sizeof(result.error_msg), "COMMIT failed: %s", sqlite3_errmsg(db));
     sqlite3_exec(db, "ROLLBACK", NULL, NULL, NULL);
@@ -310,6 +336,7 @@ txn_result_t tpcc_order_status_txn(sqlite3 *db, int w_id, int num_warehouses) {
   rc = sqlite3_step(S.os_get_cust);
   if (rc != SQLITE_ROW) {
     sqlite3_exec(db, "ROLLBACK", NULL, NULL, NULL);
+    reset_all();
     snprintf(result.error_msg, sizeof(result.error_msg),
              "Customer not found (w=%d,d=%d,c=%d): rc=%d %s", w_id, d_id, c_id, rc, sqlite3_errmsg(db));
     return result;
@@ -326,6 +353,7 @@ txn_result_t tpcc_order_status_txn(sqlite3 *db, int w_id, int num_warehouses) {
 
   if (o_id == 0) {
     sqlite3_exec(db, "ROLLBACK", NULL, NULL, NULL);
+    reset_all();
     snprintf(result.error_msg, sizeof(result.error_msg), "No orders found");
     return result;
   }
@@ -340,6 +368,7 @@ txn_result_t tpcc_order_status_txn(sqlite3 *db, int w_id, int num_warehouses) {
   }
 
   rc = sqlite3_exec(db, "COMMIT", NULL, NULL, NULL);
+  reset_all();
   if (rc != SQLITE_OK) {
     snprintf(result.error_msg, sizeof(result.error_msg), "COMMIT failed: %s", sqlite3_errmsg(db));
     sqlite3_exec(db, "ROLLBACK", NULL, NULL, NULL);
