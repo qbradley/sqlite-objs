@@ -25,6 +25,7 @@
 #include "test_azure_client.c"
 #include "test_coalesce.c"
 #include "test_wal.c"
+#include "test_uri.c"
 
 int main(int argc, char **argv) {
     (void)argc;
@@ -42,6 +43,7 @@ int main(int argc, char **argv) {
     run_azure_client_tests();
     run_coalesce_tests();
     run_wal_tests();
+    run_uri_tests();
 
     return test_harness_summary();
 }

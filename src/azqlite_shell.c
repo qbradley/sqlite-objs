@@ -14,9 +14,13 @@
 **   export AZURE_STORAGE_CONTAINER=databases
 **   export AZURE_STORAGE_SAS="sv=2024-08-04&..."
 **   ./azqlite-shell mydb.db
+**
+** URI mode (no environment variables needed):
+**   ./azqlite-shell --uri "file:mydb.db?azure_account=acct&azure_container=cont&azure_sas=tok"
 */
 
 #include <stdio.h>
+#include <string.h>
 #include "sqlite3.h"
 #include "azqlite.h"
 
@@ -36,23 +40,49 @@ extern int SQLITE_CDECL main(int argc, char **argv);
 
 int main(int argc, char **argv) {
     int rc;
+    int use_uri = 0;
 
-    /*
-    ** Register the azqlite VFS as the DEFAULT VFS.
-    ** This means all sqlite3_open() calls go through Azure
-    ** without needing to specify vfs="azqlite" explicitly.
-    ** The shell uses sqlite3_open(), not sqlite3_open_v2().
-    */
-    rc = azqlite_vfs_register(1);  /* 1 = make default */
-    if (rc != SQLITE_OK) {
-        fprintf(stderr,
-            "azqlite: Failed to register VFS (rc=%d).\n"
-            "Ensure these environment variables are set:\n"
-            "  AZURE_STORAGE_ACCOUNT\n"
-            "  AZURE_STORAGE_CONTAINER\n"
-            "  AZURE_STORAGE_SAS or AZURE_STORAGE_KEY\n",
-            rc);
-        return 1;
+    /* Scan for --uri flag (consume it before passing to shell) */
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--uri") == 0) {
+            use_uri = 1;
+            /* Remove --uri from argv */
+            for (int j = i; j < argc - 1; j++) {
+                argv[j] = argv[j + 1];
+            }
+            argc--;
+            i--;
+        }
+    }
+
+    if (use_uri) {
+        /*
+        ** URI mode: register VFS with no global client.
+        ** All Azure config comes from URI parameters in the filename.
+        ** Enable URI filenames globally before any SQLite initialization.
+        */
+        sqlite3_config(SQLITE_CONFIG_URI, 1);
+        rc = azqlite_vfs_register_uri(1);  /* 1 = make default */
+        if (rc != SQLITE_OK) {
+            fprintf(stderr,
+                "azqlite: Failed to register URI-mode VFS (rc=%d).\n", rc);
+            return 1;
+        }
+    } else {
+        /*
+        ** Default mode: register VFS using environment variables.
+        */
+        rc = azqlite_vfs_register(1);  /* 1 = make default */
+        if (rc != SQLITE_OK) {
+            fprintf(stderr,
+                "azqlite: Failed to register VFS (rc=%d).\n"
+                "Ensure these environment variables are set:\n"
+                "  AZURE_STORAGE_ACCOUNT\n"
+                "  AZURE_STORAGE_CONTAINER\n"
+                "  AZURE_STORAGE_SAS or AZURE_STORAGE_KEY\n",
+                rc);
+            return 1;
+        }
     }
 
     return shell_main(argc, argv);

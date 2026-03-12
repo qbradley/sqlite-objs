@@ -46,6 +46,7 @@ typedef struct {
 /* Benchmark configuration */
 typedef struct {
   int use_azure;
+  int use_uri;
   int use_wal;
   int num_warehouses;
   int duration_seconds;
@@ -53,6 +54,12 @@ typedef struct {
   int force_reload;
   int skip_load;
   char *db_path;
+  /* URI mode fields */
+  char *uri_account;
+  char *uri_container;
+  char *uri_sas;
+  char *uri_endpoint;
+  char uri_db_path[1024];  /* constructed URI string */
 } benchmark_config_t;
 
 /* Initialize transaction stats */
@@ -116,6 +123,11 @@ static void print_usage(const char *prog) {
   fprintf(stderr, "Options:\n");
   fprintf(stderr, "  --local            Use local SQLite (default VFS)\n");
   fprintf(stderr, "  --azure            Use azqlite (Azure blob-backed VFS)\n");
+  fprintf(stderr, "  --uri              Use URI-based Azure config (no env vars needed)\n");
+  fprintf(stderr, "  --account NAME     Azure storage account (with --uri)\n");
+  fprintf(stderr, "  --container NAME   Azure container name (with --uri)\n");
+  fprintf(stderr, "  --sas TOKEN        SAS token (with --uri)\n");
+  fprintf(stderr, "  --endpoint URL     Custom endpoint, e.g. Azurite (with --uri)\n");
   fprintf(stderr, "  --wal              Enable WAL journal mode (default)\n");
   fprintf(stderr, "  --warehouses N     Number of warehouses (default: 1)\n");
   fprintf(stderr, "  --duration S       Benchmark duration in seconds (default: 60)\n");
@@ -124,9 +136,12 @@ static void print_usage(const char *prog) {
   fprintf(stderr, "  --skip-load        Skip data loading (use existing data)\n");
   fprintf(stderr, "  --help             Show this help message\n");
   fprintf(stderr, "\n");
-  fprintf(stderr, "For Azure mode, set these environment variables:\n");
+  fprintf(stderr, "For Azure mode (env vars), set:\n");
   fprintf(stderr, "  AZURE_STORAGE_ACCOUNT, AZURE_STORAGE_CONTAINER\n");
   fprintf(stderr, "  AZURE_STORAGE_KEY (or AZURE_STORAGE_SAS)\n");
+  fprintf(stderr, "\n");
+  fprintf(stderr, "URI mode example:\n");
+  fprintf(stderr, "  %s --uri --account myacct --container mycontainer --sas 'sv=2024...'\n", prog);
 }
 
 /* Check Azure environment */
@@ -163,7 +178,7 @@ static int run_benchmark(benchmark_config_t *config) {
   
   printf("\nTPC-C Benchmark Configuration\n");
   printf("=================================================================\n");
-  printf("Mode:       %s\n", config->use_azure ? "azure (azqlite VFS)" : "local (default VFS)");
+  printf("Mode:       %s\n", config->use_uri ? "azure (URI-mode VFS)" : config->use_azure ? "azure (azqlite VFS)" : "local (default VFS)");
   if (config->use_wal) {
     printf("Journal:    WAL (write-ahead logging)\n");
   } else {
@@ -176,7 +191,24 @@ static int run_benchmark(benchmark_config_t *config) {
   printf("=================================================================\n");
   
   /* Open database */
-  if (config->use_azure) {
+  if (config->use_uri) {
+#ifdef AZQLITE_VFS_AVAILABLE
+    /* URI mode: register VFS with no global client */
+    rc = azqlite_vfs_register_uri(1);
+    if (rc != SQLITE_OK) {
+      fprintf(stderr, "Failed to register azqlite URI-mode VFS\n");
+      return 1;
+    }
+    
+    rc = sqlite3_open_v2(config->db_path, &db, 
+                         SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_URI,
+                         "azqlite");
+#else
+    fprintf(stderr, "Error: URI mode requested but binary not built with Azure support\n");
+    fprintf(stderr, "Build with 'make all-production' to enable Azure mode\n");
+    return 1;
+#endif
+  } else if (config->use_azure) {
 #ifdef AZQLITE_VFS_AVAILABLE
     /* Register azqlite VFS */
 
@@ -402,7 +434,7 @@ static int run_benchmark(benchmark_config_t *config) {
   printf("\n=================================================================\n");
   printf("\nTPC-C Benchmark Results\n");
   printf("=================================================================\n");
-  printf("Mode:       %s\n", config->use_azure ? "azure (azqlite VFS)" : "local (default VFS)");
+  printf("Mode:       %s\n", config->use_uri ? "azure (URI-mode VFS)" : config->use_azure ? "azure (azqlite VFS)" : "local (default VFS)");
   printf("Journal:    %s\n", config->use_wal ? "WAL" : "DELETE");
   printf("Warehouses: %d\n", config->num_warehouses);
   printf("Duration:   %.1f seconds\n", elapsed);
@@ -490,6 +522,33 @@ int main(int argc, char **argv) {
       config.use_azure = 0;
     } else if (strcmp(argv[i], "--azure") == 0) {
       config.use_azure = 1;
+    } else if (strcmp(argv[i], "--uri") == 0) {
+      config.use_uri = 1;
+      config.use_azure = 1;
+    } else if (strcmp(argv[i], "--account") == 0) {
+      if (++i >= argc) {
+        fprintf(stderr, "Error: --account requires an argument\n");
+        return 1;
+      }
+      config.uri_account = argv[i];
+    } else if (strcmp(argv[i], "--container") == 0) {
+      if (++i >= argc) {
+        fprintf(stderr, "Error: --container requires an argument\n");
+        return 1;
+      }
+      config.uri_container = argv[i];
+    } else if (strcmp(argv[i], "--sas") == 0) {
+      if (++i >= argc) {
+        fprintf(stderr, "Error: --sas requires an argument\n");
+        return 1;
+      }
+      config.uri_sas = argv[i];
+    } else if (strcmp(argv[i], "--endpoint") == 0) {
+      if (++i >= argc) {
+        fprintf(stderr, "Error: --endpoint requires an argument\n");
+        return 1;
+      }
+      config.uri_endpoint = argv[i];
     } else if (strcmp(argv[i], "--warehouses") == 0) {
       if (++i >= argc) {
         fprintf(stderr, "Error: --warehouses requires an argument\n");
@@ -543,7 +602,30 @@ int main(int argc, char **argv) {
   /* WAL mode is now the default and works with both local and Azure */
 
   /* Set database path */
-  if (config.use_azure) {
+  if (config.use_uri) {
+    /* Validate URI mode args */
+    if (!config.uri_account) {
+      fprintf(stderr, "Error: --uri requires --account\n");
+      return 1;
+    }
+    if (!config.uri_container) {
+      fprintf(stderr, "Error: --uri requires --container\n");
+      return 1;
+    }
+    if (!config.uri_sas) {
+      fprintf(stderr, "Error: --uri requires --sas\n");
+      return 1;
+    }
+    /* Construct URI: file:tpcc.db?azure_account=...&azure_container=...&azure_sas=... */
+    int n = snprintf(config.uri_db_path, sizeof(config.uri_db_path),
+                     "file:tpcc.db?azure_account=%s&azure_container=%s&azure_sas=%s",
+                     config.uri_account, config.uri_container, config.uri_sas);
+    if (config.uri_endpoint) {
+      snprintf(config.uri_db_path + n, sizeof(config.uri_db_path) - n,
+               "&azure_endpoint=%s", config.uri_endpoint);
+    }
+    config.db_path = config.uri_db_path;
+  } else if (config.use_azure) {
     if (!check_azure_env()) {
       return 1;
     }

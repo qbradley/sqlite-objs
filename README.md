@@ -141,7 +141,11 @@ az storage container generate-sas \
 ### Command Line Shell
 
 ```bash
+# Environment variable mode:
 ./azqlite-shell mydb.db
+
+# URI mode (no environment variables needed):
+./azqlite-shell --uri "file:mydb.db?azure_account=myacct&azure_container=mycontainer&azure_sas=sv%3D2024..."
 ```
 
 The shell automatically registers the azqlite VFS. Your database file `mydb.db` will be stored as a page blob in the configured container.
@@ -210,6 +214,35 @@ azqlite uses Azure blob leases for write exclusion:
 - Dirty page bitmap tracks modified 4KB pages
 - `xSync` uploads only dirty pages to Azure
 - Future: LRU page cache for large databases (MVP 2)
+
+## URI Configuration
+
+Instead of environment variables, you can pass Azure credentials directly in the database URI:
+
+```c
+// Register VFS without any global credentials
+azqlite_vfs_register_uri(1);  // 1 = make default
+
+// Open with credentials in the URI
+sqlite3_open_v2(
+    "file:mydb.db?azure_account=myacct&azure_container=mycontainer&azure_sas=sv%3D2024...",
+    &db,
+    SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_URI,
+    "azqlite"
+);
+```
+
+Supported URI parameters:
+
+| Parameter          | Description                              |
+|--------------------|------------------------------------------|
+| `azure_account`    | Storage account name (required)          |
+| `azure_container`  | Container name                           |
+| `azure_sas`        | SAS token                                |
+| `azure_key`        | Shared Key (alternative to SAS)          |
+| `azure_endpoint`   | Custom endpoint (e.g. for Azurite)       |
+
+This enables opening databases across different Azure accounts and containers within the same process. If `azure_account` is not present in the URI, `xOpen` returns `SQLITE_CANTOPEN`.
 
 ## Limitations
 

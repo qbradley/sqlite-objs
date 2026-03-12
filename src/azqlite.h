@@ -88,6 +88,25 @@ int azqlite_vfs_register_with_config(const azqlite_config_t *config,
 int azqlite_vfs_register_with_ops(azure_ops_t *ops, void *ctx,
                                   int makeDefault);
 
+/*
+** Register the "azqlite" VFS with no global Azure client.
+** All databases MUST provide Azure credentials via URI parameters:
+**
+**   file:mydb.db?azure_account=acct&azure_container=cont&azure_sas=token
+**
+** Supported URI parameters:
+**   azure_account    — Storage account name (required)
+**   azure_container  — Container name
+**   azure_sas        — SAS token
+**   azure_key        — Shared Key
+**   azure_endpoint   — Custom endpoint (e.g. for Azurite)
+**
+** If azure_account is missing from the URI, xOpen returns SQLITE_CANTOPEN.
+** If makeDefault is non-zero, this VFS becomes the default.
+** Returns SQLITE_OK on success, or an appropriate error code.
+*/
+int azqlite_vfs_register_uri(int makeDefault);
+
 #ifdef __cplusplus
 }
 #endif
