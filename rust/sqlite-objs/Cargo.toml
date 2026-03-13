@@ -9,7 +9,7 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-sqlite-objs-sys = { path = "../sqlite-objs-sys" }
+sqlite-objs-sys.workspace = true
 thiserror = "2.0"
 
 [dev-dependencies]

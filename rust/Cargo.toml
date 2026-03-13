@@ -3,12 +3,13 @@ members = ["sqlite-objs-sys", "sqlite-objs"]
 resolver = "2"
 
 [workspace.package]
-version = "0.1.0"
+version = "0.1.0-alpha"
 authors = ["sqlite-objs Contributors"]
 edition = "2021"
 license = "MIT"
-repository = "https://github.com/yourusername/sqlite-objs"
+repository = "https://github.com/qbradley/sqlite-objs/rust"
 rust-version = "1.70"
 
 [workspace.dependencies]
 libc = "0.2"
+sqlite-objs-sys = { path = "sqlite-objs-sys", version = "0.1.0-alpha" }
