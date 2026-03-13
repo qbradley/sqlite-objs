@@ -103,6 +103,12 @@ static int azqliteShmUnmap(sqlite3_file*, int);
 #define AZQLITE_DEFAULT_CACHE_PAGES 262144  /* 1 GB at 4K page size */
 #define AZQLITE_DEFAULT_PREFETCH_PAGES 1024 /* 4 MB warmup at open */
 
+/* Prefetch strategy codes (negative = named strategy, positive = page count) */
+#define AZQLITE_PREFETCH_OFF    (-1)
+#define AZQLITE_PREFETCH_ALL    (-2)
+#define AZQLITE_PREFETCH_INDEX  (-3)
+#define AZQLITE_PREFETCH_WARM   (-4)
+
 /* Page cache entry — one per cached page */
 typedef struct azqlite_cache_entry {
     int pageNo;                          /* 0-based page index */
@@ -1974,8 +1980,18 @@ static int azqliteOpen(sqlite3_vfs *pVfs, sqlite3_filename zName,
     }
     const char *pfParam = sqlite3_uri_parameter(zName, "prefetch");
     if (pfParam) {
-        int val = atoi(pfParam);
-        if (val >= 0) p->prefetchPages = val;
+        if (strcmp(pfParam, "off") == 0) {
+            p->prefetchPages = AZQLITE_PREFETCH_OFF;
+        } else if (strcmp(pfParam, "all") == 0) {
+            p->prefetchPages = AZQLITE_PREFETCH_ALL;
+        } else if (strcmp(pfParam, "index") == 0) {
+            p->prefetchPages = AZQLITE_PREFETCH_INDEX;
+        } else if (strcmp(pfParam, "warm") == 0) {
+            p->prefetchPages = AZQLITE_PREFETCH_WARM;
+        } else {
+            int val = atoi(pfParam);
+            if (val >= 0) p->prefetchPages = val;
+        }
     }
 
     if (isMainDb) {
@@ -2020,18 +2036,45 @@ static int azqliteOpen(sqlite3_vfs *pVfs, sqlite3_filename zName,
             p->blobSize = blobSize;
 
             if (blobSize > 0 && p->ops->page_blob_read) {
-            /* Prefetch: warm cache at open with a bounded number of pages.
-             * The adaptive readahead state machine handles demand fetching
-             * beyond this initial warmup. Cap at cache size to avoid waste. */
-            int prefetchLimit = p->prefetchPages;
-            if (prefetchLimit > p->cachePagesConfig)
-                prefetchLimit = p->cachePagesConfig;
-            size_t maxPrefetch = (size_t)prefetchLimit * AZQLITE_DEFAULT_PAGE_SIZE;
-            size_t fetchLen = ((int64_t)maxPrefetch <= blobSize)
-                              ? maxPrefetch : (size_t)blobSize;
+            /* Determine how much to prefetch based on strategy.
+             * All strategies download in one large GET to minimize
+             * HTTP round-trips (~22ms per request to Azure). */
+            size_t fetchLen = 0;
+            size_t cacheMaxBytes = (size_t)p->cachePagesConfig * AZQLITE_DEFAULT_PAGE_SIZE;
+
+            if (p->prefetchPages == AZQLITE_PREFETCH_OFF) {
+                /* Off: just page 0 (header) for page-size detection */
+                fetchLen = AZQLITE_DEFAULT_PAGE_SIZE;
+            } else if (p->prefetchPages == AZQLITE_PREFETCH_ALL) {
+                /* All: download entire DB if it fits in cache */
+                if ((size_t)blobSize <= cacheMaxBytes) {
+                    fetchLen = (size_t)blobSize;
+                } else {
+                    /* DB doesn't fit — fall back to default fixed prefetch */
+                    size_t fallback = (size_t)AZQLITE_DEFAULT_PREFETCH_PAGES * AZQLITE_DEFAULT_PAGE_SIZE;
+                    fetchLen = (fallback <= (size_t)blobSize) ? fallback : (size_t)blobSize;
+                }
+            } else if (p->prefetchPages == AZQLITE_PREFETCH_INDEX ||
+                       p->prefetchPages == AZQLITE_PREFETCH_WARM) {
+                /* Index/warm: not yet implemented — fall back to default */
+                size_t fallback = (size_t)AZQLITE_DEFAULT_PREFETCH_PAGES * AZQLITE_DEFAULT_PAGE_SIZE;
+                fetchLen = (fallback <= (size_t)blobSize) ? fallback : (size_t)blobSize;
+            } else {
+                /* Fixed page count */
+                int prefetchLimit = p->prefetchPages;
+                if (prefetchLimit > p->cachePagesConfig)
+                    prefetchLimit = p->cachePagesConfig;
+                size_t maxPrefetch = (size_t)prefetchLimit * AZQLITE_DEFAULT_PAGE_SIZE;
+                fetchLen = ((int64_t)maxPrefetch <= blobSize)
+                                  ? maxPrefetch : (size_t)blobSize;
+            }
+
+            /* Always fetch at least the header page */
             if (fetchLen < AZQLITE_DEFAULT_PAGE_SIZE && blobSize > 0)
                 fetchLen = AZQLITE_DEFAULT_PAGE_SIZE;
             if ((int64_t)fetchLen > blobSize) fetchLen = (size_t)blobSize;
+                double prefetch_t0 = 0;
+                if (azqlite_debug_timing()) prefetch_t0 = azqlite_time_ms();
                 azure_buffer_t buf = {0};
                 azure_error_t aerr2;
                 azure_error_init(&aerr2);
@@ -2059,7 +2102,8 @@ static int azqliteOpen(sqlite3_vfs *pVfs, sqlite3_filename zName,
                     return rc;
                 }
 
-                /* Insert first page(s) into cache from the fetched data */
+                /* Insert fetched pages into cache */
+                int pagesLoaded = 0;
                 if (buf.data && buf.size > 0) {
                     size_t off = 0;
                     int pageNo = 0;
@@ -2078,9 +2122,26 @@ static int azqliteOpen(sqlite3_vfs *pVfs, sqlite3_filename zName,
                         cacheInsert(&p->cache, pageNo, pageData, 0);
                         off += (size_t)detectedPageSize;
                         pageNo++;
+                        pagesLoaded++;
                     }
                 }
                 free(buf.data);
+
+                if (azqlite_debug_timing()) {
+                    double prefetch_ms = azqlite_time_ms() - prefetch_t0;
+                    const char *stratName =
+                        (p->prefetchPages == AZQLITE_PREFETCH_OFF) ? "off" :
+                        (p->prefetchPages == AZQLITE_PREFETCH_ALL) ? "all" :
+                        (p->prefetchPages == AZQLITE_PREFETCH_INDEX) ? "index" :
+                        (p->prefetchPages == AZQLITE_PREFETCH_WARM) ? "warm" : "fixed";
+                    fprintf(stderr, "[PREFETCH] strategy=%s fetched=%d pages (%.1fMB) "
+                            "of %lld total (%.1fMB) in %.1fms\n",
+                            stratName, pagesLoaded,
+                            (double)fetchLen / (1024.0 * 1024.0),
+                            (long long)blobSize,
+                            (double)blobSize / (1024.0 * 1024.0),
+                            prefetch_ms);
+                }
 
                 /* R2: Record initial Azure blob size to skip redundant resizes */
                 p->lastSyncedSize = blobSize;

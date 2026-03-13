@@ -59,6 +59,7 @@ typedef struct {
   char *uri_container;
   char *uri_sas;
   char *uri_endpoint;
+  char *prefetch;               /* prefetch strategy: off, all, index, warm, or page count */
   char uri_db_path[4096];  /* constructed URI string (large for encoded SAS) */
 } benchmark_config_t;
 
@@ -165,6 +166,7 @@ static void print_usage(const char *prog) {
   fprintf(stderr, "  --threads N        Number of concurrent threads (default: 1)\n");
   fprintf(stderr, "  --reload           Force reload data (drops existing tables)\n");
   fprintf(stderr, "  --skip-load        Skip data loading (use existing data)\n");
+  fprintf(stderr, "  --prefetch MODE    Prefetch strategy: off, all, index, warm, or page count\n");
   fprintf(stderr, "  --help             Show this help message\n");
   fprintf(stderr, "\n");
   fprintf(stderr, "For Azure mode (env vars), set:\n");
@@ -219,9 +221,13 @@ static int run_benchmark(benchmark_config_t *config) {
   printf("Duration:   %d seconds\n", config->duration_seconds);
   printf("Threads:    %d\n", config->num_threads);
   printf("Database:   %s\n", config->db_path);
+  if (config->prefetch) {
+    printf("Prefetch:   %s\n", config->prefetch);
+  }
   printf("=================================================================\n");
   
   /* Open database */
+  printf("Opening database...\n");
   if (config->use_uri) {
 #ifdef AZQLITE_VFS_AVAILABLE
     /* URI mode: register VFS with no global client */
@@ -267,6 +273,7 @@ static int run_benchmark(benchmark_config_t *config) {
   }
   
   /* Set journal mode */
+  printf("Set journal mode...\n");
   if (config->use_wal) {
     char *errmsg = NULL;
 
@@ -320,6 +327,7 @@ static int run_benchmark(benchmark_config_t *config) {
     needs_load = 0;
   } else {
     /* Check if tables exist */
+    printf("Check if tables exist...\n");
     rc = sqlite3_prepare_v2(db, "SELECT COUNT(*) FROM sqlite_master WHERE type='table'", -1, &stmt, NULL);
     int table_count = 0;
     if (rc == SQLITE_OK) {
@@ -333,6 +341,7 @@ static int run_benchmark(benchmark_config_t *config) {
       needs_load = 1;
     } else if (!config->force_reload) {
       /* Tables exist - check if data was loaded */
+      printf("Table exist - check if data was loaded..");
       rc = sqlite3_prepare_v2(db, "SELECT COUNT(*) FROM district", -1, &stmt, NULL);
       int district_count = 0;
       if (rc == SQLITE_OK) {
@@ -400,6 +409,7 @@ static int run_benchmark(benchmark_config_t *config) {
   printf("\nStarting benchmark run...\n");;
   printf("=================================================================\n");
   
+  printf("Preparing statements...\n");
   if (tpcc_prepare_stmts(db) != 0) {
     fprintf(stderr, "Failed to prepare cached statements\n");
     sqlite3_close(db);
@@ -411,6 +421,7 @@ static int run_benchmark(benchmark_config_t *config) {
   end_time = start_time + (config->duration_seconds * 1000.0);
   
   /* Main benchmark loop */
+  printf("Main benchmark loop...\n");
   while (get_time_ms() < end_time) {
     int txn_type = rand() % 100;
     int w_id = rand() % config->num_warehouses + 1;
@@ -620,6 +631,12 @@ int main(int argc, char **argv) {
       config.use_wal = 1;
     } else if (strcmp(argv[i], "--skip-load") == 0) {
       config.skip_load = 1;
+    } else if (strcmp(argv[i], "--prefetch") == 0) {
+      if (++i >= argc) {
+        fprintf(stderr, "Error: --prefetch requires an argument (off, all, index, warm, or page count)\n");
+        return 1;
+      }
+      config.prefetch = argv[i];
     } else if (strcmp(argv[i], "--help") == 0) {
       print_usage(argv[0]);
       return 0;
@@ -664,9 +681,13 @@ int main(int argc, char **argv) {
         fprintf(stderr, "Error: failed to encode endpoint\n");
         return 1;
       }
-      snprintf(config.uri_db_path + n, sizeof(config.uri_db_path) - (size_t)n,
+      n += snprintf(config.uri_db_path + n, sizeof(config.uri_db_path) - (size_t)n,
                "&azure_endpoint=%s", enc_endpoint);
       free(enc_endpoint);
+    }
+    if (config.prefetch) {
+      snprintf(config.uri_db_path + n, sizeof(config.uri_db_path) - (size_t)n,
+               "&prefetch=%s", config.prefetch);
     }
     config.db_path = config.uri_db_path;
   } else if (config.use_azure) {
