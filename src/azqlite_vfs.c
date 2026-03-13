@@ -100,8 +100,7 @@ static int azqliteShmUnmap(sqlite3_file*, int);
 ** Demand-paging LRU page cache
 ** =================================================================== */
 
-#define AZQLITE_DEFAULT_CACHE_PAGES 1024
-#define AZQLITE_DEFAULT_READAHEAD_PAGES 64  /* Pages fetched per cache-miss GET */
+#define AZQLITE_DEFAULT_CACHE_PAGES 262144  /* 1 GB at 4K page size */
 
 /* Page cache entry — one per cached page */
 typedef struct azqlite_cache_entry {
@@ -125,22 +124,143 @@ typedef struct azqlite_page_cache {
     azqlite_cache_entry_t *lruTail;      /* Least recently used */
 } azqlite_page_cache_t;
 
-static int cacheGetMaxPages(void) {
-    const char *val = getenv("AZQLITE_CACHE_PAGES");
-    if (val) {
-        int n = atoi(val);
-        if (n > 0) return n;
-    }
-    return AZQLITE_DEFAULT_CACHE_PAGES;
-}
+/* ===================================================================
+** Adaptive readahead state machine
+** =================================================================== */
 
-static int cacheGetReadaheadPages(void) {
-    const char *val = getenv("AZQLITE_READAHEAD_PAGES");
-    if (val) {
-        int n = atoi(val);
-        if (n > 0) return n;
+#define RA_INITIAL       0    /* No miss history          */
+#define RA_SEQUENTIAL    1    /* Forward-sequential mode  */
+#define RA_RANDOM        2    /* Demand-only mode         */
+
+#define RA_INITIAL_WINDOW   4    /* Starting window for new sequences (pages) */
+#define RA_MAX_WINDOW    1024    /* Maximum readahead window (pages = 4 MiB at 4K) */
+
+/* Per-file adaptive readahead state */
+typedef struct azqlite_readahead {
+    int state;           /* RA_INITIAL, RA_SEQUENTIAL, or RA_RANDOM    */
+    int lastMissPage;    /* Page number of last cache miss (-1 = none) */
+    int window;          /* Current readahead window (pages)           */
+
+    /* Observability counters */
+    int nMisses;             /* Total cache misses */
+    int nSequentialMisses;   /* Misses classified as sequential */
+    int nRandomMisses;       /* Misses classified as random */
+    int nWindowGrows;        /* Times the window doubled */
+    int nWindowResets;       /* Times the window reset to 1 */
+    int peakWindow;          /* High-water mark of window size */
+} azqlite_readahead_t;
+
+/* Readahead statistics — returned via FCNTL */
+typedef struct azqlite_readahead_stats {
+    int currentState;     /* RA_INITIAL, RA_SEQUENTIAL, RA_RANDOM */
+    int currentWindow;    /* Current readahead window (pages) */
+    int lastMissPage;     /* Last miss page number */
+    int totalMisses;      /* Total cache misses since xOpen */
+    int sequentialMisses; /* Misses classified as sequential */
+    int randomMisses;     /* Misses classified as random */
+    int windowGrows;      /* Times window doubled */
+    int windowResets;     /* Times window reset to 1 */
+    int peakWindow;       /* High-water mark */
+} azqlite_readahead_stats_t;
+
+#define AZQLITE_FCNTL_READAHEAD_MODE  1000
+#define AZQLITE_FCNTL_READAHEAD_STATS 1001
+
+/*
+** Determine readahead window for a cache miss at page P.
+** Updates state in-place. Returns the number of pages to readahead.
+*/
+static int readaheadOnMiss(azqlite_readahead_t *ra, int P,
+                           int maxWindow, int maxPages) {
+    int L = ra->lastMissPage;
+    int W = ra->window;
+    int result;
+
+    ra->nMisses++;
+
+    /* Cap readahead to cache capacity */
+    if (maxWindow > maxPages) maxWindow = maxPages;
+
+    if (ra->state == RA_INITIAL) {
+        /* First miss — begin with small probe window */
+        result = RA_INITIAL_WINDOW;
+        if (result > maxWindow) result = maxWindow;
+        ra->state = RA_SEQUENTIAL;
+        ra->lastMissPage = P;
+        ra->window = result;
+        ra->nSequentialMisses++;
+        if (result > ra->peakWindow) ra->peakWindow = result;
+        if (azqlite_debug_timing()) {
+            fprintf(stderr, "[READAHEAD] miss page=%d state=INITIAL->SEQUENTIAL "
+                    "window=0->%d (first miss)\n", P, result);
+        }
+        return result;
     }
-    return AZQLITE_DEFAULT_READAHEAD_PAGES;
+
+    int distance = P - L;
+
+    /* Case 1: Inside the last readahead window (eviction pressure) */
+    if (distance > 0 && distance < W) {
+        ra->lastMissPage = P;
+        ra->nSequentialMisses++;
+        result = W;
+        if (result > maxWindow) result = maxWindow;
+        if (azqlite_debug_timing()) {
+            fprintf(stderr, "[READAHEAD] miss page=%d state=SEQUENTIAL "
+                    "window=%d (inside-window, eviction pressure)\n", P, W);
+        }
+        return result;
+    }
+
+    /* Case 2: Sequential continuation — at or just past the window boundary */
+    int tolerance = W / 4;
+    if (tolerance < 4) tolerance = 4;
+
+    if (distance >= W && distance <= W + tolerance) {
+        int newW = W * 2;
+        if (newW > maxWindow) newW = maxWindow;
+        if (newW < RA_INITIAL_WINDOW) newW = RA_INITIAL_WINDOW;
+        ra->state = RA_SEQUENTIAL;
+        ra->lastMissPage = P;
+        ra->window = newW;
+        ra->nSequentialMisses++;
+        if (newW > W) ra->nWindowGrows++;
+        if (newW > ra->peakWindow) ra->peakWindow = newW;
+        if (azqlite_debug_timing()) {
+            fprintf(stderr, "[READAHEAD] miss page=%d state=SEQUENTIAL "
+                    "window=%d->%d (sequential continuation)\n", P, W, newW);
+        }
+        return newW;
+    }
+
+    /* Case 3: Adjacent forward miss from RANDOM — new sequence detected */
+    if (distance == 1 && ra->state == RA_RANDOM) {
+        result = RA_INITIAL_WINDOW;
+        if (result > maxWindow) result = maxWindow;
+        ra->state = RA_SEQUENTIAL;
+        ra->lastMissPage = P;
+        ra->window = result;
+        ra->nSequentialMisses++;
+        ra->nWindowGrows++;
+        if (result > ra->peakWindow) ra->peakWindow = result;
+        if (azqlite_debug_timing()) {
+            fprintf(stderr, "[READAHEAD] miss page=%d state=RANDOM->SEQUENTIAL "
+                    "window=1->%d (new sequence detected)\n", P, result);
+        }
+        return result;
+    }
+
+    /* Case 4: Non-sequential — random access */
+    ra->state = RA_RANDOM;
+    ra->lastMissPage = P;
+    ra->window = 1;
+    ra->nRandomMisses++;
+    ra->nWindowResets++;
+    if (azqlite_debug_timing()) {
+        fprintf(stderr, "[READAHEAD] miss page=%d state=RANDOM "
+                "window=%d->1 (non-sequential jump from %d)\n", P, W, L);
+    }
+    return 1;
 }
 
 /* Round up to next power of 2 */
@@ -339,6 +459,14 @@ typedef struct azqliteFile {
 
     /* Per-file Azure client (NULL = using global VFS client) */
     azure_client_t *ownClient;
+
+    /* Adaptive readahead state (per-file, per-connection) */
+    azqlite_readahead_t readahead;
+
+    /* Readahead configuration (parsed from URI at xOpen) */
+    int readaheadMode;       /* 0=auto (adaptive), >0=fixed N pages */
+    int readaheadMaxWindow;  /* Max window for adaptive mode */
+    int cachePagesConfig;    /* Configured max cache pages */
 } azqliteFile;
 
 /*
@@ -602,6 +730,15 @@ static int azqliteClose(sqlite3_file *pFile) {
         p->leaseId[0] = '\0';
     }
 
+    /* Log readahead summary if there was any miss activity */
+    if (azqlite_debug_timing() && p->readahead.nMisses > 0) {
+        fprintf(stderr, "[READAHEAD] Summary: %d misses (%d sequential, %d random), "
+                "peak window=%d, %d resets\n",
+                p->readahead.nMisses, p->readahead.nSequentialMisses,
+                p->readahead.nRandomMisses, p->readahead.peakWindow,
+                p->readahead.nWindowResets);
+    }
+
     cacheDestroy(&p->cache);
     free(p->aJrnlData);
     p->aJrnlData = NULL;
@@ -690,7 +827,16 @@ static int azqliteRead(sqlite3_file *pFile, void *pBuf, int iAmt,
         } else {
             /* Cache miss — read-ahead: fetch a batch of contiguous pages in
              * one HTTP GET to amortize Azure round-trip latency (~22ms/GET) */
-            int readaheadPages = cacheGetReadaheadPages();
+            int readaheadPages;
+            if (p->readaheadMode > 0) {
+                /* Fixed mode — user-specified via URI parameter */
+                readaheadPages = p->readaheadMode;
+            } else {
+                /* Adaptive mode — consult state machine */
+                readaheadPages = readaheadOnMiss(
+                    &p->readahead, pageNo,
+                    p->readaheadMaxWindow, p->cache.maxPages);
+            }
             /* Cap read-ahead to cache capacity so the target page
              * (inserted first at MRU) isn't evicted by later inserts */
             if (readaheadPages > p->cache.maxPages)
@@ -1605,6 +1751,32 @@ static int azqliteFileControl(sqlite3_file *pFile, int op, void *pArg) {
             *(char **)pArg = sqlite3_mprintf("azqlite");
             return SQLITE_OK;
         }
+        case AZQLITE_FCNTL_READAHEAD_MODE: {
+            azqliteFile *p = (azqliteFile *)pFile;
+            int mode = *(int *)pArg;
+            p->readaheadMode = mode;
+            if (mode == 0) {
+                /* Reset adaptive state when switching back to auto */
+                p->readahead.state = RA_INITIAL;
+                p->readahead.lastMissPage = -1;
+                p->readahead.window = 0;
+            }
+            return SQLITE_OK;
+        }
+        case AZQLITE_FCNTL_READAHEAD_STATS: {
+            azqliteFile *p = (azqliteFile *)pFile;
+            azqlite_readahead_stats_t *s = (azqlite_readahead_stats_t *)pArg;
+            s->currentState = p->readahead.state;
+            s->currentWindow = p->readahead.window;
+            s->lastMissPage = p->readahead.lastMissPage;
+            s->totalMisses = p->readahead.nMisses;
+            s->sequentialMisses = p->readahead.nSequentialMisses;
+            s->randomMisses = p->readahead.nRandomMisses;
+            s->windowGrows = p->readahead.nWindowGrows;
+            s->windowResets = p->readahead.nWindowResets;
+            s->peakWindow = p->readahead.peakWindow;
+            return SQLITE_OK;
+        }
         default:
             return SQLITE_NOTFOUND;
     }
@@ -1767,6 +1939,37 @@ static int azqliteOpen(sqlite3_vfs *pVfs, sqlite3_filename zName,
     p->lastSyncDirtyCount = 0;
     p->etag[0] = '\0';
 
+    /* Adaptive readahead defaults */
+    p->readahead.state = RA_INITIAL;
+    p->readahead.lastMissPage = -1;
+    p->readahead.window = 0;
+    memset(&p->readahead.nMisses, 0,
+           sizeof(azqlite_readahead_t) - offsetof(azqlite_readahead_t, nMisses));
+    p->readaheadMode = 0;              /* adaptive by default */
+    p->readaheadMaxWindow = RA_MAX_WINDOW;
+    p->cachePagesConfig = AZQLITE_DEFAULT_CACHE_PAGES;
+
+    /* Parse readahead URI parameters */
+    const char *raParam = sqlite3_uri_parameter(zName, "readahead");
+    if (raParam) {
+        if (strcmp(raParam, "auto") == 0 || strcmp(raParam, "adaptive") == 0) {
+            p->readaheadMode = 0;
+        } else {
+            int val = atoi(raParam);
+            if (val >= 0) p->readaheadMode = val;
+        }
+    }
+    const char *raMaxParam = sqlite3_uri_parameter(zName, "readahead_max");
+    if (raMaxParam) {
+        int val = atoi(raMaxParam);
+        if (val > 0) p->readaheadMaxWindow = val;
+    }
+    const char *cpParam = sqlite3_uri_parameter(zName, "cache_pages");
+    if (cpParam) {
+        int val = atoi(cpParam);
+        if (val > 0) p->cachePagesConfig = val;
+    }
+
     if (isMainDb) {
         /* MAIN_DB: Initialize page cache and fetch first page for header.
         ** Use blob_get_properties as single HEAD request — returns NOT_FOUND
@@ -1813,7 +2016,7 @@ static int azqliteOpen(sqlite3_vfs *pVfs, sqlite3_filename zName,
             /* Prefetch: fill cache at open to avoid cold-cache HTTP storms.
              * For small DBs (fit in cache), this loads the entire DB.
              * For large DBs, it pre-warms with the first maxPages pages. */
-            int maxPages = cacheGetMaxPages();
+            int maxPages = p->cachePagesConfig;
             size_t maxPrefetch = (size_t)maxPages * AZQLITE_DEFAULT_PAGE_SIZE;
             size_t fetchLen = ((int64_t)maxPrefetch <= blobSize)
                               ? maxPrefetch : (size_t)blobSize;
@@ -1839,7 +2042,7 @@ static int azqliteOpen(sqlite3_vfs *pVfs, sqlite3_filename zName,
                 }
 
                 /* Initialize cache with detected page size */
-                int rc = cacheInit(&p->cache, detectedPageSize, cacheGetMaxPages());
+                int rc = cacheInit(&p->cache, detectedPageSize, p->cachePagesConfig);
                 if (rc != SQLITE_OK) {
                     free(buf.data);
                     sqlite3_free(p->zBlobName);
@@ -1874,7 +2077,7 @@ static int azqliteOpen(sqlite3_vfs *pVfs, sqlite3_filename zName,
                 p->lastSyncedSize = blobSize;
             } else {
                 /* Empty blob or no read ops — init cache with default page size */
-                int rc = cacheInit(&p->cache, AZQLITE_DEFAULT_PAGE_SIZE, cacheGetMaxPages());
+                int rc = cacheInit(&p->cache, AZQLITE_DEFAULT_PAGE_SIZE, p->cachePagesConfig);
                 if (rc != SQLITE_OK) {
                     sqlite3_free(p->zBlobName);
                     p->zBlobName = NULL;
@@ -1895,7 +2098,7 @@ static int azqliteOpen(sqlite3_vfs *pVfs, sqlite3_filename zName,
                 }
             }
             p->blobSize = 0;
-            int rc = cacheInit(&p->cache, AZQLITE_DEFAULT_PAGE_SIZE, cacheGetMaxPages());
+            int rc = cacheInit(&p->cache, AZQLITE_DEFAULT_PAGE_SIZE, p->cachePagesConfig);
             if (rc != SQLITE_OK) {
                 sqlite3_free(p->zBlobName);
                 p->zBlobName = NULL;

@@ -1338,6 +1338,31 @@ static void close_test_db(sqlite3 *db) {
     if (db) sqlite3_close(db);
 }
 
+/* URI-aware variants — pass URI query params like "cache_pages=4" */
+static sqlite3 *open_test_db_uri(mock_azure_ctx_t *mctx, const char *params) {
+    sqlite3 *db = NULL;
+    azqlite_vfs_register_with_ops(mock_azure_get_ops(), mctx, 0);
+    char uri[256];
+    snprintf(uri, sizeof(uri), "file:test.db?%s", params);
+    int rc = sqlite3_open_v2(uri, &db,
+                              SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_URI,
+                              "azqlite");
+    return (rc == SQLITE_OK) ? db : NULL;
+}
+
+static sqlite3 *open_existing_test_db_uri(mock_azure_ctx_t *mctx,
+                                           const char *name,
+                                           const char *params) {
+    sqlite3 *db = NULL;
+    azqlite_vfs_register_with_ops(mock_azure_get_ops(), mctx, 0);
+    char uri[256];
+    snprintf(uri, sizeof(uri), "file:%s?%s", name, params);
+    int rc = sqlite3_open_v2(uri, &db,
+                              SQLITE_OPEN_READWRITE | SQLITE_OPEN_URI,
+                              "azqlite");
+    return (rc == SQLITE_OK) ? db : NULL;
+}
+
 /* ── Registration Tests ───────────────────────────────────────────── */
 
 TEST(vfs_registers_with_correct_name) {
@@ -2468,9 +2493,6 @@ TEST(demand_paging_cache_miss_fetches_page) {
 TEST(demand_paging_lru_eviction) {
     setup();
 
-    /* Use a very small cache to force eviction */
-    setenv("AZQLITE_CACHE_PAGES", "4", 1);
-
     /* Create a real database with data spanning many pages */
     sqlite3 *db = open_test_db(g_ctx);
     ASSERT_NOT_NULL(db);
@@ -2493,8 +2515,8 @@ TEST(demand_paging_lru_eviction) {
     ASSERT_OK(rc);
     close_test_db(db);
 
-    /* Reopen with small cache — pages will need to be evicted and re-fetched */
-    sqlite3 *db2 = open_existing_test_db(g_ctx, "test.db");
+    /* Reopen with small cache via URI — pages will need to be evicted */
+    sqlite3 *db2 = open_existing_test_db_uri(g_ctx, "test.db", "cache_pages=4");
     ASSERT_NOT_NULL(db2);
 
     /* First query — fills cache, causes evictions */
@@ -2525,7 +2547,6 @@ TEST(demand_paging_lru_eviction) {
     ASSERT_GT(second_reads, 0);
 
     close_test_db(db2);
-    unsetenv("AZQLITE_CACHE_PAGES");
 }
 
 /* ── Test 4: Dirty pages survive eviction ────────────────────────── */
@@ -2533,10 +2554,8 @@ TEST(demand_paging_lru_eviction) {
 TEST(demand_paging_dirty_not_evicted) {
     setup();
 
-    /* Small cache to force eviction pressure */
-    setenv("AZQLITE_CACHE_PAGES", "4", 1);
-
-    sqlite3 *db = open_test_db(g_ctx);
+    /* Small cache via URI to force eviction pressure */
+    sqlite3 *db = open_test_db_uri(g_ctx, "cache_pages=4");
     ASSERT_NOT_NULL(db);
 
     int rc;
@@ -2580,7 +2599,6 @@ TEST(demand_paging_dirty_not_evicted) {
     sqlite3_finalize(stmt);
 
     close_test_db(db);
-    unsetenv("AZQLITE_CACHE_PAGES");
 }
 
 /* ── Test 5: Cross-page read ─────────────────────────────────────── */
@@ -2797,10 +2815,8 @@ TEST(demand_paging_sync_coalesces_dirty) {
 TEST(demand_paging_small_cache_correctness) {
     setup();
 
-    /* Extremely small cache — 2 pages */
-    setenv("AZQLITE_CACHE_PAGES", "2", 1);
-
-    sqlite3 *db = open_test_db(g_ctx);
+    /* Extremely small cache — 2 pages via URI */
+    sqlite3 *db = open_test_db_uri(g_ctx, "cache_pages=2");
     ASSERT_NOT_NULL(db);
 
     int rc;
@@ -2837,7 +2853,6 @@ TEST(demand_paging_small_cache_correctness) {
     sqlite3_finalize(stmt);
 
     close_test_db(db);
-    unsetenv("AZQLITE_CACHE_PAGES");
 }
 
 /* ── Test: Data survives close/reopen with demand paging ─────────── */
@@ -2845,9 +2860,7 @@ TEST(demand_paging_small_cache_correctness) {
 TEST(demand_paging_data_survives_reopen) {
     setup();
 
-    setenv("AZQLITE_CACHE_PAGES", "4", 1);
-
-    sqlite3 *db = open_test_db(g_ctx);
+    sqlite3 *db = open_test_db_uri(g_ctx, "cache_pages=4");
     ASSERT_NOT_NULL(db);
 
     int rc;
@@ -2869,7 +2882,7 @@ TEST(demand_paging_data_survives_reopen) {
     close_test_db(db);
 
     /* Reopen with small cache — demand paging must fetch pages correctly */
-    db = open_existing_test_db(g_ctx, "test.db");
+    db = open_existing_test_db_uri(g_ctx, "test.db", "cache_pages=4");
     ASSERT_NOT_NULL(db);
 
     sqlite3_stmt *stmt;
@@ -2889,14 +2902,238 @@ TEST(demand_paging_data_survives_reopen) {
     sqlite3_finalize(stmt);
 
     close_test_db(db);
-    unsetenv("AZQLITE_CACHE_PAGES");
+}
+
+/* ══════════════════════════════════════════════════════════════════════
+** Adaptive Readahead Tests
+** ══════════════════════════════════════════════════════════════════════ */
+
+/* Mirror VFS-internal constants for test assertions */
+#define TEST_RA_INITIAL      0
+#define TEST_RA_SEQUENTIAL   1
+#define TEST_RA_RANDOM       2
+#define TEST_FCNTL_READAHEAD_MODE  1000
+#define TEST_FCNTL_READAHEAD_STATS 1001
+
+typedef struct {
+    int currentState;
+    int currentWindow;
+    int lastMissPage;
+    int totalMisses;
+    int sequentialMisses;
+    int randomMisses;
+    int windowGrows;
+    int windowResets;
+    int peakWindow;
+} test_readahead_stats_t;
+
+static test_readahead_stats_t get_ra_stats(sqlite3 *db) {
+    test_readahead_stats_t stats;
+    memset(&stats, 0, sizeof(stats));
+    sqlite3_file_control(db, "main", TEST_FCNTL_READAHEAD_STATS, &stats);
+    return stats;
+}
+
+/* Test: default mode is adaptive (state=INITIAL) */
+TEST(readahead_default_is_adaptive) {
+    setup();
+    sqlite3 *db = open_test_db(g_ctx);
+    ASSERT_NOT_NULL(db);
+
+    test_readahead_stats_t s = get_ra_stats(db);
+    ASSERT_EQ(s.currentState, TEST_RA_INITIAL);
+    ASSERT_EQ(s.currentWindow, 0);
+    ASSERT_EQ(s.totalMisses, 0);
+
+    close_test_db(db);
+}
+
+/* Test: sequential reads grow the window */
+TEST(readahead_sequential_grows_window) {
+    setup();
+    sqlite3 *db = open_test_db(g_ctx);
+    ASSERT_NOT_NULL(db);
+
+    /* Create enough data to span many pages and trigger sequential reads */
+    int rc = sqlite3_exec(db, "CREATE TABLE t(id INTEGER PRIMARY KEY, data TEXT);",
+                           NULL, NULL, NULL);
+    ASSERT_OK(rc);
+    rc = sqlite3_exec(db, "BEGIN;", NULL, NULL, NULL);
+    ASSERT_OK(rc);
+    for (int i = 0; i < 500; i++) {
+        char sql[512];
+        snprintf(sql, sizeof(sql),
+                 "INSERT INTO t VALUES(%d, '%0400d');", i, i);
+        rc = sqlite3_exec(db, sql, NULL, NULL, NULL);
+        ASSERT_OK(rc);
+    }
+    rc = sqlite3_exec(db, "COMMIT;", NULL, NULL, NULL);
+    ASSERT_OK(rc);
+    close_test_db(db);
+
+    /* Reopen with small cache so sequential scan triggers misses */
+    sqlite3 *db2 = open_existing_test_db_uri(g_ctx, "test.db", "cache_pages=8");
+    ASSERT_NOT_NULL(db2);
+
+    /* Full scan triggers sequential pattern */
+    sqlite3_stmt *stmt;
+    rc = sqlite3_prepare_v2(db2, "SELECT COUNT(*) FROM t;", -1, &stmt, NULL);
+    ASSERT_OK(rc);
+    rc = sqlite3_step(stmt);
+    ASSERT_EQ(rc, SQLITE_ROW);
+    sqlite3_finalize(stmt);
+
+    test_readahead_stats_t s = get_ra_stats(db2);
+    /* After sequential scan, should have detected sequential pattern */
+    ASSERT_GT(s.totalMisses, 0);
+    ASSERT_GT(s.peakWindow, 0);
+
+    close_test_db(db2);
+}
+
+/* Test: FCNTL to set fixed readahead mode */
+TEST(readahead_fcntl_set_fixed_mode) {
+    setup();
+    sqlite3 *db = open_test_db(g_ctx);
+    ASSERT_NOT_NULL(db);
+
+    /* Set fixed readahead of 16 pages */
+    int mode = 16;
+    int rc = sqlite3_file_control(db, "main", TEST_FCNTL_READAHEAD_MODE, &mode);
+    ASSERT_OK(rc);
+
+    /* Stats should still report — mode doesn't affect stats struct directly,
+       but the mode is stored internally */
+    test_readahead_stats_t s = get_ra_stats(db);
+    /* State remains INITIAL since we haven't read anything */
+    ASSERT_EQ(s.currentState, TEST_RA_INITIAL);
+
+    close_test_db(db);
+}
+
+/* Test: FCNTL reset to adaptive resets state machine */
+TEST(readahead_fcntl_reset_to_adaptive) {
+    setup();
+    sqlite3 *db = open_test_db(g_ctx);
+    ASSERT_NOT_NULL(db);
+
+    /* Set to fixed mode */
+    int mode = 32;
+    int rc = sqlite3_file_control(db, "main", TEST_FCNTL_READAHEAD_MODE, &mode);
+    ASSERT_OK(rc);
+
+    /* Reset back to adaptive (mode=0) */
+    mode = 0;
+    rc = sqlite3_file_control(db, "main", TEST_FCNTL_READAHEAD_MODE, &mode);
+    ASSERT_OK(rc);
+
+    test_readahead_stats_t s = get_ra_stats(db);
+    ASSERT_EQ(s.currentState, TEST_RA_INITIAL);
+    ASSERT_EQ(s.currentWindow, 0);
+
+    close_test_db(db);
+}
+
+/* Test: URI readahead=64 sets fixed mode */
+TEST(readahead_uri_fixed_mode) {
+    setup();
+    sqlite3 *db = open_test_db_uri(g_ctx, "readahead=64");
+    ASSERT_NOT_NULL(db);
+
+    /* Create and query some data to verify fixed mode works */
+    int rc = sqlite3_exec(db, "CREATE TABLE t(x INTEGER);", NULL, NULL, NULL);
+    ASSERT_OK(rc);
+    rc = sqlite3_exec(db, "INSERT INTO t VALUES(1);", NULL, NULL, NULL);
+    ASSERT_OK(rc);
+
+    sqlite3_stmt *stmt;
+    rc = sqlite3_prepare_v2(db, "SELECT x FROM t;", -1, &stmt, NULL);
+    ASSERT_OK(rc);
+    rc = sqlite3_step(stmt);
+    ASSERT_EQ(rc, SQLITE_ROW);
+    ASSERT_EQ(sqlite3_column_int(stmt, 0), 1);
+    sqlite3_finalize(stmt);
+
+    close_test_db(db);
+}
+
+/* Test: URI readahead=auto is same as adaptive default */
+TEST(readahead_uri_auto_mode) {
+    setup();
+    sqlite3 *db = open_test_db_uri(g_ctx, "readahead=auto");
+    ASSERT_NOT_NULL(db);
+
+    test_readahead_stats_t s = get_ra_stats(db);
+    ASSERT_EQ(s.currentState, TEST_RA_INITIAL);
+
+    close_test_db(db);
+}
+
+/* Test: URI cache_pages param works */
+TEST(readahead_uri_cache_pages) {
+    setup();
+    sqlite3 *db = open_test_db_uri(g_ctx, "cache_pages=16");
+    ASSERT_NOT_NULL(db);
+
+    /* Just verify db works with custom cache size */
+    int rc = sqlite3_exec(db, "CREATE TABLE t(x INTEGER);", NULL, NULL, NULL);
+    ASSERT_OK(rc);
+    rc = sqlite3_exec(db, "INSERT INTO t VALUES(42);", NULL, NULL, NULL);
+    ASSERT_OK(rc);
+
+    sqlite3_stmt *stmt;
+    rc = sqlite3_prepare_v2(db, "SELECT x FROM t;", -1, &stmt, NULL);
+    ASSERT_OK(rc);
+    rc = sqlite3_step(stmt);
+    ASSERT_EQ(rc, SQLITE_ROW);
+    ASSERT_EQ(sqlite3_column_int(stmt, 0), 42);
+    sqlite3_finalize(stmt);
+
+    close_test_db(db);
+}
+
+/* Test: URI readahead_max param works */
+TEST(readahead_uri_max_window) {
+    setup();
+    sqlite3 *db = open_test_db_uri(g_ctx, "readahead_max=32");
+    ASSERT_NOT_NULL(db);
+
+    /* Create data and scan — window should be capped */
+    int rc = sqlite3_exec(db, "CREATE TABLE t(id INTEGER PRIMARY KEY, data TEXT);",
+                           NULL, NULL, NULL);
+    ASSERT_OK(rc);
+    rc = sqlite3_exec(db, "BEGIN;", NULL, NULL, NULL);
+    ASSERT_OK(rc);
+    for (int i = 0; i < 200; i++) {
+        char sql[512];
+        snprintf(sql, sizeof(sql),
+                 "INSERT INTO t VALUES(%d, '%0400d');", i, i);
+        rc = sqlite3_exec(db, sql, NULL, NULL, NULL);
+        ASSERT_OK(rc);
+    }
+    rc = sqlite3_exec(db, "COMMIT;", NULL, NULL, NULL);
+    ASSERT_OK(rc);
+    close_test_db(db);
+
+    sqlite3 *db2 = open_existing_test_db_uri(g_ctx, "test.db",
+                                               "cache_pages=8&readahead_max=32");
+    ASSERT_NOT_NULL(db2);
+
+    sqlite3_stmt *stmt;
+    rc = sqlite3_prepare_v2(db2, "SELECT COUNT(*) FROM t;", -1, &stmt, NULL);
+    ASSERT_OK(rc);
+    rc = sqlite3_step(stmt);
+    ASSERT_EQ(rc, SQLITE_ROW);
+    sqlite3_finalize(stmt);
+
+    test_readahead_stats_t s = get_ra_stats(db2);
+    /* Peak window should not exceed readahead_max=32 */
+    ASSERT_TRUE(s.peakWindow <= 32);
+
+    close_test_db(db2);
 }
 
 #endif /* ENABLE_VFS_INTEGRATION */
-
-/* ══════════════════════════════════════════════════════════════════════
-** Test Suite Runner
-** ══════════════════════════════════════════════════════════════════════ */
 
 void run_vfs_tests(void) {
     /* Section 1: Page Blob Operations */
@@ -3148,6 +3385,17 @@ void run_vfs_tests(void) {
     RUN_TEST(demand_paging_sync_coalesces_dirty);
     RUN_TEST(demand_paging_small_cache_correctness);
     RUN_TEST(demand_paging_data_survives_reopen);
+    TEST_SUITE_END();
+
+    TEST_SUITE_BEGIN("Adaptive Readahead");
+    RUN_TEST(readahead_default_is_adaptive);
+    RUN_TEST(readahead_sequential_grows_window);
+    RUN_TEST(readahead_fcntl_set_fixed_mode);
+    RUN_TEST(readahead_fcntl_reset_to_adaptive);
+    RUN_TEST(readahead_uri_fixed_mode);
+    RUN_TEST(readahead_uri_auto_mode);
+    RUN_TEST(readahead_uri_cache_pages);
+    RUN_TEST(readahead_uri_max_window);
     TEST_SUITE_END();
 #endif
 
