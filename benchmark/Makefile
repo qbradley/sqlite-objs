@@ -56,10 +56,12 @@ SQLITE_OBJ = $(BUILD_DIR)/sqlite3.o
 
 # VFS objects (stub build)
 VFS_STUB_OBJS = $(BUILD_DIR)/azqlite_vfs.o \
+                $(BUILD_DIR)/azqlite_cache.o \
                 $(BUILD_DIR)/azure_client_stub.o
 
 # VFS objects (production build)
 VFS_PROD_OBJS = $(BUILD_DIR)/azqlite_vfs.o \
+                $(BUILD_DIR)/azqlite_cache.o \
                 $(BUILD_DIR)/azure_client.o \
                 $(BUILD_DIR)/azure_auth.o \
                 $(BUILD_DIR)/azure_error.o
