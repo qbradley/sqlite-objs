@@ -15,6 +15,9 @@
 **   export AZURE_STORAGE_SAS="sv=2024-08-04&..."
 **   ./azqlite-shell mydb.db
 **
+** Open a local file (bypasses Azure VFS):
+**   ./azqlite-shell "file:local.db?vfs=unix"
+**
 ** URI mode (no environment variables needed):
 **   ./azqlite-shell --uri "file:mydb.db?azure_account=acct&azure_container=cont&azure_sas=tok"
 **
@@ -59,13 +62,17 @@ int main(int argc, char **argv) {
         }
     }
 
+    /*
+    ** Always enable URI filenames so users can open local files with
+    ** ?vfs=unix (or any other VFS) even when azqlite is the default.
+    */
+    sqlite3_config(SQLITE_CONFIG_URI, 1);
+
     if (use_uri) {
         /*
         ** URI mode: register VFS with no global client.
         ** All Azure config comes from URI parameters in the filename.
-        ** Enable URI filenames globally before any SQLite initialization.
         */
-        sqlite3_config(SQLITE_CONFIG_URI, 1);
         rc = azqlite_vfs_register_uri(1);  /* 1 = make default */
         if (rc != SQLITE_OK) {
             fprintf(stderr,

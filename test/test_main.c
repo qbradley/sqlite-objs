@@ -31,6 +31,9 @@ int main(int argc, char **argv) {
     (void)argc;
     (void)argv;
 
+    /* Enable URI filenames globally so ?vfs= works in ATTACH statements */
+    sqlite3_config(SQLITE_CONFIG_URI, 1);
+
     fprintf(stdout,
         "%s%s╔══════════════════════════════════════╗%s\n"
         "%s%s║   azqlite Layer 1 Test Suite         ║%s\n"

@@ -3133,6 +3133,103 @@ TEST(readahead_uri_max_window) {
     close_test_db(db2);
 }
 
+/* ── Cross-VFS Tests ──────────────────────────────────────────────── */
+
+/*
+** Test: Open a local file via the unix VFS and an Azure-backed file via
+** the azqlite VFS, then JOIN across the two databases.
+** This proves the same binary can work with both local and remote files
+** by selecting the VFS at open time.
+*/
+TEST(cross_vfs_local_and_azure_join) {
+    setup();
+
+    /* Register azqlite VFS (non-default) with mock ops */
+    azqlite_vfs_register_with_ops(mock_azure_get_ops(), g_ctx, 0);
+
+    /* 1. Create a local database using the built-in unix VFS */
+    sqlite3 *localDb = NULL;
+    unlink("cross_local.db");
+    int rc = sqlite3_open_v2("cross_local.db", &localDb,
+                              SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE,
+                              "unix");
+    ASSERT_OK(rc);
+    ASSERT_NOT_NULL(localDb);
+
+    rc = sqlite3_exec(localDb,
+        "CREATE TABLE employees(id INTEGER PRIMARY KEY, name TEXT, dept_id INTEGER);"
+        "INSERT INTO employees VALUES(1, 'Alice', 10);"
+        "INSERT INTO employees VALUES(2, 'Bob', 20);"
+        "INSERT INTO employees VALUES(3, 'Carol', 10);",
+        NULL, NULL, NULL);
+    ASSERT_OK(rc);
+    sqlite3_close(localDb);
+
+    /* 2. Create an Azure-backed database using the azqlite VFS */
+    sqlite3 *azureDb = NULL;
+    rc = sqlite3_open_v2("cross_remote.db", &azureDb,
+                          SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE,
+                          "azqlite");
+    ASSERT_OK(rc);
+    ASSERT_NOT_NULL(azureDb);
+
+    rc = sqlite3_exec(azureDb,
+        "CREATE TABLE departments(id INTEGER PRIMARY KEY, name TEXT);"
+        "INSERT INTO departments VALUES(10, 'Engineering');"
+        "INSERT INTO departments VALUES(20, 'Marketing');",
+        NULL, NULL, NULL);
+    ASSERT_OK(rc);
+    sqlite3_close(azureDb);
+
+    /* 3. Reopen azure db, ATTACH local db via unix VFS, and JOIN */
+    rc = sqlite3_open_v2("cross_remote.db", &azureDb,
+                          SQLITE_OPEN_READWRITE, "azqlite");
+    ASSERT_OK(rc);
+
+    rc = sqlite3_exec(azureDb,
+        "ATTACH 'file:cross_local.db?vfs=unix' AS local;",
+        NULL, NULL, NULL);
+    ASSERT_OK(rc);
+
+    /* 4. Cross-VFS JOIN: local employees (unix) × azure departments */
+    sqlite3_stmt *stmt;
+    rc = sqlite3_prepare_v2(azureDb,
+        "SELECT e.name, d.name FROM local.employees e "
+        "JOIN departments d ON e.dept_id = d.id "
+        "ORDER BY e.id;",
+        -1, &stmt, NULL);
+    ASSERT_OK(rc);
+
+    /* Row 1: Alice, Engineering */
+    rc = sqlite3_step(stmt);
+    ASSERT_EQ(rc, SQLITE_ROW);
+    ASSERT_STR_EQ((const char *)sqlite3_column_text(stmt, 0), "Alice");
+    ASSERT_STR_EQ((const char *)sqlite3_column_text(stmt, 1), "Engineering");
+
+    /* Row 2: Bob, Marketing */
+    rc = sqlite3_step(stmt);
+    ASSERT_EQ(rc, SQLITE_ROW);
+    ASSERT_STR_EQ((const char *)sqlite3_column_text(stmt, 0), "Bob");
+    ASSERT_STR_EQ((const char *)sqlite3_column_text(stmt, 1), "Marketing");
+
+    /* Row 3: Carol, Engineering */
+    rc = sqlite3_step(stmt);
+    ASSERT_EQ(rc, SQLITE_ROW);
+    ASSERT_STR_EQ((const char *)sqlite3_column_text(stmt, 0), "Carol");
+    ASSERT_STR_EQ((const char *)sqlite3_column_text(stmt, 1), "Engineering");
+
+    /* No more rows */
+    rc = sqlite3_step(stmt);
+    ASSERT_EQ(rc, SQLITE_DONE);
+
+    sqlite3_finalize(stmt);
+
+    /* Detach and clean up */
+    sqlite3_exec(azureDb, "DETACH local;", NULL, NULL, NULL);
+    sqlite3_close(azureDb);
+    unlink("cross_local.db");
+}
+
 #endif /* ENABLE_VFS_INTEGRATION */
 
 void run_vfs_tests(void) {
@@ -3396,6 +3493,10 @@ void run_vfs_tests(void) {
     RUN_TEST(readahead_uri_auto_mode);
     RUN_TEST(readahead_uri_cache_pages);
     RUN_TEST(readahead_uri_max_window);
+    TEST_SUITE_END();
+
+    TEST_SUITE_BEGIN("Cross-VFS Operations");
+    RUN_TEST(cross_vfs_local_and_azure_join);
     TEST_SUITE_END();
 #endif
 
