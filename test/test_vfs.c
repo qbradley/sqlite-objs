@@ -2428,14 +2428,15 @@ TEST(demand_paging_cache_miss_fetches_page) {
     ASSERT_OK(rc);
     close_test_db(db);
 
-    /* Reopen — only HEAD + first page fetched */
+    /* Reopen — bulk prefetch loads entire small DB into cache */
     mock_reset_call_counts(g_ctx);
     db = open_existing_test_db(g_ctx, "test.db");
     ASSERT_NOT_NULL(db);
 
+    /* Single page_blob_read call (bulk prefetch) */
     ASSERT_EQ(mock_get_call_count(g_ctx, "page_blob_read"), 1);
 
-    /* First SELECT: cache misses trigger Azure reads */
+    /* First SELECT: all pages already cached from prefetch, no new reads */
     mock_reset_call_counts(g_ctx);
     sqlite3_stmt *stmt;
     rc = sqlite3_prepare_v2(db, "SELECT COUNT(*) FROM t;", -1, &stmt, NULL);
@@ -2446,9 +2447,9 @@ TEST(demand_paging_cache_miss_fetches_page) {
     sqlite3_finalize(stmt);
 
     int reads_first = mock_get_call_count(g_ctx, "page_blob_read");
-    ASSERT_GT(reads_first, 0);
+    ASSERT_EQ(reads_first, 0);
 
-    /* Second identical SELECT: all pages cached, no Azure reads */
+    /* Second identical SELECT: still all cached, no Azure reads */
     mock_reset_call_counts(g_ctx);
     rc = sqlite3_prepare_v2(db, "SELECT COUNT(*) FROM t;", -1, &stmt, NULL);
     ASSERT_OK(rc);

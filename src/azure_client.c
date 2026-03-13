@@ -479,6 +479,9 @@ static azure_err_t execute_single(
     /* Timeouts */
     curl_easy_setopt(curl, CURLOPT_TIMEOUT, 60L);
     curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 10L);
+    curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
+    curl_easy_setopt(curl, CURLOPT_LOW_SPEED_LIMIT, 1024L);
+    curl_easy_setopt(curl, CURLOPT_LOW_SPEED_TIME, 30L);
 
     /* TCP keep-alive for connection reuse */
     curl_easy_setopt(curl, CURLOPT_TCP_KEEPALIVE, 1L);
@@ -1272,6 +1275,9 @@ static azure_err_t batch_init_easy(
     /* Timeouts and keep-alive (match execute_single settings) */
     curl_easy_setopt(req->easy, CURLOPT_TIMEOUT, 60L);
     curl_easy_setopt(req->easy, CURLOPT_CONNECTTIMEOUT, 10L);
+    curl_easy_setopt(req->easy, CURLOPT_NOSIGNAL, 1L);
+    curl_easy_setopt(req->easy, CURLOPT_LOW_SPEED_LIMIT, 1024L);
+    curl_easy_setopt(req->easy, CURLOPT_LOW_SPEED_TIME, 30L);
     curl_easy_setopt(req->easy, CURLOPT_TCP_KEEPALIVE, 1L);
     curl_easy_setopt(req->easy, CURLOPT_TCP_KEEPIDLE, 30L);
     curl_easy_setopt(req->easy, CURLOPT_TCP_KEEPINTVL, 15L);

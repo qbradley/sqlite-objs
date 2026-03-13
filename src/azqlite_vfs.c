@@ -101,6 +101,7 @@ static int azqliteShmUnmap(sqlite3_file*, int);
 ** =================================================================== */
 
 #define AZQLITE_DEFAULT_CACHE_PAGES 1024
+#define AZQLITE_DEFAULT_READAHEAD_PAGES 64  /* Pages fetched per cache-miss GET */
 
 /* Page cache entry — one per cached page */
 typedef struct azqlite_cache_entry {
@@ -131,6 +132,15 @@ static int cacheGetMaxPages(void) {
         if (n > 0) return n;
     }
     return AZQLITE_DEFAULT_CACHE_PAGES;
+}
+
+static int cacheGetReadaheadPages(void) {
+    const char *val = getenv("AZQLITE_READAHEAD_PAGES");
+    if (val) {
+        int n = atoi(val);
+        if (n > 0) return n;
+    }
+    return AZQLITE_DEFAULT_READAHEAD_PAGES;
 }
 
 /* Round up to next power of 2 */
@@ -678,46 +688,70 @@ static int azqliteRead(sqlite3_file *pFile, void *pBuf, int iAmt,
         if (entry) {
             cacheLruTouch(&p->cache, entry);
         } else {
-            /* Cache miss — fetch from Azure */
+            /* Cache miss — read-ahead: fetch a batch of contiguous pages in
+             * one HTTP GET to amortize Azure round-trip latency (~22ms/GET) */
+            int readaheadPages = cacheGetReadaheadPages();
+            /* Cap read-ahead to cache capacity so the target page
+             * (inserted first at MRU) isn't evicted by later inserts */
+            if (readaheadPages > p->cache.maxPages)
+                readaheadPages = p->cache.maxPages;
+            int totalPages = (int)((p->blobSize + pageSize - 1) / pageSize);
+            int endPage = pageNo + readaheadPages;
+            if (endPage > totalPages) endPage = totalPages;
+
             int64_t fetchOff = (int64_t)pageNo * pageSize;
-            size_t fetchLen = (size_t)pageSize;
-            /* Clamp to blob size */
-            if (fetchOff + (int64_t)fetchLen > p->blobSize) {
-                fetchLen = (size_t)(p->blobSize - fetchOff);
-            }
+            int64_t fetchEnd = (int64_t)endPage * pageSize;
+            if (fetchEnd > p->blobSize) fetchEnd = p->blobSize;
+            size_t fetchLen = (size_t)(fetchEnd - fetchOff);
 
-            unsigned char *pageData = (unsigned char *)calloc(1, (size_t)pageSize);
-            if (!pageData) return SQLITE_NOMEM;
-
+            azure_buffer_t buf = {0};
             if (fetchLen > 0) {
-                azure_buffer_t buf = {0};
                 azure_error_t aerr;
                 azure_error_init(&aerr);
                 azure_err_t aec = p->ops->page_blob_read(
                     p->ops_ctx, p->zBlobName, fetchOff, fetchLen, &buf, &aerr);
                 if (aec != AZURE_OK) {
-                    free(pageData);
                     int sqlRc = azureErrToSqlite(aec, SQLITE_IOERR_READ);
                     fprintf(stderr, "azqlite: page_blob_read failed at offset %lld len %zu: %s\n",
                             (long long)fetchOff, fetchLen, aerr.error_message);
                     azure_error_clear(&aerr);
                     return sqlRc;
                 }
-                if (buf.data && buf.size > 0) {
-                    size_t toCopy = buf.size < (size_t)pageSize ? buf.size : (size_t)pageSize;
-                    memcpy(pageData, buf.data, toCopy);
-                }
-                free(buf.data);
             }
 
-            /* Evict if at capacity */
-            if (p->cache.nPages >= p->cache.maxPages) {
-                cacheEvictClean(&p->cache);
+            /* Split response into individual pages and insert into cache */
+            if (buf.data && buf.size > 0) {
+                size_t bufOff = 0;
+                for (int pg = pageNo; pg < endPage && bufOff < buf.size; pg++) {
+                    /* Skip pages already in cache (may be dirty) */
+                    if (cacheLookup(&p->cache, pg)) {
+                        bufOff += (size_t)pageSize;
+                        continue;
+                    }
+
+                    unsigned char *pgData = (unsigned char *)calloc(1, (size_t)pageSize);
+                    if (!pgData) {
+                        free(buf.data);
+                        return SQLITE_NOMEM;
+                    }
+                    size_t avail = buf.size - bufOff;
+                    size_t toCopy = avail < (size_t)pageSize ? avail : (size_t)pageSize;
+                    memcpy(pgData, buf.data + bufOff, toCopy);
+
+                    if (p->cache.nPages >= p->cache.maxPages) {
+                        cacheEvictClean(&p->cache);
+                    }
+                    cacheInsert(&p->cache, pg, pgData, 0);
+                    bufOff += (size_t)pageSize;
+                }
             }
-            entry = cacheInsert(&p->cache, pageNo, pageData, 0);
+            free(buf.data);
+
+            /* Requested page should now be in cache */
+            entry = cacheLookup(&p->cache, pageNo);
             if (!entry) {
-                free(pageData);
-                return SQLITE_NOMEM;
+                memset(out, 0, (size_t)remaining);
+                return SQLITE_IOERR_SHORT_READ;
             }
         }
 
@@ -1776,8 +1810,16 @@ static int azqliteOpen(sqlite3_vfs *pVfs, sqlite3_filename zName,
 
             if (blobSize > 0 && p->ops->page_blob_read) {
                 /* Fetch first page to detect page size from SQLite header */
-                size_t fetchLen = AZQLITE_DEFAULT_PAGE_SIZE;
-                if ((int64_t)fetchLen > blobSize) fetchLen = (size_t)blobSize;
+            /* Prefetch: fill cache at open to avoid cold-cache HTTP storms.
+             * For small DBs (fit in cache), this loads the entire DB.
+             * For large DBs, it pre-warms with the first maxPages pages. */
+            int maxPages = cacheGetMaxPages();
+            size_t maxPrefetch = (size_t)maxPages * AZQLITE_DEFAULT_PAGE_SIZE;
+            size_t fetchLen = ((int64_t)maxPrefetch <= blobSize)
+                              ? maxPrefetch : (size_t)blobSize;
+            if (fetchLen < AZQLITE_DEFAULT_PAGE_SIZE && blobSize > 0)
+                fetchLen = AZQLITE_DEFAULT_PAGE_SIZE;
+            if ((int64_t)fetchLen > blobSize) fetchLen = (size_t)blobSize;
                 azure_buffer_t buf = {0};
                 azure_error_t aerr2;
                 azure_error_init(&aerr2);
