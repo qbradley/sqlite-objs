@@ -152,6 +152,13 @@ int azqlite_cache_page_write_if_invalid(azqlite_cache_t *cache, int page_no,
 */
 unsigned char *azqlite_cache_page_ptr(azqlite_cache_t *cache, int page_no);
 
+/*
+** Verify the CRC32C checksum of a cached page.
+** Returns 1 if the checksum matches (or checksums are disabled), 0 if corrupt.
+** Returns 0 if page_no is out of range or the page is not valid.
+*/
+int azqlite_cache_page_verify(azqlite_cache_t *cache, int page_no);
+
 /* ===================================================================
 ** Dirty page tracking
 ** =================================================================== */

@@ -17,6 +17,7 @@
 #include "../sqlite-autoconf-3520000/sqlite3.h"
 #include "mock_azure_ops.h"
 #include "test_harness.h"
+#include "../src/azqlite_cache.h"
 #include <string.h>
 #include <stdlib.h>
 
@@ -3588,6 +3589,107 @@ TEST(prefetch_thread_cancel_on_close) {
 
 #endif /* ENABLE_VFS_INTEGRATION */
 
+/* ===================================================================
+** CRC32C Checksum Tests (direct cache API)
+** =================================================================== */
+
+TEST(checksum_detects_corruption) {
+    setup();
+
+    azqlite_cache_config_t cfg;
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.cache_dir = g_test_cache_dir;
+    cfg.blob_identity = "test/checksum/corrupt";
+    cfg.page_size = 4096;
+    cfg.page_count = 4;
+    cfg.checksums_enabled = 1;
+
+    azqlite_cache_t *cache = azqlite_cache_open(&cfg);
+    ASSERT_NOT_NULL(cache);
+
+    /* Write a page with known data */
+    unsigned char page_data[4096];
+    memset(page_data, 0xAB, sizeof(page_data));
+    azqlite_cache_page_write(cache, 1, page_data, 0);
+
+    /* Verify checksum passes */
+    ASSERT_EQ(azqlite_cache_page_verify(cache, 1), 1);
+
+    /* Corrupt the page data directly in the mmap */
+    unsigned char *ptr = azqlite_cache_page_ptr(cache, 1);
+    ASSERT_NOT_NULL(ptr);
+    ptr[0] ^= 0xFF;
+
+    /* Verify checksum now fails */
+    ASSERT_EQ(azqlite_cache_page_verify(cache, 1), 0);
+
+    /* Fix the corruption */
+    ptr[0] ^= 0xFF;
+    ASSERT_EQ(azqlite_cache_page_verify(cache, 1), 1);
+
+    azqlite_cache_close(cache);
+}
+
+TEST(checksum_survives_reopen) {
+    setup();
+
+    const char *identity = "test/checksum/reopen";
+    unsigned char page0[4096], page1[4096];
+    memset(page0, 0x11, sizeof(page0));
+    memset(page1, 0x22, sizeof(page1));
+
+    /* Write pages with checksums enabled */
+    {
+        azqlite_cache_config_t cfg;
+        memset(&cfg, 0, sizeof(cfg));
+        cfg.cache_dir = g_test_cache_dir;
+        cfg.blob_identity = identity;
+        cfg.page_size = 4096;
+        cfg.page_count = 4;
+        cfg.checksums_enabled = 1;
+
+        azqlite_cache_t *cache = azqlite_cache_open(&cfg);
+        ASSERT_NOT_NULL(cache);
+
+        azqlite_cache_page_write(cache, 0, page0, 0);
+        azqlite_cache_page_write(cache, 1, page1, 0);
+
+        ASSERT_EQ(azqlite_cache_page_verify(cache, 0), 1);
+        ASSERT_EQ(azqlite_cache_page_verify(cache, 1), 1);
+
+        azqlite_cache_close(cache);
+    }
+
+    /* Reopen the cache and verify checksums are still valid */
+    {
+        azqlite_cache_config_t cfg;
+        memset(&cfg, 0, sizeof(cfg));
+        cfg.cache_dir = g_test_cache_dir;
+        cfg.blob_identity = identity;
+        cfg.page_size = 4096;
+        cfg.page_count = 4;
+        cfg.checksums_enabled = 1;
+
+        azqlite_cache_t *cache = azqlite_cache_open(&cfg);
+        ASSERT_NOT_NULL(cache);
+
+        /* Pages should still be valid with correct checksums */
+        ASSERT_EQ(azqlite_cache_page_valid(cache, 0), 1);
+        ASSERT_EQ(azqlite_cache_page_valid(cache, 1), 1);
+        ASSERT_EQ(azqlite_cache_page_verify(cache, 0), 1);
+        ASSERT_EQ(azqlite_cache_page_verify(cache, 1), 1);
+
+        /* Verify actual data is intact */
+        unsigned char buf[4096];
+        azqlite_cache_lock(cache);
+        ASSERT_EQ(azqlite_cache_page_read(cache, 0, buf), 1);
+        azqlite_cache_unlock(cache);
+        ASSERT_MEM_EQ(buf, page0, 4096);
+
+        azqlite_cache_close(cache);
+    }
+}
+
 void run_vfs_tests(void) {
     /* Section 1: Page Blob Operations */
     TEST_SUITE_BEGIN("Page Blob Operations");
@@ -3868,6 +3970,11 @@ void run_vfs_tests(void) {
     RUN_TEST(prefetch_thread_cancel_on_close);
     TEST_SUITE_END();
 #endif
+
+    TEST_SUITE_BEGIN("CRC32C Page Checksums");
+    RUN_TEST(checksum_detects_corruption);
+    RUN_TEST(checksum_survives_reopen);
+    TEST_SUITE_END();
 
     /* Cleanup */
     if (g_ctx) {

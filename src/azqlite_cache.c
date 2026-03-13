@@ -99,6 +99,34 @@ static void bitmap_clear(unsigned char *bitmap, int bit) {
     bitmap[bit / 8] &= (unsigned char)~(1 << (bit % 8));
 }
 
+/* ===================================================================
+** CRC32C (Castagnoli) — software lookup-table implementation
+** Polynomial: 0x82F63B78 (bit-reversed form of 0x1EDC6F41)
+** =================================================================== */
+
+static uint32_t crc32c_table[256];
+static int crc32c_table_init = 0;
+
+static void crc32c_init_table(void) {
+    if (crc32c_table_init) return;
+    for (int i = 0; i < 256; i++) {
+        uint32_t crc = (uint32_t)i;
+        for (int j = 0; j < 8; j++) {
+            crc = (crc >> 1) ^ (0x82F63B78 & (-(int32_t)(crc & 1)));
+        }
+        crc32c_table[i] = crc;
+    }
+    crc32c_table_init = 1;
+}
+
+static uint32_t crc32c(const unsigned char *data, size_t len) {
+    uint32_t crc = 0xFFFFFFFF;
+    for (size_t i = 0; i < len; i++) {
+        crc = crc32c_table[(crc ^ data[i]) & 0xFF] ^ (crc >> 8);
+    }
+    return crc ^ 0xFFFFFFFF;
+}
+
 /* Ensure directory exists (creates parents as needed) */
 static int ensure_directory(const char *path) {
     char tmp[512];
@@ -181,6 +209,8 @@ azqlite_cache_t *azqlite_cache_open(const azqlite_cache_config_t *config) {
         config->page_count < 0) {
         return NULL;
     }
+
+    if (config->checksums_enabled) crc32c_init_table();
 
     /* page_size==0 means "adopt from existing cache header, or use 4096" */
     int requested_page_size = config->page_size > 0 ? config->page_size : 4096;
@@ -422,6 +452,9 @@ void azqlite_cache_page_write(azqlite_cache_t *c, int page_no,
     if (mark_dirty) {
         bitmap_set(c->dirty_bitmap, page_no);
     }
+    if (c->checksums_enabled && c->checksums) {
+        c->checksums[page_no] = crc32c(data, (size_t)c->page_size);
+    }
     pthread_mutex_unlock(&c->mutex);
 }
 
@@ -436,6 +469,9 @@ int azqlite_cache_page_write_if_invalid(azqlite_cache_t *c, int page_no,
     size_t offset = (size_t)page_no * (size_t)c->page_size;
     memcpy(c->pages_base + offset, data, (size_t)c->page_size);
     bitmap_set(c->valid_bitmap, page_no);
+    if (c->checksums_enabled && c->checksums) {
+        c->checksums[page_no] = crc32c(data, (size_t)c->page_size);
+    }
     pthread_mutex_unlock(&c->mutex);
     return 1;
 }
@@ -443,6 +479,15 @@ int azqlite_cache_page_write_if_invalid(azqlite_cache_t *c, int page_no,
 unsigned char *azqlite_cache_page_ptr(azqlite_cache_t *c, int page_no) {
     if (!c || page_no < 0 || page_no >= c->page_count) return NULL;
     return c->pages_base + (size_t)page_no * (size_t)c->page_size;
+}
+
+int azqlite_cache_page_verify(azqlite_cache_t *c, int page_no) {
+    if (!c || page_no < 0 || page_no >= c->page_count) return 0;
+    if (!c->checksums_enabled || !c->checksums) return 1;
+    if (!bitmap_test(c->valid_bitmap, page_no)) return 0;
+    size_t offset = (size_t)page_no * (size_t)c->page_size;
+    uint32_t actual = crc32c(c->pages_base + offset, (size_t)c->page_size);
+    return actual == c->checksums[page_no];
 }
 
 /* ===================================================================
@@ -505,10 +550,12 @@ int azqlite_cache_grow(azqlite_cache_t *c, int new_page_count) {
     if (!c || new_page_count <= c->page_count) return 0;
 
     int old_bitmap_bytes = c->bitmap_bytes;
+    int old_page_count = c->page_count;
 
     /* Save old bitmaps BEFORE unmapping (they live in the mmap'd region) */
     unsigned char *old_valid = NULL;
     unsigned char *old_dirty = NULL;
+    uint32_t *old_checksums = NULL;
     if (old_bitmap_bytes > 0) {
         old_valid = (unsigned char *)malloc((size_t)old_bitmap_bytes);
         old_dirty = (unsigned char *)malloc((size_t)old_bitmap_bytes);
@@ -516,6 +563,12 @@ int azqlite_cache_grow(azqlite_cache_t *c, int new_page_count) {
             memcpy(old_valid, c->valid_bitmap, (size_t)old_bitmap_bytes);
         if (old_dirty && c->dirty_bitmap)
             memcpy(old_dirty, c->dirty_bitmap, (size_t)old_bitmap_bytes);
+    }
+    if (c->checksums_enabled && c->checksums && old_page_count > 0) {
+        size_t cksum_bytes = (size_t)old_page_count * sizeof(uint32_t);
+        old_checksums = (uint32_t *)malloc(cksum_bytes);
+        if (old_checksums)
+            memcpy(old_checksums, c->checksums, cksum_bytes);
     }
 
     /* Unmap existing */
@@ -530,6 +583,7 @@ int azqlite_cache_grow(azqlite_cache_t *c, int new_page_count) {
     if (ftruncate(c->meta_fd, (off_t)c->meta_size) != 0) {
         free(old_valid);
         free(old_dirty);
+        free(old_checksums);
         return -1;
     }
     c->meta_base = (unsigned char *)mmap(NULL, c->meta_size,
@@ -538,6 +592,7 @@ int azqlite_cache_grow(azqlite_cache_t *c, int new_page_count) {
     if (c->meta_base == MAP_FAILED) {
         free(old_valid);
         free(old_dirty);
+        free(old_checksums);
         return -1;
     }
 
@@ -545,6 +600,7 @@ int azqlite_cache_grow(azqlite_cache_t *c, int new_page_count) {
     if (ftruncate(c->pages_fd, (off_t)c->pages_size) != 0) {
         free(old_valid);
         free(old_dirty);
+        free(old_checksums);
         return -1;
     }
     c->pages_base = (unsigned char *)mmap(NULL, c->pages_size,
@@ -553,6 +609,7 @@ int azqlite_cache_grow(azqlite_cache_t *c, int new_page_count) {
     if (c->pages_base == MAP_FAILED) {
         free(old_valid);
         free(old_dirty);
+        free(old_checksums);
         return -1;
     }
 
@@ -565,9 +622,14 @@ int azqlite_cache_grow(azqlite_cache_t *c, int new_page_count) {
         memcpy(c->valid_bitmap, old_valid, (size_t)old_bitmap_bytes);
     if (old_dirty && old_bitmap_bytes > 0)
         memcpy(c->dirty_bitmap, old_dirty, (size_t)old_bitmap_bytes);
+    if (c->checksums_enabled && c->checksums && old_checksums && old_page_count > 0) {
+        memset(c->checksums, 0, (size_t)new_page_count * sizeof(uint32_t));
+        memcpy(c->checksums, old_checksums, (size_t)old_page_count * sizeof(uint32_t));
+    }
 
     free(old_valid);
     free(old_dirty);
+    free(old_checksums);
 
     /* Update header */
     c->header->page_count = (uint32_t)new_page_count;

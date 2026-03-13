@@ -2024,6 +2024,8 @@ static int azqliteOpen(sqlite3_vfs *pVfs, sqlite3_filename zName,
             if (blobSize > 0 && p->ops->page_blob_read) {
             /* Open disk cache first (page_size=0 adopts existing header's page_size) */
             const char *cacheDir = sqlite3_uri_parameter(zName, "cache_dir");
+            const char *checksumsParam = sqlite3_uri_parameter(zName, "checksums");
+            int checksumsEnabled = (checksumsParam && checksumsParam[0] == '1');
             int pageCount = (int)(blobSize / AZQLITE_DEFAULT_PAGE_SIZE) + 1;
             {
                 azqlite_cache_config_t cfg;
@@ -2032,6 +2034,7 @@ static int azqliteOpen(sqlite3_vfs *pVfs, sqlite3_filename zName,
                 cfg.blob_identity = p->zBlobName;
                 cfg.page_size = 0;  /* Adopt from existing cache, or 4096 */
                 cfg.page_count = pageCount;
+                cfg.checksums_enabled = checksumsEnabled;
                 p->diskCache = azqlite_cache_open(&cfg);
             }
             if (!p->diskCache) {
@@ -2121,6 +2124,7 @@ static int azqliteOpen(sqlite3_vfs *pVfs, sqlite3_filename zName,
                     cfg.blob_identity = p->zBlobName;
                     cfg.page_size = detectedPageSize;
                     cfg.page_count = pageCount;
+                    cfg.checksums_enabled = checksumsEnabled;
                     p->diskCache = azqlite_cache_open(&cfg);
                     if (!p->diskCache) {
                         free(buf.data);
