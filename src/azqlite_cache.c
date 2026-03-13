@@ -481,6 +481,34 @@ unsigned char *azqlite_cache_page_ptr(azqlite_cache_t *c, int page_no) {
     return c->pages_base + (size_t)page_no * (size_t)c->page_size;
 }
 
+int azqlite_cache_read_page_range(azqlite_cache_t *c, int page_no,
+                                  int page_off, int len,
+                                  unsigned char *dest) {
+    if (!c || page_no < 0 || page_no >= c->page_count) return 0;
+    if (page_off < 0 || len <= 0 || page_off + len > c->page_size) return 0;
+    pthread_mutex_lock(&c->mutex);
+    if (!bitmap_test(c->valid_bitmap, page_no)) {
+        pthread_mutex_unlock(&c->mutex);
+        return 0;
+    }
+    size_t offset = (size_t)page_no * (size_t)c->page_size + (size_t)page_off;
+    memcpy(dest, c->pages_base + offset, (size_t)len);
+    pthread_mutex_unlock(&c->mutex);
+    return 1;
+}
+
+void azqlite_cache_mark_written(azqlite_cache_t *c, int page_no) {
+    if (!c || page_no < 0 || page_no >= c->page_count) return;
+    /* Caller must hold the mutex */
+    bitmap_set(c->valid_bitmap, page_no);
+    bitmap_set(c->dirty_bitmap, page_no);
+    if (c->checksums_enabled && c->checksums) {
+        size_t offset = (size_t)page_no * (size_t)c->page_size;
+        c->checksums[page_no] = crc32c(c->pages_base + offset,
+                                       (size_t)c->page_size);
+    }
+}
+
 int azqlite_cache_page_verify(azqlite_cache_t *c, int page_no) {
     if (!c || page_no < 0 || page_no >= c->page_count) return 0;
     if (!c->checksums_enabled || !c->checksums) return 1;
@@ -549,6 +577,14 @@ int azqlite_cache_dirty_count(azqlite_cache_t *c) {
 int azqlite_cache_grow(azqlite_cache_t *c, int new_page_count) {
     if (!c || new_page_count <= c->page_count) return 0;
 
+    pthread_mutex_lock(&c->mutex);
+
+    /* Re-check after acquiring lock (another thread may have grown) */
+    if (new_page_count <= c->page_count) {
+        pthread_mutex_unlock(&c->mutex);
+        return 0;
+    }
+
     int old_bitmap_bytes = c->bitmap_bytes;
     int old_page_count = c->page_count;
 
@@ -584,6 +620,7 @@ int azqlite_cache_grow(azqlite_cache_t *c, int new_page_count) {
         free(old_valid);
         free(old_dirty);
         free(old_checksums);
+        pthread_mutex_unlock(&c->mutex);
         return -1;
     }
     c->meta_base = (unsigned char *)mmap(NULL, c->meta_size,
@@ -593,6 +630,7 @@ int azqlite_cache_grow(azqlite_cache_t *c, int new_page_count) {
         free(old_valid);
         free(old_dirty);
         free(old_checksums);
+        pthread_mutex_unlock(&c->mutex);
         return -1;
     }
 
@@ -601,6 +639,7 @@ int azqlite_cache_grow(azqlite_cache_t *c, int new_page_count) {
         free(old_valid);
         free(old_dirty);
         free(old_checksums);
+        pthread_mutex_unlock(&c->mutex);
         return -1;
     }
     c->pages_base = (unsigned char *)mmap(NULL, c->pages_size,
@@ -610,6 +649,7 @@ int azqlite_cache_grow(azqlite_cache_t *c, int new_page_count) {
         free(old_valid);
         free(old_dirty);
         free(old_checksums);
+        pthread_mutex_unlock(&c->mutex);
         return -1;
     }
 
@@ -634,6 +674,7 @@ int azqlite_cache_grow(azqlite_cache_t *c, int new_page_count) {
     /* Update header */
     c->header->page_count = (uint32_t)new_page_count;
 
+    pthread_mutex_unlock(&c->mutex);
     return 0;
 }
 

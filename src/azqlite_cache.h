@@ -149,8 +149,28 @@ int azqlite_cache_page_write_if_invalid(azqlite_cache_t *cache, int page_no,
 ** The pointer is valid until the next cache_grow() call.
 ** Caller must hold the mutex if accessing concurrently.
 ** Returns NULL if page_no is out of range.
+**
+** WARNING: Prefer azqlite_cache_read_page_range() for safe access.
+** Raw pointers become invalid after grow().
 */
 unsigned char *azqlite_cache_page_ptr(azqlite_cache_t *cache, int page_no);
+
+/*
+** Read a sub-range of a cached page into dest.
+** Thread-safe: acquires mutex internally.
+** Returns 1 if the page was valid and data was copied, 0 otherwise.
+** page_off + len must not exceed page_size.
+*/
+int azqlite_cache_read_page_range(azqlite_cache_t *cache, int page_no,
+                                  int page_off, int len,
+                                  unsigned char *dest);
+
+/*
+** Mark a page as valid + dirty, computing CRC32C from in-place data.
+** Caller MUST hold the cache mutex. Used after writing data directly
+** into the mmap via page_ptr() to atomically update metadata.
+*/
+void azqlite_cache_mark_written(azqlite_cache_t *cache, int page_no);
 
 /*
 ** Verify the CRC32C checksum of a cached page.

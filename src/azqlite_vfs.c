@@ -906,8 +906,6 @@ static int azqliteRead(sqlite3_file *pFile, void *pBuf, int iAmt,
             }
         }
 
-        unsigned char *pagePtr = azqlite_cache_page_ptr(p->diskCache, pageNo);
-
         /* Handle short read within partial page at end of file */
         sqlite3_int64 endOfPage = (sqlite3_int64)(pageNo + 1) * pageSize;
         if (endOfPage > p->blobSize) {
@@ -918,13 +916,16 @@ static int azqliteRead(sqlite3_file *pFile, void *pBuf, int iAmt,
             }
             if (pageOff + copyLen > validInPage) {
                 int validCopy = validInPage - pageOff;
-                memcpy(out, pagePtr + pageOff, validCopy);
+                azqlite_cache_read_page_range(
+                    p->diskCache, pageNo, pageOff, validCopy, out);
                 memset(out + validCopy, 0, (size_t)(remaining - validCopy));
                 return SQLITE_IOERR_SHORT_READ;
             }
         }
 
-        memcpy(out, pagePtr + pageOff, copyLen);
+        /* Safe locked copy from mmap cache to output buffer */
+        azqlite_cache_read_page_range(
+            p->diskCache, pageNo, pageOff, copyLen, out);
         out += copyLen;
         offset += copyLen;
         remaining -= copyLen;
@@ -993,9 +994,11 @@ static int azqliteWrite(sqlite3_file *pFile, const void *pBuf, int iAmt,
         int copyLen = pageSize - pageOff;
         if (copyLen > remaining) copyLen = (int)remaining;
 
-        unsigned char *pagePtr = azqlite_cache_page_ptr(p->diskCache, pageNo);
-        if (!pagePtr) return SQLITE_NOMEM;
+        /* Bounds check — page should be within cache after grow above */
+        if (pageNo >= azqlite_cache_page_count(p->diskCache))
+            return SQLITE_NOMEM;
 
+        unsigned char *pagePtr;
         int isFullPage = (pageOff == 0 && copyLen == pageSize);
         int64_t pageStart = (int64_t)pageNo * pageSize;
 
@@ -1039,22 +1042,16 @@ static int azqliteWrite(sqlite3_file *pFile, const void *pBuf, int iAmt,
             }
         }
 
-        /* Write the actual data */
+        /* Write data directly to mmap and mark valid+dirty atomically */
         azqlite_cache_lock(p->diskCache);
         pagePtr = azqlite_cache_page_ptr(p->diskCache, pageNo);
-        memcpy(pagePtr + pageOff, src, copyLen);
-        /* Mark valid and dirty via bitmap operations directly — we already
-         * have the lock and the data is written */
-        /* Use the page_write path for the bitmap updates */
-        azqlite_cache_unlock(p->diskCache);
-
-        /* Ensure page is marked valid and dirty */
-        if (!azqlite_cache_page_valid(p->diskCache, pageNo)) {
-            /* For full-page writes where we skipped fetch, write the full page */
-            azqlite_cache_page_write(p->diskCache, pageNo, pagePtr, 1);
-        } else {
-            azqlite_cache_page_set_dirty(p->diskCache, pageNo);
+        if (!pagePtr) {
+            azqlite_cache_unlock(p->diskCache);
+            return SQLITE_NOMEM;
         }
+        memcpy(pagePtr + pageOff, src, copyLen);
+        azqlite_cache_mark_written(p->diskCache, pageNo);
+        azqlite_cache_unlock(p->diskCache);
 
         src += copyLen;
         offset += copyLen;
@@ -1190,6 +1187,8 @@ static int diskCacheCoalesceRanges(
             *pnRanges = 0;
             return SQLITE_NOMEM;
         }
+        /* Copy page data under lock to prevent stale pointers from grow() */
+        azqlite_cache_lock(cache);
         for (int j = 0; j < runCount; j++) {
             unsigned char *pagePtr = azqlite_cache_page_ptr(cache, dirtyPages[i + j]);
             size_t copyLen = (size_t)pageSize;
@@ -1201,6 +1200,7 @@ static int diskCacheCoalesceRanges(
                 memcpy(buf + (size_t)j * (size_t)pageSize, pagePtr, copyLen);
             }
         }
+        azqlite_cache_unlock(cache);
 
         if (nRanges >= maxRanges) {
             free(buf);
