@@ -566,6 +566,20 @@ static int detectPageSize(const unsigned char *aData, sqlite3_int64 nData) {
 
 #define PREFETCH_BATCH_PAGES 64
 
+/*
+** Cancel and join the background prefetch thread if it is running.
+** Must be called before any Azure I/O from the main thread to prevent
+** concurrent use of the shared curl_multi handle (not thread-safe).
+*/
+static void cancelPrefetchThread(azqliteFile *p) {
+    if (!p->prefetchRunning) return;
+    pthread_mutex_lock(&p->prefetchMutex);
+    p->prefetchCancel = 1;
+    pthread_mutex_unlock(&p->prefetchMutex);
+    pthread_join(p->prefetchThread, NULL);
+    p->prefetchRunning = 0;
+}
+
 static void *prefetchThreadFunc(void *arg) {
     azqliteFile *p = (azqliteFile *)arg;
     int pageSize = p->pageSize;
@@ -713,13 +727,7 @@ static int azqliteClose(sqlite3_file *pFile) {
     int rc = SQLITE_OK;
 
     /* Cancel and join background prefetch thread if running */
-    if (p->prefetchRunning) {
-        pthread_mutex_lock(&p->prefetchMutex);
-        p->prefetchCancel = 1;
-        pthread_mutex_unlock(&p->prefetchMutex);
-        pthread_join(p->prefetchThread, NULL);
-        p->prefetchRunning = 0;
-    }
+    cancelPrefetchThread(p);
     pthread_mutex_destroy(&p->prefetchMutex);
 
     /* Flush any remaining dirty data before closing */
@@ -863,6 +871,9 @@ static int azqliteRead(sqlite3_file *pFile, void *pBuf, int iAmt,
 
             azure_buffer_t buf = {0};
             if (fetchLen > 0) {
+                /* Stop prefetch thread before Azure I/O to avoid sharing
+                 * the curl_multi handle concurrently. */
+                cancelPrefetchThread(p);
                 azure_error_t aerr;
                 azure_error_init(&aerr);
                 azure_err_t aec = p->ops->page_blob_read(
@@ -1009,6 +1020,8 @@ static int azqliteWrite(sqlite3_file *pFile, const void *pBuf, int iAmt,
                 if (pageStart + (int64_t)fetchLen > p->blobSize) {
                     fetchLen = (size_t)(p->blobSize - pageStart);
                 }
+                /* Stop prefetch thread before Azure I/O */
+                cancelPrefetchThread(p);
                 azure_buffer_t buf = {0};
                 azure_error_t aerr;
                 azure_error_init(&aerr);
@@ -1231,6 +1244,10 @@ static int azqliteSync(sqlite3_file *pFile, int flags) {
     azqliteFile *p = (azqliteFile *)pFile;
     azure_error_t aerr;
     (void)flags;
+
+    /* Stop the prefetch thread before any Azure I/O to avoid concurrent
+     * use of the shared curl_multi handle (not thread-safe). */
+    cancelPrefetchThread(p);
 
     if (p->eFileType == SQLITE_OPEN_WAL) {
         /* WAL sync — append new data to Azure append blob */
