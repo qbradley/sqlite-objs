@@ -1,11 +1,11 @@
-# AZQLite VFS Test Infrastructure Analysis
+# SQLite-Objs VFS Test Infrastructure Analysis
 
 ## Overview
-The test infrastructure for azqlite VFS consists of:
+The test infrastructure for sqlite-objs VFS consists of:
 1. **test_harness.h** — Minimal C test framework with macro-based assertions
 2. **mock_azure_ops.h/c** — Complete in-memory mock of Azure Blob Storage API
 3. **test_vfs.c** — ~2,561 lines of comprehensive test cases for VFS and mock operations
-4. **azqlite_vfs.c** — Production VFS implementation (~2,357 lines)
+4. **sqlite_objs_vfs.c** — Production VFS implementation (~2,357 lines)
 
 ---
 
@@ -346,7 +346,7 @@ static azure_ops_t mock_ops = {
 #include "test_harness.h"
 #include <string.h>
 #include <stdlib.h>
-#include <azqlite.h>  /* Line 1326 */
+#include <sqlite_objs.h>  /* Line 1326 */
 ```
 
 ### Global Setup/Teardown (Lines 25-37)
@@ -372,10 +372,10 @@ static void teardown(void) {
 ```c
 static sqlite3 *open_test_db(mock_azure_ctx_t *mctx) {
     sqlite3 *db = NULL;
-    azqlite_vfs_register_with_ops(mock_azure_get_ops(), mctx, 0);
+    sqlite_objs_vfs_register_with_ops(mock_azure_get_ops(), mctx, 0);
     int rc = sqlite3_open_v2("test.db", &db,
                               SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE,
-                              "azqlite");
+                              "sqlite-objs");
     return (rc == SQLITE_OK) ? db : NULL;
 }
 
@@ -500,7 +500,7 @@ Total: **105 test functions** organized in 17 suites:
 94. **concurrent_page_and_block_blobs** (1299) — Both blob types coexist
 
 #### SECTION 9: VFS Registration (Lines 1343-1376)
-95. **vfs_registers_with_correct_name** (1343) — VFS name "azqlite"
+95. **vfs_registers_with_correct_name** (1343) — VFS name "sqlite-objs"
 96. **vfs_not_default_unless_requested** (1351) — Not default by default
 97. **vfs_can_be_default** (1359) — Register as default
 98. **vfs_open_with_name_parameter** (1366) — Open via VFS name
@@ -517,28 +517,28 @@ Total: **105 test functions** organized in 17 suites:
 
 ---
 
-## 4. AZQLITE VFS IMPLEMENTATION (azqlite_vfs.c)
+## 4. SQLITE_OBJS VFS IMPLEMENTATION (sqlite_objs_vfs.c)
 
 ### Core Constants (Lines 91-97)
 ```c
-#define AZQLITE_DEFAULT_PAGE_SIZE       4096
-#define AZQLITE_LEASE_DURATION          30      /* default lease (seconds) */
-#define AZQLITE_LEASE_DURATION_LONG     60      /* extended lease for large flushes */
-#define AZQLITE_DIRTY_PAGE_THRESHOLD    100     /* dirty pages triggering extended lease */
-#define AZQLITE_MAX_PATHNAME            512
-#define AZQLITE_INITIAL_ALLOC           (64*1024)  /* 64 KiB initial buffer */
-#define AZQLITE_DEFAULT_CACHE_PAGES     1024    /* LRU cache size */
+#define SQLITE_OBJS_DEFAULT_PAGE_SIZE       4096
+#define SQLITE_OBJS_LEASE_DURATION          30      /* default lease (seconds) */
+#define SQLITE_OBJS_LEASE_DURATION_LONG     60      /* extended lease for large flushes */
+#define SQLITE_OBJS_DIRTY_PAGE_THRESHOLD    100     /* dirty pages triggering extended lease */
+#define SQLITE_OBJS_MAX_PATHNAME            512
+#define SQLITE_OBJS_INITIAL_ALLOC           (64*1024)  /* 64 KiB initial buffer */
+#define SQLITE_OBJS_DEFAULT_CACHE_PAGES     1024    /* LRU cache size */
 ```
 
 #### Cache Configuration via Environment Variable (Lines 127-134)
 ```c
 static int cacheGetMaxPages(void) {
-    const char *val = getenv("AZQLITE_CACHE_PAGES");
+    const char *val = getenv("SQLITE_OBJS_CACHE_PAGES");
     if (val) {
         int n = atoi(val);
         if (n > 0) return n;
     }
-    return AZQLITE_DEFAULT_CACHE_PAGES;  /* Default: 1024 pages */
+    return SQLITE_OBJS_DEFAULT_CACHE_PAGES;  /* Default: 1024 pages */
 }
 ```
 
@@ -546,35 +546,35 @@ static int cacheGetMaxPages(void) {
 
 **Cache Entry** (lines 106-113)
 ```c
-typedef struct azqlite_cache_entry {
+typedef struct sqlite_objs_cache_entry {
     int pageNo;                          /* 0-based page index */
     unsigned char *data;                 /* Allocated page data (pageSize bytes) */
     int dirty;                           /* 1 = needs flush to Azure */
-    struct azqlite_cache_entry *lruPrev; /* LRU: toward MRU end */
-    struct azqlite_cache_entry *lruNext; /* LRU: toward LRU end */
-    struct azqlite_cache_entry *hashNext;/* Hash chain for lookup */
-} azqlite_cache_entry_t;
+    struct sqlite_objs_cache_entry *lruPrev; /* LRU: toward MRU end */
+    struct sqlite_objs_cache_entry *lruNext; /* LRU: toward LRU end */
+    struct sqlite_objs_cache_entry *hashNext;/* Hash chain for lookup */
+} sqlite_objs_cache_entry_t;
 ```
 
 **Cache Context** (lines 116-125)
 ```c
-typedef struct azqlite_page_cache {
+typedef struct sqlite_objs_page_cache {
     int maxPages;                        /* Soft limit for clean page eviction */
     int nPages;                          /* Current total pages in cache */
     int nDirty;                          /* Current dirty page count */
     int pageSize;                        /* Bytes per page (from header or 4096) */
     int hashSize;                        /* Hash table bucket count (power of 2) */
-    azqlite_cache_entry_t **hashTable;   /* Hash buckets array */
-    azqlite_cache_entry_t *lruHead;      /* Most recently used */
-    azqlite_cache_entry_t *lruTail;      /* Least recently used */
-} azqlite_page_cache_t;
+    sqlite_objs_cache_entry_t **hashTable;   /* Hash buckets array */
+    sqlite_objs_cache_entry_t *lruHead;      /* Most recently used */
+    sqlite_objs_cache_entry_t *lruTail;      /* Least recently used */
+} sqlite_objs_page_cache_t;
 ```
 
 ### File Structure (Lines 287-332)
 
-**azqliteFile** — Per-file state
+**sqlite-objsFile** — Per-file state
 ```c
-typedef struct azqliteFile {
+typedef struct sqlite-objsFile {
     const sqlite3_io_methods *pMethod;  /* MUST be first */
     
     /* Azure operations */
@@ -583,7 +583,7 @@ typedef struct azqliteFile {
     char *zBlobName;                    /* Blob name in container */
     
     /* Page cache — MAIN_DB only */
-    azqlite_page_cache_t cache;         /* LRU demand-paged cache */
+    sqlite_objs_page_cache_t cache;         /* LRU demand-paged cache */
     sqlite3_int64 blobSize;             /* Current logical blob size */
     int lastSyncDirtyCount;             /* Dirty pages at last xSync (lease heuristic) */
     
@@ -601,7 +601,7 @@ typedef struct azqliteFile {
     int eFileType;                      /* SQLITE_OPEN_MAIN_DB, MAIN_JOURNAL, WAL */
     
     /* Back-pointer to VFS shared state */
-    azqliteVfsData *pVfsData;
+    sqlite-objsVfsData *pVfsData;
     
     /* Journal file — MAIN_JOURNAL only */
     unsigned char *aJrnlData;           /* Journal buffer */
@@ -617,7 +617,7 @@ typedef struct azqliteFile {
     
     /* Per-file client (optional) */
     azure_client_t *ownClient;
-} azqliteFile;
+} sqlite-objsFile;
 ```
 
 ---
@@ -715,7 +715,7 @@ typedef struct azqliteFile {
 
 #### Journal Sync (lines 1180-1200+)
 - If `nJrnlData > 0`: Upload entire journal via `block_blob_upload()`
-- Timing: Optional debug output if `AZQLITE_DEBUG_TIMING=1`
+- Timing: Optional debug output if `SQLITE_OBJS_DEBUG_TIMING=1`
 
 #### MAIN_DB Sync (lines 1200+)
 - Collect dirty pages via `cacheCollectDirty()`
@@ -772,7 +772,7 @@ typedef struct azqliteFile {
 | **mock_azure_ops.h** | Mock API contract | Declarations, enums | 1-201 |
 | **mock_azure_ops.c** | Mock implementation | Blobs, leases, failure injection | 1-1038 |
 | **test_vfs.c** | Integration tests | 105 tests, 15 suites | 1-2561 |
-| **azqlite_vfs.c** | VFS implementation | xRead/Write/Sync/Truncate/xOpen | 1-2357 |
+| **sqlite_objs_vfs.c** | VFS implementation | xRead/Write/Sync/Truncate/xOpen | 1-2357 |
 
 ## Key Testing Patterns
 
@@ -788,6 +788,6 @@ typedef struct azqliteFile {
 
 ## Environment Variables
 
-- `AZQLITE_CACHE_PAGES` — Override default 1024 page cache size
-- `AZQLITE_DEBUG_TIMING` — Enable optional timing output in xSync
+- `SQLITE_OBJS_CACHE_PAGES` — Override default 1024 page cache size
+- `SQLITE_OBJS_DEBUG_TIMING` — Enable optional timing output in xSync
 

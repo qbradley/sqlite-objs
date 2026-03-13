@@ -55,7 +55,7 @@ Azurite uses well-known dev credentials:
 - **Account**: `devstoreaccount1`
 - **Key**: `Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==`
 - **Endpoint**: `http://127.0.0.1:10000/devstoreaccount1`
-- **Container**: `azqlite-test`
+- **Container**: `sqlite-objs-test`
 
 These are NOT secrets — every Azurite install uses identical values.
 

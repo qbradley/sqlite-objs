@@ -1,7 +1,7 @@
 # Project Context
 
 - **Owner:** Quetzal Bradley
-- **Project:** Azure Blob-backed SQLite (azqlite) — a drop-in replacement for SQLite where all storage is backed by Azure Blob Storage, implemented as a custom VFS layer. MIT licensed.
+- **Project:** Azure Blob-backed SQLite (sqlite-objs) — a drop-in replacement for SQLite where all storage is backed by Azure Blob Storage, implemented as a custom VFS layer. MIT licensed.
 - **Stack:** C, SQLite VFS API, Azure Blob Storage REST API, libcurl, OpenSSL
 - **SQLite source:** `sqlite-autoconf-3520000/` (do not modify unless absolutely necessary)
 - **Created:** 2026-03-10
@@ -88,14 +88,14 @@
 
 ### Demo Script for Azure Integration (2026-03-10)
 
-- **Created:** `demo/azure-demo.sh` — executable bash script demonstrating azqlite with real Azure Blob Storage.
+- **Created:** `demo/azure-demo.sh` — executable bash script demonstrating sqlite-objs with real Azure Blob Storage.
 - **Functionality:**
   1. Validates environment variables (AZURE_STORAGE_ACCOUNT, AZURE_STORAGE_CONTAINER, AZURE_STORAGE_SAS or AZURE_STORAGE_KEY)
-  2. Builds `azqlite-shell` with `make all-production`
+  2. Builds `sqlite-objs-shell` with `make all-production`
   3. Runs a SQLite session that creates a table, inserts rows, queries, and updates
   4. Displays results and cleanup instructions
 - **Documentation:** `demo/README.md` provides setup instructions, prerequisites (libcurl/OpenSSL installation), troubleshooting guide, and explanation of what gets created in Azure.
-- **Configuration flow confirmed:** `azqlite_shell.c` reads env vars in `main()` and passes them to `azqlite_vfs_register(1)`. The VFS internally calls `azqlite_vfs_register_with_config()` which creates an `azure_client_t` with the credentials. No changes needed to shell — it already works correctly.
+- **Configuration flow confirmed:** `sqlite_objs_shell.c` reads env vars in `main()` and passes them to `sqlite_objs_vfs_register(1)`. The VFS internally calls `sqlite_objs_vfs_register_with_config()` which creates an `azure_client_t` with the credentials. No changes needed to shell — it already works correctly.
 - **Ready to test:** Script is executable, production build works, and all prerequisites are documented. Waiting for real Azure credentials to verify end-to-end.
 
 ### Agent-10: Production Build & Demo (2026-03-10 — 07:43:07Z)
@@ -139,7 +139,7 @@ Completed orchestration summary:
   - SharedKey auth: each request gets its own `Authorization` header (Content-Length and x-ms-range differ per range).
   - SAS auth: token appended to shared URL once (all ranges use same URL).
   - Body data via `CURLOPT_POSTFIELDS` (no copy — aData stable per D17 btree mutex guarantee).
-  - `CURLMOPT_MAX_HOST_CONNECTIONS` and `CURLMOPT_MAXCONNECTS` set to `AZQLITE_MAX_PARALLEL_PUTS` (32).
+  - `CURLMOPT_MAX_HOST_CONNECTIONS` and `CURLMOPT_MAXCONNECTS` set to `SQLITE_OBJS_MAX_PARALLEL_PUTS` (32).
 - **Retry strategy:** Failed ranges retried up to 3 times with exponential backoff (500ms base). Only retryable errors (transient/throttle) trigger retry. Non-retryable errors (auth, bad request) abort immediately.
 - **Lease renewal:** Checks elapsed time each event loop iteration. If >15 seconds since last renewal, calls `az_lease_renew` using client's own curl handle (NOT from multi pool). Lease loss aborts all in-flight requests.
 - **Event loop:** `curl_multi_perform` + `curl_multi_wait` (1000ms timeout). Results collected via `curl_multi_info_read` with `CURLOPT_PRIVATE` linking each handle back to its `batch_req_t` context.
@@ -153,8 +153,8 @@ Completed orchestration summary:
 - **Solution:** Added persistent `CURLM *multi_handle` field to `azure_client_t` struct. Lazily initialized on first batch write call via `ensure_multi_handle()`. Destroyed in `azure_client_destroy()`. Reused across all batch calls and retry attempts.
 - **Files modified:** `src/azure_client_impl.h` (struct field), `src/azure_client.c` (lazy init, reuse, destroy, tuning, jitter)
 - **Connection pool tuning (set once at CURLM creation):**
-  - `CURLMOPT_MAX_HOST_CONNECTIONS = AZQLITE_MAX_PARALLEL_PUTS` (32)
-  - `CURLMOPT_MAXCONNECTS = AZQLITE_MAX_PARALLEL_PUTS` (32)
+  - `CURLMOPT_MAX_HOST_CONNECTIONS = SQLITE_OBJS_MAX_PARALLEL_PUTS` (32)
+  - `CURLMOPT_MAXCONNECTS = SQLITE_OBJS_MAX_PARALLEL_PUTS` (32)
 - **TLS session caching:** Explicit `CURLOPT_SSL_SESSIONID_CACHE = 1` on each easy handle. CURLM connection pool manages TLS session reuse automatically across calls.
 - **Keep-alive tuning updated:** `CURLOPT_TCP_KEEPIDLE = 30` (was 60), `CURLOPT_TCP_KEEPINTVL = 15` (was 30). Detects dead connections faster.
 - **Retry jitter added:** Backoff formula now `base_delay * (1 << retry_count) + (rand() % 100)`. PRNG seeded once in `ensure_multi_handle()`. Prevents thundering herd on simultaneous retries.

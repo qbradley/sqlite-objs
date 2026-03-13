@@ -1,13 +1,13 @@
-# Azqlite Rust Bindings
+# sqlite-objs Rust Bindings
 
-Safe Rust bindings for azqlite - a SQLite VFS backed by Azure Blob Storage.
+Safe Rust bindings for sqlite-objs - a SQLite VFS backed by Azure Blob Storage.
 
 ## Structure
 
 This workspace contains two crates:
 
-- **`azqlite-sys`** - Raw FFI bindings to the azqlite C library
-- **`azqlite`** - Safe, idiomatic Rust API
+- **`sqlite-objs-sys`** - Raw FFI bindings to the sqlite-objs C library
+- **`sqlite-objs`** - Safe, idiomatic Rust API
 
 ## Building
 
@@ -29,7 +29,7 @@ cargo test
 
 ## Example
 
-See `azqlite/examples/basic.rs`:
+See `sqlite-objs/examples/basic.rs`:
 
 ```sh
 cargo run --example basic
@@ -41,24 +41,24 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-azqlite = { path = "path/to/rust/azqlite" }
+sqlite-objs = { path = "path/to/rust/sqlite-objs" }
 rusqlite = "0.32"
 ```
 
 Then in your code:
 
 ```rust
-use azqlite::AzqliteVfs;
+use sqlite_objs::SqliteObjsVfs;
 use rusqlite::Connection;
 
 // Register VFS in URI mode
-AzqliteVfs::register_uri(false)?;
+SqliteObjsVfs::register_uri(false)?;
 
 // Open database with Azure credentials in URI
 let conn = Connection::open_with_flags_and_vfs(
     "file:mydb.db?azure_account=myaccount&azure_container=databases&azure_sas=sv=2024...",
     OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_CREATE | OpenFlags::SQLITE_OPEN_URI,
-    "azqlite"
+    "sqlite-objs"
 )?;
 ```
 

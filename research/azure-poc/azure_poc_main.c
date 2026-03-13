@@ -428,7 +428,7 @@ static void test_live_page_blob(azure_client_t *client)
     TEST_START("Live: Page Blob Operations");
     azure_error_t err;
 
-    const char *blob_name = "azqlite-poc-test.pageblob";
+    const char *blob_name = "sqliteObjs-poc-test.pageblob";
 
     /* 1. Create a 4096-byte page blob (one SQLite page) */
     fprintf(stderr, "  Creating page blob (%d bytes)...\n", 4096);
@@ -515,8 +515,8 @@ static void test_live_block_blob(azure_client_t *client)
     TEST_START("Live: Block Blob Operations");
     azure_error_t err;
 
-    const char *blob_name = "azqlite-poc-test.journal";
-    const char *test_data = "This is journal data for azqlite PoC test.";
+    const char *blob_name = "sqliteObjs-poc-test.journal";
+    const char *test_data = "This is journal data for sqliteObjs PoC test.";
     size_t test_len = strlen(test_data);
 
     /* 1. Upload */
@@ -581,7 +581,7 @@ static void test_live_lease(azure_client_t *client)
     TEST_START("Live: Lease Operations");
     azure_error_t err;
 
-    const char *blob_name = "azqlite-poc-test-lease.pageblob";
+    const char *blob_name = "sqliteObjs-poc-test-lease.pageblob";
 
     /* Create a test blob first */
     azure_err_t rc = azure_page_blob_create(client, blob_name, 512, &err);
@@ -667,7 +667,7 @@ int main(int argc, char **argv)
     srand((unsigned int)time(NULL));
 
     fprintf(stderr, "╔═══════════════════════════════════════════════╗\n");
-    fprintf(stderr, "║  azqlite — Azure Blob Storage REST API PoC   ║\n");
+    fprintf(stderr, "║  sqliteObjs — Azure Blob Storage REST API PoC   ║\n");
     fprintf(stderr, "║  API Version: %s                    ║\n", AZURE_API_VERSION);
     fprintf(stderr, "║  Dependencies: libcurl + OpenSSL only         ║\n");
     fprintf(stderr, "╚═══════════════════════════════════════════════╝\n");

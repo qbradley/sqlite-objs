@@ -1,4 +1,4 @@
-# Code Review: azqlite MVP 1 — Reviewer Gate
+# Code Review: sqlite-objs MVP 1 — Reviewer Gate
 
 > **Reviewer:** Gandalf (Lead/Architect)
 > **Date:** 2026-03-10
@@ -8,7 +8,7 @@
 
 ---
 
-## 1. `src/azqlite_vfs.c` — Core VFS Implementation (Aragorn)
+## 1. `src/sqlite_objs_vfs.c` — Core VFS Implementation (Aragorn)
 
 **Verdict: APPROVE WITH CONDITIONS**
 
@@ -233,21 +233,21 @@ p += n;
 
 ---
 
-## 6. `src/azqlite.h` — Public API
+## 6. `src/sqlite_objs.h` — Public API
 
 **Verdict: APPROVE**
 
 Clean, minimal, well-documented. Three registration functions covering all use cases:
 
-1. `azqlite_vfs_register()` — env var config (production)
-2. `azqlite_vfs_register_with_config()` — explicit config (programmatic)
-3. `azqlite_vfs_register_with_ops()` — mock injection (testing)
+1. `sqlite_objs_vfs_register()` — env var config (production)
+2. `sqlite_objs_vfs_register_with_config()` — explicit config (programmatic)
+3. `sqlite_objs_vfs_register_with_ops()` — mock injection (testing)
 
-The test seam (`ops`/`ops_ctx` in `azqlite_config_t`) is properly documented and does NOT compromise the production API. Users who don't use it never see it — the struct zero-initializes to NULL, which means "use production client." This is exactly right.
+The test seam (`ops`/`ops_ctx` in `sqlite_objs_config_t`) is properly documented and does NOT compromise the production API. Users who don't use it never see it — the struct zero-initializes to NULL, which means "use production client." This is exactly right.
 
 ---
 
-## 7. `src/azqlite_shell.c` — CLI Wrapper
+## 7. `src/sqlite_objs_shell.c` — CLI Wrapper
 
 **Verdict: APPROVE**
 
@@ -277,15 +277,15 @@ The code is architecturally sound, follows the design decisions faithfully in al
 
 | # | File | Issue | Severity | Effort |
 |---|------|-------|----------|--------|
-| **C1** | `azqlite_vfs.c:693` | Device characteristics: replace `ATOMIC512 \| SAFE_APPEND` with `SEQUENTIAL \| POWERSAFE_OVERWRITE \| SUBPAGE_READ` per D4. **Data corruption risk.** | Critical | 5 min |
+| **C1** | `sqlite_objs_vfs.c:693` | Device characteristics: replace `ATOMIC512 \| SAFE_APPEND` with `SEQUENTIAL \| POWERSAFE_OVERWRITE \| SUBPAGE_READ` per D4. **Data corruption risk.** | Critical | 5 min |
 | **C2** | `azure_client.c:173-187` | URL construction: replace `strcat` with bounds-checked `snprintf` to prevent stack buffer overflow. | Critical | 30 min |
 
 ### Recommended Fixes (Soon After Demo)
 
 | # | File | Issue | Priority |
 |---|------|-------|----------|
-| I1 | `azqlite_vfs.c:486` | Track blob size, skip redundant resize in xSync | High |
-| I2 | `azqlite_vfs.c:179` | Zero newly-grown dirty bitmap bytes | Medium |
+| I1 | `sqlite_objs_vfs.c:486` | Track blob size, skip redundant resize in xSync | High |
+| I2 | `sqlite_objs_vfs.c:179` | Zero newly-grown dirty bitmap bytes | Medium |
 | I3 | `azure_error.c:26` | Resolve `#define` alias fragility in switch statement | Medium |
 | I4 | `azure_client.c:307` | Document CURLOPT_POSTFIELDS+PUT as tech debt | Low |
 | I5 | `azure_auth.c:176` | Clamp snprintf return to prevent pointer overshoot | Medium |

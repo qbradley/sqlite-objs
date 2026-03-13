@@ -1,4 +1,4 @@
-# Design Review: azqlite MVP 1
+# Design Review: sqlite-objs MVP 1
 
 > **Facilitator:** Gandalf (Lead/Architect)
 > **Date:** 2026-03-10
@@ -9,7 +9,7 @@
 
 ## Executive Summary
 
-After synthesizing research from all four agents across 2,700+ lines of analysis, the architecture for azqlite MVP 1 is clear: **a single-file SQLite VFS backed by Azure Page Blobs, using blob leases for writer exclusion, an in-memory full-blob cache for reads, a local write buffer flushed on sync, rollback journal mode (DELETE), and a swappable `azure_ops_t` vtable for testability.** The key technical insight — that Azure Page Blobs support 512-byte aligned random writes, perfectly matching SQLite's page I/O model — is validated by both Frodo's PoC and Aragorn's VFS analysis, and has no precedent in the 18+ prior art projects surveyed. This gives us a genuine architectural advantage: zero write amplification, no block-chunking complexity, and direct page-to-offset mapping.
+After synthesizing research from all four agents across 2,700+ lines of analysis, the architecture for sqlite-objs MVP 1 is clear: **a single-file SQLite VFS backed by Azure Page Blobs, using blob leases for writer exclusion, an in-memory full-blob cache for reads, a local write buffer flushed on sync, rollback journal mode (DELETE), and a swappable `azure_ops_t` vtable for testability.** The key technical insight — that Azure Page Blobs support 512-byte aligned random writes, perfectly matching SQLite's page I/O model — is validated by both Frodo's PoC and Aragorn's VFS analysis, and has no precedent in the 18+ prior art projects surveyed. This gives us a genuine architectural advantage: zero write amplification, no block-chunking complexity, and direct page-to-offset mapping.
 
 ---
 
@@ -129,7 +129,7 @@ He's right. Without caching, a simple `SELECT * FROM t` on a 100-page database w
 **Architecture:**
 
 ```c
-struct azqliteFile {
+struct sqlite-objsFile {
     sqlite3_io_methods const *pMethod;  /* MUST be first */
     /* Azure connection info */
     azure_ops_t *ops;                   /* Swappable Azure operations (vtable) */
@@ -209,7 +209,7 @@ make test               # Layers 1+2 (default dev workflow)
 
 ### Decision 6: VFS Registration Strategy
 
-**Decision:** Named VFS "azqlite", registered as non-default, with delegation to the default VFS for non-essential methods and temp file routing.
+**Decision:** Named VFS "sqlite-objs", registered as non-default, with delegation to the default VFS for non-essential methods and temp file routing.
 
 **Rationale:**
 
@@ -218,25 +218,25 @@ The VFS should be opt-in, not forced. Users select it explicitly via `sqlite3_op
 **Registration API:**
 ```c
 /* Public API — call once at startup */
-int azqlite_vfs_register(int makeDefault);
+int sqlite_objs_vfs_register(int makeDefault);
 
 /* Or let the user pass config */
-int azqlite_vfs_register_with_config(const azqlite_config_t *config, int makeDefault);
+int sqlite_objs_vfs_register_with_config(const sqlite_objs_config_t *config, int makeDefault);
 ```
 
 **VFS struct:**
 ```c
-static sqlite3_vfs azqliteVfs = {
+static sqlite3_vfs sqlite-objsVfs = {
     .iVersion    = 2,            /* Version 2 for xCurrentTimeInt64 */
-    .szOsFile    = sizeof(azqliteFile),
+    .szOsFile    = sizeof(sqlite-objsFile),
     .mxPathname  = 512,          /* Azure blob paths can be long */
-    .zName       = "azqlite",
+    .zName       = "sqlite-objs",
     /* Methods we implement */
-    .xOpen       = azqliteOpen,
-    .xDelete     = azqliteDelete,
-    .xAccess     = azqliteAccess,
-    .xFullPathname = azqliteFullPathname,
-    .xGetLastError = azqliteGetLastError,
+    .xOpen       = sqlite-objsOpen,
+    .xDelete     = sqlite-objsDelete,
+    .xAccess     = sqlite-objsAccess,
+    .xFullPathname = sqlite-objsFullPathname,
+    .xGetLastError = sqlite-objsGetLastError,
     /* Methods delegated to default VFS */
     .xDlOpen     = /* delegate */,
     .xDlError    = /* delegate */,
@@ -251,19 +251,19 @@ static sqlite3_vfs azqliteVfs = {
 
 **Temp file routing:**
 In `xOpen`, check file type flags:
-- `SQLITE_OPEN_MAIN_DB` → Azure-backed `azqliteFile`
-- `SQLITE_OPEN_MAIN_JOURNAL` → Azure-backed `azqliteFile` (block blob)
+- `SQLITE_OPEN_MAIN_DB` → Azure-backed `sqlite-objsFile`
+- `SQLITE_OPEN_MAIN_JOURNAL` → Azure-backed `sqlite-objsFile` (block blob)
 - Everything else (`TEMP_DB`, `TEMP_JOURNAL`, `SUBJOURNAL`, `TRANSIENT_DB`) → delegate to default VFS's `xOpen`
 
-**The szOsFile challenge:** Our `azqliteFile` struct and the default VFS's `unixFile` may differ in size. `szOsFile` must be `max(sizeof(azqliteFile), default->szOsFile)` to accommodate both paths. Aragorn should handle this.
+**The szOsFile challenge:** Our `sqlite-objsFile` struct and the default VFS's `unixFile` may differ in size. `szOsFile` must be `max(sizeof(sqlite-objsFile), default->szOsFile)` to accommodate both paths. Aragorn should handle this.
 
 **Usage:**
 ```c
 // Explicit VFS name
-sqlite3_open_v2("mydb.db", &db, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, "azqlite");
+sqlite3_open_v2("mydb.db", &db, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, "sqlite-objs");
 
 // URI parameter
-sqlite3_open_v2("file:mydb.db?vfs=azqlite", &db, SQLITE_OPEN_URI | SQLITE_OPEN_READWRITE, NULL);
+sqlite3_open_v2("file:mydb.db?vfs=sqlite-objs", &db, SQLITE_OPEN_URI | SQLITE_OPEN_READWRITE, NULL);
 ```
 
 ---
@@ -299,7 +299,7 @@ export AZURE_STORAGE_KEY="base64key..."
 
 **Future (MVP 2+):**
 - Support for subdirectory-like blob name prefixes (e.g., `tenant1/mydb.db`)
-- Possible URI scheme: `azqlite://account/container/blob` (but not for MVP 1 — adds parser complexity)
+- Possible URI scheme: `sqlite-objs://account/container/blob` (but not for MVP 1 — adds parser complexity)
 
 ---
 
@@ -368,11 +368,11 @@ SQLite itself uses a Makefile. Our users are C developers. Keep it familiar.
 
 **Directory structure:**
 ```
-azqlite/
+sqlite-objs/
 ├── Makefile
 ├── src/
-│   ├── azqlite.h              # Public API (VFS registration, config)
-│   ├── azqlite_vfs.c          # VFS implementation (xOpen, xRead, xWrite, ...)
+│   ├── sqlite_objs.h              # Public API (VFS registration, config)
+│   ├── sqlite_objs_vfs.c          # VFS implementation (xOpen, xRead, xWrite, ...)
 │   ├── azure_client.c         # Azure REST client (evolved from PoC)
 │   ├── azure_client.h         # Internal Azure client header
 │   ├── azure_auth.c           # HMAC-SHA256 auth signing
@@ -389,12 +389,12 @@ azqlite/
 
 **Makefile targets:**
 ```makefile
-all:              # Build libazqlite.a + azqlite-shell (SQLite CLI with our VFS)
+all:              # Build libsqlite_objs.a + sqlite-objs-shell (SQLite CLI with our VFS)
 test-unit:        # Build and run Layer 1 tests
 test-integration: # Build and run Layer 2 tests (requires Azurite)
 test:             # test-unit + test-integration
 clean:            # Remove build artifacts
-amalgamation:     # Produce azqlite.c + azqlite.h (single-file distribution)
+amalgamation:     # Produce sqlite_objs.c + sqlite_objs.h (single-file distribution)
 ```
 
 **Compilation flags:**
@@ -404,7 +404,7 @@ CFLAGS += -DSQLITE_THREADSAFE=1
 LDFLAGS = -lcurl -lssl -lcrypto
 ```
 
-**The amalgamation target** (per Quetzal's directive): concatenate SQLite amalgamation + our source files into a single `azqlite.c` with a unified `azqlite.h`. Plus a `azqlite-shell.c` that builds a SQLite CLI with our VFS auto-registered. This is a release artifact, not a development workflow.
+**The amalgamation target** (per Quetzal's directive): concatenate SQLite amalgamation + our source files into a single `sqlite_objs.c` with a unified `sqlite_objs.h`. Plus a `sqlite-objs-shell.c` that builds a SQLite CLI with our VFS auto-registered. This is a release artifact, not a development workflow.
 
 ---
 
@@ -423,11 +423,11 @@ LDFLAGS = -lcurl -lssl -lcrypto
 | SAS token + Shared Key auth | Frodo | Both paths from PoC |
 | Error handling + retry | Frodo | 5 retries, exponential backoff |
 | Temp file delegation to default VFS | Aragorn | Route non-main files locally |
-| VFS registration (`azqlite_vfs_register`) | Aragorn | Named "azqlite", non-default |
+| VFS registration (`sqlite_objs_vfs_register`) | Aragorn | Named "sqlite-objs", non-default |
 | Layer 1 tests (C mocks) | Samwise | ~300 tests target |
 | Layer 2 tests (Azurite) | Samwise | ~75 tests target |
 | Makefile build system | Aragorn | all, test-unit, test-integration |
-| `azqlite-shell` binary | Aragorn | SQLite CLI with our VFS |
+| `sqlite-objs-shell` binary | Aragorn | SQLite CLI with our VFS |
 | 30-second lease with inline renewal | Aragorn | Renew at sync and during long writes |
 
 **OUT of scope (deferred):**
@@ -447,7 +447,7 @@ LDFLAGS = -lcurl -lssl -lcrypto
 | Amalgamation build | Post-MVP 1 | Release packaging, not development |
 | Layer 3 tests (Toxiproxy) | MVP 2 | Infrastructure can be set up in parallel |
 | Layer 4 tests (real Azure) | MVP 2 | Nice to have earlier but not blocking |
-| URI scheme (`azqlite://`) | MVP 2 | Env vars are sufficient for MVP 1 |
+| URI scheme (`sqlite-objs://`) | MVP 2 | Env vars are sufficient for MVP 1 |
 
 ---
 
@@ -456,7 +456,7 @@ LDFLAGS = -lcurl -lssl -lcrypto
 ```
 ┌─────────────────────────────────────────────────────────────┐
 │                    Application Layer                         │
-│              sqlite3_open_v2("mydb.db", ..., "azqlite")     │
+│              sqlite3_open_v2("mydb.db", ..., "sqlite-objs")     │
 └────────────────────────┬────────────────────────────────────┘
                          │
 ┌────────────────────────▼────────────────────────────────────┐
@@ -465,12 +465,12 @@ LDFLAGS = -lcurl -lssl -lcrypto
 └────────────────────────┬────────────────────────────────────┘
                          │ sqlite3_vfs / sqlite3_io_methods
 ┌────────────────────────▼────────────────────────────────────┐
-│                    azqlite VFS Layer                          │
+│                    sqlite-objs VFS Layer                          │
 │                                                              │
 │  ┌──────────────┐  ┌──────────────┐  ┌───────────────────┐  │
-│  │  azqliteOpen  │  │ azqliteFile  │  │  File Type Router │  │
-│  │  azqliteDelete│  │  ┌─────────┐ │  │                   │  │
-│  │  azqliteAccess│  │  │ aData[] │ │  │ MAIN_DB → Azure   │  │
+│  │  sqlite-objsOpen  │  │ sqlite-objsFile  │  │  File Type Router │  │
+│  │  sqlite-objsDelete│  │  ┌─────────┐ │  │                   │  │
+│  │  sqlite-objsAccess│  │  │ aData[] │ │  │ MAIN_DB → Azure   │  │
 │  │  ...          │  │  │ (cache) │ │  │ MAIN_JOURNAL →    │  │
 │  │               │  │  ├─────────┤ │  │   Azure           │  │
 │  │ Delegates to  │  │  │aDirty[] │ │  │ TEMP_* → local    │  │
@@ -513,16 +513,16 @@ LDFLAGS = -lcurl -lssl -lcrypto
 
 ```
 1. App: INSERT INTO t VALUES (...)
-2. SQLite: xLock(RESERVED)        → azqlite: acquire 30s lease on mydb.db blob
-3. SQLite: xOpen(MAIN_JOURNAL)    → azqlite: prepare journal (block blob)
-4. SQLite: xWrite(journal, ...)   → azqlite: buffer journal data in memory
-5. SQLite: xSync(journal)         → azqlite: upload journal as block blob
-6. SQLite: xWrite(db, page N)     → azqlite: memcpy into aData, mark dirty
-7. SQLite: xWrite(db, page M)     → azqlite: memcpy into aData, mark dirty
-8. SQLite: xSync(db)              → azqlite: PUT Page for each dirty page,
+2. SQLite: xLock(RESERVED)        → sqlite-objs: acquire 30s lease on mydb.db blob
+3. SQLite: xOpen(MAIN_JOURNAL)    → sqlite-objs: prepare journal (block blob)
+4. SQLite: xWrite(journal, ...)   → sqlite-objs: buffer journal data in memory
+5. SQLite: xSync(journal)         → sqlite-objs: upload journal as block blob
+6. SQLite: xWrite(db, page N)     → sqlite-objs: memcpy into aData, mark dirty
+7. SQLite: xWrite(db, page M)     → sqlite-objs: memcpy into aData, mark dirty
+8. SQLite: xSync(db)              → sqlite-objs: PUT Page for each dirty page,
                                               renew lease, clear dirty bitmap
-9. SQLite: xDelete(journal)       → azqlite: delete journal block blob
-10.SQLite: xUnlock(NONE)          → azqlite: release lease
+9. SQLite: xDelete(journal)       → sqlite-objs: delete journal block blob
+10.SQLite: xUnlock(NONE)          → sqlite-objs: release lease
 ```
 
 ---
@@ -607,13 +607,13 @@ LDFLAGS = -lcurl -lssl -lcrypto
 
 A user can:
 
-1. **Build** `azqlite-shell` from source with `make` on macOS or Linux
+1. **Build** `sqlite-objs-shell` from source with `make` on macOS or Linux
 2. **Create** a new SQLite database backed by Azure Page Blobs:
    ```bash
    export AZURE_STORAGE_ACCOUNT=myaccount
    export AZURE_STORAGE_CONTAINER=mycontainer
    export AZURE_STORAGE_SAS="..."
-   ./azqlite-shell mydb.db
+   ./sqlite-objs-shell mydb.db
    sqlite> CREATE TABLE t(id INTEGER PRIMARY KEY, name TEXT);
    sqlite> INSERT INTO t VALUES (1, 'hello');
    sqlite> SELECT * FROM t;
@@ -621,7 +621,7 @@ A user can:
    ```
 3. **Close and reopen** the database — data persists on Azure:
    ```bash
-   ./azqlite-shell mydb.db
+   ./sqlite-objs-shell mydb.db
    sqlite> SELECT * FROM t;
    1|hello
    ```
@@ -643,20 +643,20 @@ A user can:
 
 ### Aragorn (SQLite/C Dev) — VFS Implementation
 
-1. **Create `src/azqlite_vfs.c`** — the complete VFS implementation
-   - azqliteFile struct (as specified in Decision 4)
+1. **Create `src/sqlite_objs_vfs.c`** — the complete VFS implementation
+   - sqlite-objsFile struct (as specified in Decision 4)
    - All sqlite3_io_methods v1: xClose, xRead, xWrite, xTruncate, xSync, xFileSize, xLock, xUnlock, xCheckReservedLock, xFileControl, xSectorSize, xDeviceCharacteristics
    - File type router in xOpen (Azure for MAIN_DB/MAIN_JOURNAL, delegate for temp files)
    - Dirty page tracking with bitmap
    - Lease-based locking (acquire at RESERVED, renew at sync, release at unlock)
 
-2. **Create `src/azqlite.h`** — public API header
-   - `azqlite_vfs_register()` / `azqlite_vfs_register_with_config()`
+2. **Create `src/sqlite_objs.h`** — public API header
+   - `sqlite_objs_vfs_register()` / `sqlite_objs_vfs_register_with_config()`
    - Config struct (or document env var approach)
 
 3. **Create `Makefile`** — build system (targets: all, test-unit, test-integration, test, clean)
 
-4. **Create `azqlite-shell.c`** — SQLite CLI wrapper that registers our VFS
+4. **Create `sqlite-objs-shell.c`** — SQLite CLI wrapper that registers our VFS
 
 ### Frodo (Azure Expert) — Azure Client Layer
 

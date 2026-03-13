@@ -1,7 +1,7 @@
 # Project Context
 
 - **Owner:** Quetzal Bradley
-- **Project:** Azure Blob-backed SQLite (azqlite) — a drop-in replacement for SQLite where all storage is backed by Azure Blob Storage, implemented as a custom VFS layer. MIT licensed.
+- **Project:** Azure Blob-backed SQLite (sqlite-objs) — a drop-in replacement for SQLite where all storage is backed by Azure Blob Storage, implemented as a custom VFS layer. MIT licensed.
 - **Stack:** C, SQLite VFS API, Azure Blob Storage REST API, libcurl, OpenSSL
 - **SQLite source:** `sqlite-autoconf-3520000/` (do not modify unless absolutely necessary)
 - **Created:** 2026-03-10
@@ -44,7 +44,7 @@
 
 **Sector size:** Return 4096 (matches default page size and SQLITE_DEFAULT_SECTOR_SIZE).
 
-**VFS registration:** `sqlite3_vfs_register(pVfs, makeDflt)`. Select via `sqlite3_open_v2(file, &db, flags, "azqlite")` or URI `?vfs=azqlite`.
+**VFS registration:** `sqlite3_vfs_register(pVfs, makeDflt)`. Select via `sqlite3_open_v2(file, &db, flags, "sqlite-objs")` or URI `?vfs=sqlite-objs`.
 
 **All VFS methods are synchronous.** Azure latency (5-50ms per op) means read cache is mandatory. Without cache, 100-page read = ~5 seconds.
 
@@ -67,8 +67,8 @@
 - **Two-level lease locking:** SHARED requires no lease (reads always work). RESERVED/EXCLUSIVE acquire 30s blob lease. Release on unlock. xCheckReservedLock uses HEAD to detect held leases. Inline renewal (no background thread).
 - **Error handling:** 409 (lease conflict) or 429 (throttle) → SQLITE_BUSY (retryable). All else after retry → SQLITE_IOERR_* (fatal). 5 retries, 500ms exponential backoff + jitter.
 - **Device characteristics:** `SQLITE_IOCAP_SEQUENTIAL | SQLITE_IOCAP_POWERSAFE_OVERWRITE | SQLITE_IOCAP_SUBPAGE_READ`. NOT ATOMIC — journal safety is needed.
-- **VFS name "azqlite"**, non-default registration. Usage: `sqlite3_open_v2(name, &db, flags, "azqlite")`.
-- **Source layout:** `src/` (azqlite_vfs.c, azure_client.c/.h, azure_auth.c, azure_error.c, azqlite.h), `test/` (test_main.c, test_vfs.c, mock_azure_ops.c, test_integration.c).
+- **VFS name "sqlite-objs"**, non-default registration. Usage: `sqlite3_open_v2(name, &db, flags, "sqlite-objs")`.
+- **Source layout:** `src/` (sqlite_objs_vfs.c, azure_client.c/.h, azure_auth.c, azure_error.c, sqlite_objs.h), `test/` (test_main.c, test_vfs.c, mock_azure_ops.c, test_integration.c).
 - **Top risks:** (1) Lease expiry during long transactions, (2) Partial sync failure — both mitigated by journal-first ordering and inline lease renewal.
 
 ### Cross-Agent Context: Key Interface Contract — azure_ops_t (2026-03-10)
@@ -89,22 +89,22 @@
 ### MVP 1 VFS Implementation Complete (2026-03-10)
 
 **Files created:**
-- `src/azqlite.h` — Public API header with `azqlite_vfs_register()` and `azqlite_vfs_register_with_config()`, `azqlite_config_t` with test-seam (ops/ops_ctx override)
+- `src/sqlite_objs.h` — Public API header with `sqlite_objs_vfs_register()` and `sqlite_objs_vfs_register_with_config()`, `sqlite_objs_config_t` with test-seam (ops/ops_ctx override)
 - `src/azure_client.h` — Internal header defining `azure_ops_t` vtable (13 ops), `azure_err_t` enum, `azure_error_t`, `azure_buffer_t`, `azure_client_t` lifecycle functions
-- `src/azqlite_vfs.c` — Complete VFS: azqliteFile struct, io_methods v1 (12 methods), VFS methods (xOpen/xDelete/xAccess/xFullPathname + delegated), registration, dirty bitmap, lease management
+- `src/sqlite_objs_vfs.c` — Complete VFS: sqlite-objsFile struct, io_methods v1 (12 methods), VFS methods (xOpen/xDelete/xAccess/xFullPathname + delegated), registration, dirty bitmap, lease management
 - `src/azure_client_stub.c` — Stub ops returning AZURE_ERR_UNKNOWN for all 13 operations. Frodo replaces this.
-- `src/azqlite_shell.c` — CLI wrapper: renames shell.c main to shell_main via #define, registers VFS as default, forwards to shell_main
-- `Makefile` — Targets: all (libazqlite.a + azqlite-shell), test-unit, test-integration, test, clean, amalgamation (stub)
+- `src/sqlite_objs_shell.c` — CLI wrapper: renames shell.c main to shell_main via #define, registers VFS as default, forwards to shell_main
+- `Makefile` — Targets: all (libsqlite_objs.a + sqlite-objs-shell), test-unit, test-integration, test, clean, amalgamation (stub)
 
 **Key patterns:**
-- azqliteFile struct embeds `const sqlite3_io_methods *pMethod` as first member (sqlite3_file subclass contract)
+- sqlite-objsFile struct embeds `const sqlite3_io_methods *pMethod` as first member (sqlite3_file subclass contract)
 - Dirty page bitmap: 1 bit per page, `dirtyMarkPage()` tracks writes, `dirtyClearAll()` after sync
 - Buffer grows geometrically via `bufferEnsure()` / `jrnlBufferEnsure()`
 - Journal files (MAIN_JOURNAL) use separate aJrnlData buffer, uploaded as block blob on xSync
 - Lease: acquire at xLock(RESERVED+), renew inline at xSync and xWrite (>15s), release at xUnlock(≤SHARED)
 - `azureErrToSqlite()` maps CONFLICT/THROTTLED→SQLITE_BUSY, all else→SQLITE_IOERR variants
 - xOpen routes by flag bits: MAIN_DB/MAIN_JOURNAL→Azure, everything else→default VFS xOpen
-- szOsFile = max(sizeof(azqliteFile), defaultVfs->szOsFile) to handle delegation
+- szOsFile = max(sizeof(sqlite-objsFile), defaultVfs->szOsFile) to handle delegation
 - xOpen sets pMethod=NULL initially (prevents xClose on failure), sets it last on success
 - Page size detected from SQLite header bytes 16-17 on existing databases
 - xFullPathname strips leading slashes, rejects ".." paths
@@ -116,20 +116,20 @@
 **Build system:**
 - `-w` flag on sqlite3.c and shell.c compilation (suppress upstream warnings)
 - Platform detection: Darwin omits -ldl, Linux includes it
-- Static library: build/libazqlite.a containing sqlite3.o + azqlite_vfs.o + azure_client_stub.o
+- Static library: build/libsqlite_objs.a containing sqlite3.o + sqlite_objs_vfs.o + azure_client_stub.o
 
 ### Benchmark Harness Implementation (2026-03-10)
 
-**Problem:** Need to compare local SQLite vs azqlite performance using SQLite's official speedtest1 benchmark. speedtest1.c calls `exit()` directly, making it unsuitable for inclusion as a library.
+**Problem:** Need to compare local SQLite vs sqlite-objs performance using SQLite's official speedtest1 benchmark. speedtest1.c calls `exit()` directly, making it unsuitable for inclusion as a library.
 
 **Solution:** Three-binary approach:
 1. `benchmark` — Lightweight harness that shells out to speedtest1 binaries and measures wall-clock time
 2. `speedtest1` — Standard speedtest1 linked against vanilla SQLite
-3. `speedtest1-azure` — speedtest1 linked against azqlite VFS via wrapper
+3. `speedtest1-azure` — speedtest1 linked against sqlite-objs VFS via wrapper
 
 **Files created:**
 - `benchmark/benchmark.c` — Main harness using `system()` to invoke speedtest1 binaries, timing via `gettimeofday()`, formatted output
-- `benchmark/speedtest1_wrapper.c` — Thin wrapper that registers azqlite VFS as default before calling speedtest1_main
+- `benchmark/speedtest1_wrapper.c` — Thin wrapper that registers sqlite-objs VFS as default before calling speedtest1_main
 - `benchmark/speedtest1.c` — Downloaded from SQLite upstream (test/speedtest1.c)
 - `benchmark/Makefile` — Builds all three binaries, handles stub vs production builds
 - `benchmark/README.md` — Usage documentation
@@ -138,7 +138,7 @@
 - **Process isolation:** Each speedtest1 run is a separate process via `system()`. This avoids the `exit()` problem and gives clean timing.
 - **Silent subprocess output:** speedtest1 output redirected to `/dev/null` to keep harness output clean. Users can run speedtest1 binaries directly for detailed output.
 - **Exit code tolerance:** speedtest1 returns 1 if optional features (rtree) are missing. Harness treats exit codes 0 and 1 as success.
-- **Two speedtest1 binaries:** One linked against vanilla SQLite, one against azqlite. Benchmark harness invokes the appropriate binary.
+- **Two speedtest1 binaries:** One linked against vanilla SQLite, one against sqlite-objs. Benchmark harness invokes the appropriate binary.
 - **Stub vs production:** `make all` builds with azure_client_stub (local-only), `make all-production` builds with real Azure client.
 
 **Usage patterns:**
@@ -167,7 +167,7 @@ export AZURE_STORAGE_CONTAINER=...
 
 **Header reconciliation:** `azure_client.h` is now the single canonical header. Merged azure_err_t as superset of all codes. Added `#define AZURE_ERR_THROTTLE AZURE_ERR_THROTTLED` alias. Unified azure_buffer_t to `data`/`size`/`capacity`. Added `error_code[128]` to azure_error_t. `azure_client_impl.h` and `mock_azure_ops.h` now include `azure_client.h` instead of duplicating types. Production `azure_client_create` updated to match canonical config-struct signature.
 
-**Build:** Test binary links `sqlite3.o + azqlite_vfs.o + azure_client_stub.o + mock_azure_ops.o`. Added `make all-production` target. Fixed `##__VA_ARGS__` to C11-compliant split fprintf. Added `azqlite_vfs_register_with_ops()` convenience wrapper. Fixed 2 test logic bugs (invalid blob content, fast-test lease timing).
+**Build:** Test binary links `sqlite3.o + sqlite_objs_vfs.o + azure_client_stub.o + mock_azure_ops.o`. Added `make all-production` target. Fixed `##__VA_ARGS__` to C11-compliant split fprintf. Added `sqlite_objs_vfs_register_with_ops()` convenience wrapper. Fixed 2 test logic bugs (invalid blob content, fast-test lease timing).
 
 **Result:** `make all` + `make test-unit` (148/148) both pass clean.
 
@@ -175,7 +175,7 @@ export AZURE_STORAGE_CONTAINER=...
 
 Gandalf's review identified two critical issues (C1, C2) that must be fixed before demo:
 
-**C1 (MY RESPONSIBILITY): Device Characteristics Flag Error (azqlite_vfs.c:693)**
+**C1 (MY RESPONSIBILITY): Device Characteristics Flag Error (sqlite_objs_vfs.c:693)**
 - **Current:** Claims `SQLITE_IOCAP_ATOMIC512 | SQLITE_IOCAP_SAFE_APPEND`
 - **Issue:** ATOMIC512 tells SQLite it can skip journal entries for 512-byte writes. Our multi-page xSync is NOT atomic — dangerous data corruption risk.
 - **Fix Required:** Change to `SQLITE_IOCAP_SEQUENTIAL | SQLITE_IOCAP_POWERSAFE_OVERWRITE | SQLITE_IOCAP_SUBPAGE_READ`
@@ -191,7 +191,7 @@ Gandalf's review identified two critical issues (C1, C2) that must be fixed befo
 
 ### TPC-C OLTP Benchmark Implementation (2026-03-11)
 
-**Problem:** Need a realistic OLTP benchmark to compare local SQLite vs azqlite performance. Existing speedtest1 benchmark is good for basic performance but doesn't reflect realistic transaction workloads with complex multi-table operations.
+**Problem:** Need a realistic OLTP benchmark to compare local SQLite vs sqlite-objs performance. Existing speedtest1 benchmark is good for basic performance but doesn't reflect realistic transaction workloads with complex multi-table operations.
 
 **Solution:** Implemented custom TPC-C style benchmark in `benchmark/tpcc/`:
 
@@ -200,12 +200,12 @@ Gandalf's review identified two critical issues (C1, C2) that must be fixed befo
 - `tpcc_load.c` (332 lines) — Data loader populating 100K items + W warehouses + 10 districts/warehouse + 3K customers/district
 - `tpcc_txn.c` (321 lines) — Three core transactions: New Order (45%), Payment (43%), Order Status (12%)
 - `tpcc.c` (430 lines) — Main benchmark driver with latency tracking, percentile calculation, and formatted output
-- `Makefile` (155 lines) — Builds `tpcc-local` (default VFS) and `tpcc-azure` (azqlite VFS) versions
+- `Makefile` (155 lines) — Builds `tpcc-local` (default VFS) and `tpcc-azure` (sqlite-objs VFS) versions
 - `README.md` (161 lines) — Usage documentation and TPC-C schema overview
 
 **Key design patterns:**
 - **Two binaries:** `tpcc-local` (no Azure deps) and `tpcc-azure` (requires production VFS build)
-- **Conditional compilation:** `#ifdef AZQLITE_VFS_AVAILABLE` to avoid linker errors in local-only build
+- **Conditional compilation:** `#ifdef SQLITE_OBJS_VFS_AVAILABLE` to avoid linker errors in local-only build
 - **Auto schema/load:** Detects empty database and creates schema + loads data automatically
 - **Latency tracking:** Stores all transaction latencies for percentile calculation (p50, p95, p99)
 - **Transaction mix:** Randomized 45/43/12 split matching TPC-C spec (simplified to 3 transactions)
@@ -260,7 +260,7 @@ export AZURE_STORAGE_ACCOUNT=...
 
 ### Phase 1 Page Coalescing Implementation (2026-03-11)
 
-**What:** Implemented `coalesceDirtyRanges()` — scans dirty bitmap, merges contiguous pages into ≤4MiB ranges, rewrites azqliteSync to flush coalesced ranges instead of individual pages. Added `azure_page_range_t` and `page_blob_write_batch` (NULL) to azure_ops_t vtable for Phase 2 readiness.
+**What:** Implemented `coalesceDirtyRanges()` — scans dirty bitmap, merges contiguous pages into ≤4MiB ranges, rewrites sqlite-objsSync to flush coalesced ranges instead of individual pages. Added `azure_page_range_t` and `page_blob_write_batch` (NULL) to azure_ops_t vtable for Phase 2 readiness.
 
 **Key learnings:**
 - Adding fields to END of azure_ops_t is backward-compatible — C zero-initializes trailing struct members.
@@ -275,21 +275,21 @@ export AZURE_STORAGE_ACCOUNT=...
 
 **Files modified:**
 - `src/azure_client.h` — Added `char etag[128]` field to `azure_error_t`; updated `azure_error_init` and `azure_error_clear`.
-- `src/azqlite_vfs.c` — Added `lastSyncDirtyCount`, `leaseDuration`, `etag[128]` fields to `azqliteFile`. Dynamic lease duration in `azqliteLock()` (30s default, 60s if last sync had >100 dirty pages). `leaseRenewIfNeeded()` uses `leaseDuration/2`. `azqliteSync()` records dirty count and captures ETag. `xOpen` captures ETag from `blob_get_properties`.
+- `src/sqlite_objs_vfs.c` — Added `lastSyncDirtyCount`, `leaseDuration`, `etag[128]` fields to `sqlite-objsFile`. Dynamic lease duration in `sqlite-objsLock()` (30s default, 60s if last sync had >100 dirty pages). `leaseRenewIfNeeded()` uses `leaseDuration/2`. `sqlite-objsSync()` records dirty count and captures ETag. `xOpen` captures ETag from `blob_get_properties`.
 
 **Key learnings:**
 - Adding `etag` to `azure_error_t` is cleanest ETag plumbing — it's passed to every op, works with both mock and production code, no vtable changes needed.
 - `lastSyncDirtyCount` starts at 0, so first transaction always gets 30s lease. Only after a heavy sync does the next lock request extend to 60s. This is conservative and correct.
 - `leaseDuration` field tracks what was actually acquired, so renewal threshold adjusts proportionally (30s→renew@15s, 60s→renew@30s).
-- `AZQLITE_LEASE_RENEW_AFTER` kept as fallback constant but no longer primary — `leaseDuration / 2` is the source of truth.
+- `SQLITE_OBJS_LEASE_RENEW_AFTER` kept as fallback constant but no longer primary — `leaseDuration / 2` is the source of truth.
 
 ### R1+R2 Performance Optimizations (2026-03-11)
 
 Implemented two optimizations from the performance diagnosis (aragorn-perf-diagnosis.md):
 
-**R1: Journal/WAL blob existence cache** — Added `journalCacheState` (-1/0/1) and `journalBlobName[512]` to `azqliteVfsData`. Cache is seeded on first xAccess (detects `-journal` suffix per D7) or xOpen of journal blob. Updated on xSync(journal)→1, xDelete(journal)→0. xAccess returns cached state for known journal blobs. WAL files always return 0 (iVersion=1, WAL disabled). Also added `pVfsData` back-pointer to `azqliteFile` for cache access from file-level methods. Reduces ~4 HEAD requests per transaction to ~0 after startup.
+**R1: Journal/WAL blob existence cache** — Added `journalCacheState` (-1/0/1) and `journalBlobName[512]` to `sqlite-objsVfsData`. Cache is seeded on first xAccess (detects `-journal` suffix per D7) or xOpen of journal blob. Updated on xSync(journal)→1, xDelete(journal)→0. xAccess returns cached state for known journal blobs. WAL files always return 0 (iVersion=1, WAL disabled). Also added `pVfsData` back-pointer to `sqlite-objsFile` for cache access from file-level methods. Reduces ~4 HEAD requests per transaction to ~0 after startup.
 
-**R2: Skip redundant resize** — Added `lastSyncedSize` to `azqliteFile`. `azqliteSync` only calls `page_blob_resize` when `nData > lastSyncedSize`. Updated after successful resize, after xOpen download, and after xTruncate. Most TPC-C transactions modify existing pages without growing, saving ~45ms per transaction.
+**R2: Skip redundant resize** — Added `lastSyncedSize` to `sqlite-objsFile`. `sqlite-objsSync` only calls `page_blob_resize` when `nData > lastSyncedSize`. Updated after successful resize, after xOpen download, and after xTruncate. Most TPC-C transactions modify existing pages without growing, saving ~45ms per transaction.
 
 **Test updates:** Two tests adjusted for R2 behavior — `vfs_lease_expire_during_sync` now fails `page_blob_write` (resize may not be called), `vfs_sync_resize_failure_before_flush` inserts zeroblob(65536) to force DB growth.
 
@@ -297,12 +297,12 @@ Implemented two optimizations from the performance diagnosis (aragorn-perf-diagn
 
 ### WAL Mode VFS Support (2026-03-11)
 
-**Implemented WAL mode with exclusive locking in azqlite_vfs.c.** This enables `PRAGMA journal_mode=WAL` when append blob operations are available in the vtable, providing a projected 5-16× throughput improvement over journal mode (1 HTTP call per commit vs 9).
+**Implemented WAL mode with exclusive locking in sqlite_objs_vfs.c.** This enables `PRAGMA journal_mode=WAL` when append blob operations are available in the vtable, providing a projected 5-16× throughput improvement over journal mode (1 HTTP call per commit vs 9).
 
 **Key VFS changes:**
 - **iVersion bumped 1→2** on `sqlite3_io_methods` to enable WAL support
-- **xShm* stubs added:** `azqliteShmMap` returns `SQLITE_IOERR` (safety net if user forgets exclusive mode), others return `SQLITE_OK`/no-op. In exclusive mode, these are never called.
-- **WAL buffer system:** New fields `aWalData`/`nWalData`/`nWalAlloc`/`nWalSynced`/`walNeedFullResync` on `azqliteFile`. Pattern mirrors journal buffer but tracks sync offset for incremental Azure appends.
+- **xShm* stubs added:** `sqlite-objsShmMap` returns `SQLITE_IOERR` (safety net if user forgets exclusive mode), others return `SQLITE_OK`/no-op. In exclusive mode, these are never called.
+- **WAL buffer system:** New fields `aWalData`/`nWalData`/`nWalAlloc`/`nWalSynced`/`walNeedFullResync` on `sqlite-objsFile`. Pattern mirrors journal buffer but tracks sync offset for incremental Azure appends.
 - **xOpen WAL path:** Checks append blob ops availability, downloads existing WAL for crash recovery (via `block_blob_download` — GET works on all blob types), or creates new empty append blob.
 - **xWrite WAL:** Buffers locally, flags `walNeedFullResync` if overwriting already-synced data.
 - **xSync WAL:** Incremental append (sends only bytes since last sync) or full resync (delete+recreate+upload all) if data was rewritten.
@@ -322,53 +322,53 @@ Implemented two optimizations from the performance diagnosis (aragorn-perf-diagn
 
 ### Phase 1: Journal State Per-File (2026-03-11)
 
-**Problem:** `azqliteVfsData` held a single `journalCacheState`/`journalBlobName[512]` pair — global state shared by all open databases. With multiple databases open simultaneously, journal cache state would cross-contaminate between them.
+**Problem:** `sqlite-objsVfsData` held a single `journalCacheState`/`journalBlobName[512]` pair — global state shared by all open databases. With multiple databases open simultaneously, journal cache state would cross-contaminate between them.
 
-**Solution:** Replaced the single journal cache entry with a fixed-capacity array of `azqliteJournalCacheEntry` structs (max 16), each holding `{state, zBlobName[512]}`. Added `journalCacheFind()` and `journalCacheGetOrCreate()` helpers for O(n) lookup by blob name. n ≤ 16, so linear scan is negligible.
+**Solution:** Replaced the single journal cache entry with a fixed-capacity array of `sqlite-objsJournalCacheEntry` structs (max 16), each holding `{state, zBlobName[512]}`. Added `journalCacheFind()` and `journalCacheGetOrCreate()` helpers for O(n) lookup by blob name. n ≤ 16, so linear scan is negligible.
 
 **Key design choices:**
 - Fixed array (not linked list) — no heap allocation, lives inside `g_vfsData`, zero-initialized by existing `memset`
 - New entries start with `state = -1` (unknown), matching old initialization semantics
-- `AZQLITE_MAX_JOURNAL_CACHE = 16` — more than enough for typical use; if exceeded, new journals simply skip caching (fall through to HEAD requests)
+- `SQLITE_OBJS_MAX_JOURNAL_CACHE = 16` — more than enough for typical use; if exceeded, new journals simply skip caching (fall through to HEAD requests)
 - All 5 usage sites updated: xSync, xOpen (MAIN_JOURNAL), xDelete, xAccess, registration
 
-**Files modified:** `src/azqlite_vfs.c` only.
+**Files modified:** `src/sqlite_objs_vfs.c` only.
 
 **Result:** All 234 unit tests pass. No behavioral change from user perspective. Each database now has independent journal cache state.
 
 ### Per-File Client Ownership + URI Parameter Parsing (2026-03-11)
 
-**Phase 2 + 3 combined** — each `azqliteFile` can now own its own `azure_client_t`.
+**Phase 2 + 3 combined** — each `sqlite-objsFile` can now own its own `azure_client_t`.
 
-**Struct change:** Added `azure_client_t *ownClient` to `azqliteFile`. NULL means using the global VFS client (backward-compatible default).
+**Struct change:** Added `azure_client_t *ownClient` to `sqlite-objsFile`. NULL means using the global VFS client (backward-compatible default).
 
-**URI parser:** `azqlite_parse_uri_config()` extracts `azure_account`, `azure_container`, `azure_sas`, `azure_key`, `azure_endpoint` from `sqlite3_filename` via `sqlite3_uri_parameter()`. Returns 1 if `azure_account` is present, 0 otherwise.
+**URI parser:** `sqlite_objs_parse_uri_config()` extracts `azure_account`, `azure_container`, `azure_sas`, `azure_key`, `azure_endpoint` from `sqlite3_filename` via `sqlite3_uri_parameter()`. Returns 1 if `azure_account` is present, 0 otherwise.
 
-**azqliteOpen flow:**
-1. `memset(p, 0, sizeof(azqliteFile))` — `ownClient` starts NULL
+**sqlite-objsOpen flow:**
+1. `memset(p, 0, sizeof(sqlite-objsFile))` — `ownClient` starts NULL
 2. If URI params found → `azure_client_create()` → set `p->ownClient`, derive `ops`/`ops_ctx` from it
 3. If not found → fall back to `pVfsData->ops` / `pVfsData->ops_ctx` (existing behavior, zero change)
 
-**azqliteClose:** If `p->ownClient != NULL`, calls `azure_client_destroy()` and nulls it. Placed after blob name free, before `pMethod = NULL`.
+**sqlite-objsClose:** If `p->ownClient != NULL`, calls `azure_client_destroy()` and nulls it. Placed after blob name free, before `pMethod = NULL`.
 
 **Key decisions:**
 - URI parsing before ops/ops_ctx assignment ensures clean ownership — the file either fully owns its client or fully uses the global one
 - `azure_client_create()` failure returns `SQLITE_CANTOPEN` (appropriate for a file-open failure)
-- No public API change — Phase 4 will add `azqlite_vfs_register_uri()`
+- No public API change — Phase 4 will add `sqlite_objs_vfs_register_uri()`
 
-**Files modified:** `src/azqlite_vfs.c` only.
+**Files modified:** `src/sqlite_objs_vfs.c` only.
 
 **Result:** All 234 unit tests pass. Zero behavioral change when URI params not used.
 
 ### Phase 4+5: URI-only VFS Registration + Shell/Benchmark Updates
 
-**What:** Added `azqlite_vfs_register_uri(int makeDefault)` — registers the azqlite VFS with no global Azure client. All databases must provide Azure config via URI parameters (`azure_account`, `azure_container`, `azure_sas`, etc.), or xOpen returns SQLITE_CANTOPEN.
+**What:** Added `sqlite_objs_vfs_register_uri(int makeDefault)` — registers the sqlite-objs VFS with no global Azure client. All databases must provide Azure config via URI parameters (`azure_account`, `azure_container`, `azure_sas`, etc.), or xOpen returns SQLITE_CANTOPEN.
 
 **Key changes:**
-- `src/azqlite.h` — Added `azqlite_vfs_register_uri()` declaration with full documentation of URI parameters
-- `src/azqlite_vfs.c` — Implemented `azqlite_vfs_register_uri()` (sets ops=NULL, ops_ctx=NULL, no client creation). Added NULL-ops guard in xOpen: when per-file URI parsing returns no config AND global ops are NULL, returns SQLITE_CANTOPEN instead of proceeding with NULL ops (crash prevention).
-- `src/azqlite_shell.c` — Added `--uri` flag. When present, calls `azqlite_vfs_register_uri(1)` and enables `SQLITE_CONFIG_URI` so the shell's `sqlite3_open()` honors URI filenames. Strips `--uri` from argv before forwarding to shell_main.
-- `benchmark/tpcc/tpcc.c` — Added `--uri`, `--account`, `--container`, `--sas`, `--endpoint` options. Constructs `file:tpcc.db?azure_account=...&azure_container=...&azure_sas=...` URI and calls `azqlite_vfs_register_uri(1)` with `SQLITE_OPEN_URI` flag.
+- `src/sqlite_objs.h` — Added `sqlite_objs_vfs_register_uri()` declaration with full documentation of URI parameters
+- `src/sqlite_objs_vfs.c` — Implemented `sqlite_objs_vfs_register_uri()` (sets ops=NULL, ops_ctx=NULL, no client creation). Added NULL-ops guard in xOpen: when per-file URI parsing returns no config AND global ops are NULL, returns SQLITE_CANTOPEN instead of proceeding with NULL ops (crash prevention).
+- `src/sqlite_objs_shell.c` — Added `--uri` flag. When present, calls `sqlite_objs_vfs_register_uri(1)` and enables `SQLITE_CONFIG_URI` so the shell's `sqlite3_open()` honors URI filenames. Strips `--uri` from argv before forwarding to shell_main.
+- `benchmark/tpcc/tpcc.c` — Added `--uri`, `--account`, `--container`, `--sas`, `--endpoint` options. Constructs `file:tpcc.db?azure_account=...&azure_container=...&azure_sas=...` URI and calls `sqlite_objs_vfs_register_uri(1)` with `SQLITE_OPEN_URI` flag.
 - `README.md` — Added "URI Configuration" section with code example, parameter table, and explanation.
 
 **Safety guard in xOpen:** After the URI-parse / global-fallback logic, if `p->ops` is still NULL (no URI params + no global client), we now return SQLITE_CANTOPEN immediately. Previously this would proceed with NULL ops and crash on first blob_exists call.

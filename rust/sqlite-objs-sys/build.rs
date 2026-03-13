@@ -32,10 +32,10 @@ fn main() {
         None
     };
 
-    // Compile azqlite VFS and Azure client (SQLite comes from libsqlite3-sys)
+    // Compile sqlite-objs VFS and Azure client (SQLite comes from libsqlite3-sys)
     let mut builder = cc::Build::new();
     builder
-        .file(src_dir.join("azqlite_vfs.c"))
+        .file(src_dir.join("sqlite_objs_vfs.c"))
         .file(src_dir.join("azure_client.c"))
         .file(src_dir.join("azure_auth.c"))
         .file(src_dir.join("azure_error.c"))
@@ -53,7 +53,7 @@ fn main() {
         builder.include(inc);
     }
 
-    builder.compile("azqlite");
+    builder.compile("sqlite_objs");
 
     // Find and link OpenSSL using pkg-config or Homebrew
     if let Ok(output) = Command::new("pkg-config")
@@ -71,7 +71,7 @@ fn main() {
         println!("cargo:rustc-link-search=native={}/lib", prefix);
     }
 
-    // Link sqlite3 from libsqlite3-sys (needed for azqlite C code's sqlite3_* calls)
+    // Link sqlite3 from libsqlite3-sys (needed for sqlite-objs C code's sqlite3_* calls)
     if let Ok(lib_dir) = env::var("DEP_SQLITE3_LIB_DIR") {
         println!("cargo:rustc-link-search=native={}", lib_dir);
     }
@@ -85,10 +85,10 @@ fn main() {
     println!("cargo:rustc-link-lib=m");
 
     // Tell cargo to recompile if C sources change
-    println!("cargo:rerun-if-changed={}", src_dir.join("azqlite_vfs.c").display());
+    println!("cargo:rerun-if-changed={}", src_dir.join("sqlite_objs_vfs.c").display());
     println!("cargo:rerun-if-changed={}", src_dir.join("azure_client.c").display());
     println!("cargo:rerun-if-changed={}", src_dir.join("azure_auth.c").display());
     println!("cargo:rerun-if-changed={}", src_dir.join("azure_error.c").display());
-    println!("cargo:rerun-if-changed={}", src_dir.join("azqlite.h").display());
+    println!("cargo:rerun-if-changed={}", src_dir.join("sqlite_objs.h").display());
     println!("cargo:rerun-if-changed={}", src_dir.join("azure_client.h").display());
 }

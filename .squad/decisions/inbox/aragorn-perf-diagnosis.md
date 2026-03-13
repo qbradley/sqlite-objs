@@ -45,7 +45,7 @@ The fundamental bottleneck is **9 sequential HTTP round-trips per transaction**,
 SQLite calls xAccess to check journal and WAL existence multiple times per transaction. Each HEAD request costs ~25ms. These are pure overhead for the single-writer case.
 
 ### 4. Resize-Every-Sync Is 9% of Latency
-`azqliteSync` calls `page_blob_resize` on every sync regardless of whether the blob actually needs to grow. This is a wasted HTTP round-trip when the blob size has not changed.
+`sqlite-objsSync` calls `page_blob_resize` on every sync regardless of whether the blob actually needs to grow. This is a wasted HTTP round-trip when the blob size has not changed.
 
 ### 5. Journal Upload Is Serial and Expensive
 The journal (block blob upload) takes ~130ms average. It must complete BEFORE the db page writes begin (crash safety). With only ~21-111KB of journal data, the time is dominated by HTTP latency, not bandwidth.
@@ -68,14 +68,14 @@ For TPC-C's tiny transactions (2-5 dirty pages each), the page coalescing and pa
 **Impact: HIGH** - Expected improvement from 2.9 tps to ~3.8 tps
 
 SQLite calls `xAccess` for journal and WAL files repeatedly. Since we control both files via Azure:
-- Cache journal existence state in the azqliteFile struct
+- Cache journal existence state in the sqlite-objsFile struct
 - Return cached result from `xAccess` for journal/WAL blobs that we created/deleted ourselves
 - Only do a real HEAD when the cached state might be stale (e.g., on first access after xOpen)
 
 ### R2: Skip Resize When Size Unchanged (~9% savings, ~45ms/txn)
 **Impact: MEDIUM** - Expected improvement of ~0.3 tps additional
 
-Track `lastSyncedSize` in azqliteFile. Only call `page_blob_resize` when `nData > lastSyncedSize`. Most TPC-C transactions modify existing pages without growing the file.
+Track `lastSyncedSize` in sqlite-objsFile. Only call `page_blob_resize` when `nData > lastSyncedSize`. Most TPC-C transactions modify existing pages without growing the file.
 
 ### R3: Transaction Batching / Deferred Lease Release (~14% savings)
 **Impact: MEDIUM** - Expected improvement of ~0.5 tps additional
@@ -132,8 +132,8 @@ Theoretical maximum with all optimizations:
 
 ## Instrumentation Added
 
-Debug timing is controlled by `AZQLITE_DEBUG_TIMING=1` environment variable:
-- `azqlite_vfs.c`: lease acquire/release, xSync breakdown, xRead counts, coalesce timing
+Debug timing is controlled by `SQLITE_OBJS_DEBUG_TIMING=1` environment variable:
+- `sqlite_objs_vfs.c`: lease acquire/release, xSync breakdown, xRead counts, coalesce timing
 - `azure_client.c`: per-HTTP-call timing with DNS/TCP/TLS breakdown, connection reuse detection
 - Zero overhead when env var is not set (checked once, cached)
 - All 207 unit tests pass with instrumentation in place

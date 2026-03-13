@@ -1,22 +1,22 @@
 /*
-** azqlite_shell.c — SQLite CLI wrapper with azqlite VFS
+** sqlite_objs_shell.c — SQLite CLI wrapper with sqliteObjs VFS
 **
-** This is a thin wrapper that registers the azqlite VFS as the default
+** This is a thin wrapper that registers the sqliteObjs VFS as the default
 ** VFS, then invokes the standard SQLite shell.  The result is a SQLite
 ** CLI that transparently reads/writes from Azure Blob Storage.
 **
 ** Build:
-**   cc -o azqlite-shell azqlite_shell.c azqlite_vfs.c azure_client_stub.c \
+**   cc -o sqlite-objs-shell sqlite_objs_shell.c sqlite_objs_vfs.c azure_client_stub.c \
 **      sqlite3.c -lpthread -ldl -lm
 **
 ** Usage:
 **   export AZURE_STORAGE_ACCOUNT=myaccount
 **   export AZURE_STORAGE_CONTAINER=databases
 **   export AZURE_STORAGE_SAS="sv=2024-08-04&..."
-**   ./azqlite-shell mydb.db
+**   ./sqlite-objs-shell mydb.db
 **
 ** URI mode (no environment variables needed):
-**   ./azqlite-shell --uri "file:mydb.db?azure_account=acct&azure_container=cont&azure_sas=tok"
+**   ./sqlite-objs-shell --uri "file:mydb.db?azure_account=acct&azure_container=cont&azure_sas=tok"
 **
 ** NOTE: SAS tokens contain '&' which is a URI delimiter. When using --uri,
 ** percent-encode '&' as '%26' in the SAS token value, e.g.:
@@ -26,7 +26,7 @@
 #include <stdio.h>
 #include <string.h>
 #include "sqlite3.h"
-#include "azqlite.h"
+#include "sqlite_objs.h"
 
 /*
 ** The SQLite shell's entry point.  Declared in shell.c.
@@ -66,20 +66,20 @@ int main(int argc, char **argv) {
         ** Enable URI filenames globally before any SQLite initialization.
         */
         sqlite3_config(SQLITE_CONFIG_URI, 1);
-        rc = azqlite_vfs_register_uri(1);  /* 1 = make default */
+        rc = sqlite_objs_vfs_register_uri(1);  /* 1 = make default */
         if (rc != SQLITE_OK) {
             fprintf(stderr,
-                "azqlite: Failed to register URI-mode VFS (rc=%d).\n", rc);
+                "sqliteObjs: Failed to register URI-mode VFS (rc=%d).\n", rc);
             return 1;
         }
     } else {
         /*
         ** Default mode: register VFS using environment variables.
         */
-        rc = azqlite_vfs_register(1);  /* 1 = make default */
+        rc = sqlite_objs_vfs_register(1);  /* 1 = make default */
         if (rc != SQLITE_OK) {
             fprintf(stderr,
-                "azqlite: Failed to register VFS (rc=%d).\n"
+                "sqliteObjs: Failed to register VFS (rc=%d).\n"
                 "Ensure these environment variables are set:\n"
                 "  AZURE_STORAGE_ACCOUNT\n"
                 "  AZURE_STORAGE_CONTAINER\n"

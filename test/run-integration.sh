@@ -15,7 +15,7 @@
 #   AZURITE_PORT      — Port for blob service (default: 10000)
 #   AZURITE_SILENT    — Set to 1 to suppress Azurite output
 #
-# Part of the azqlite project. License: MIT
+# Part of the sqlite-objs project. License: MIT
 
 set -e
 
@@ -25,7 +25,7 @@ set -e
 
 AZURITE_PORT="${AZURITE_PORT:-10000}"
 AZURITE_SILENT="${AZURITE_SILENT:-0}"
-CONTAINER_NAME="azqlite-test"
+CONTAINER_NAME="sqlite-objs-test"
 ACCOUNT_NAME="devstoreaccount1"
 AZURITE_ENDPOINT="http://127.0.0.1:${AZURITE_PORT}"
 
@@ -55,7 +55,7 @@ trap cleanup EXIT INT TERM
 # ──────────────────────────────────────────────────────────────
 
 echo "╔════════════════════════════════════════════════════════╗"
-echo "║  azqlite Integration Test Runner                      ║"
+echo "║  sqlite-objs Integration Test Runner                      ║"
 echo "╚════════════════════════════════════════════════════════╝"
 echo ""
 

@@ -1,4 +1,4 @@
-# Security Testing Guide for azqlite
+# Security Testing Guide for sqlite-objs
 
 > Modern C security testing tools, integration instructions, and CI recommendations.
 
@@ -21,7 +21,7 @@
 
 **What it catches:** Type mismatches, unused variables, implicit conversions, sign comparison issues.
 
-azqlite already uses `-Wall -Wextra -Wpedantic`. Recommended additions:
+sqlite-objs already uses `-Wall -Wextra -Wpedantic`. Recommended additions:
 
 ```makefile
 # Add to CFLAGS for maximum warning coverage
@@ -167,7 +167,7 @@ sanitize: clean
 export ASAN_OPTIONS="detect_leaks=1:detect_stack_use_after_return=1:check_initialization_order=1:strict_init_order=1"
 ```
 
-**What to watch for in azqlite:**
+**What to watch for in sqlite-objs:**
 - Buffer handling in `azure_buffer_t` (growable buffer in azure_client.c)
 - `aData` memory buffer in VFS layer (realloc on writes past EOF)
 - Dirty page bitmap allocation/deallocation
@@ -195,7 +195,7 @@ ubsan: clean
 		LDFLAGS="$(LDFLAGS) -fsanitize=undefined"
 ```
 
-**What to watch for in azqlite:**
+**What to watch for in sqlite-objs:**
 - Integer arithmetic in `dirtyBitmapSize()` — page count calculations
 - Size calculations: `offset + len` overflow checks in xRead/xWrite
 - Alignment calculations: `(size + 511) & ~511` rounding
@@ -227,10 +227,10 @@ msan: clean
 - **All linked libraries must be MSan-instrumented** — this means libcurl and OpenSSL cannot be used with MSan unless rebuilt with MSan. Best suited for unit tests using the mock layer.
 - Cannot combine with ASan
 
-**What to watch for in azqlite:**
+**What to watch for in sqlite-objs:**
 - `azure_buffer_t` — are read buffers fully initialized before use?
 - `azure_error_t` — are all fields set on error paths?
-- VFS file descriptor (`azqliteFile`) — are all struct fields initialized on xOpen?
+- VFS file descriptor (`sqlite-objsFile`) — are all struct fields initialized on xOpen?
 
 **CI considerations:**
 - Run only on unit tests (mock layer, no libcurl dependency)
@@ -253,7 +253,7 @@ tsan: clean
 		LDFLAGS="$(LDFLAGS) -fsanitize=thread"
 ```
 
-**Relevance to azqlite:**
+**Relevance to sqlite-objs:**
 - SQLite is compiled with `SQLITE_THREADSAFE=1` (serialized mode)
 - The VFS layer itself may be called from multiple threads
 - Lease renewal timing (`leaseRenewIfNeeded`) could race with lock operations
@@ -306,7 +306,7 @@ fuzz-xml-parse:
 	@echo "Run: $(BUILD_DIR)/fuzz_xml_parse corpus/xml_parse/"
 ```
 
-**Recommended fuzz targets for azqlite (priority order):**
+**Recommended fuzz targets for sqlite-objs (priority order):**
 
 | Target | File | Risk |
 |--------|------|------|
@@ -314,7 +314,7 @@ fuzz-xml-parse:
 | Base64 decode | `azure_auth.c:azure_base64_decode` | High — processes account keys |
 | URL construction | `azure_client.c:build_blob_url` | Medium — user-provided blob names |
 | Header parsing | `azure_client.c:curl_header_cb` | Medium — untrusted server headers |
-| Full VFS path | `azqlite_vfs.c:azqliteFullPathname` | Low — path construction |
+| Full VFS path | `sqlite_objs_vfs.c:sqlite-objsFullPathname` | Low — path construction |
 
 **CI considerations:**
 - Requires Clang (libFuzzer is built into Clang)
@@ -391,7 +391,7 @@ coverage: clean
 ```
 
 **What to look for:**
-- Are all error paths in `azqlite_vfs.c` exercised? (lease failures, allocation failures, alignment errors)
+- Are all error paths in `sqlite_objs_vfs.c` exercised? (lease failures, allocation failures, alignment errors)
 - Are all `azure_err_t` codes handled in the VFS error mapping?
 - Is the retry logic in `execute_with_retry()` tested for each retry scenario?
 - Are all branches of `xOpen` (main db, journal, temp, other) covered?
@@ -438,7 +438,7 @@ coverage-llvm: clean
 
 ### 5.1 Format String Vulnerabilities
 
-**Risk in azqlite:** Moderate. Error messages from Azure are placed into fixed-size buffers. If any user-controlled string were passed as a format string argument, it could be exploited.
+**Risk in sqlite-objs:** Moderate. Error messages from Azure are placed into fixed-size buffers. If any user-controlled string were passed as a format string argument, it could be exploited.
 
 **Detection:**
 - Compiler: `-Wformat=2 -Wformat-security` (already recommended above)
@@ -447,14 +447,14 @@ coverage-llvm: clean
 
 **Locations to audit:**
 - `snprintf` calls in `azure_error.c` (error message formatting)
-- `sqlite3_snprintf` calls in `azqlite_vfs.c` (path construction)
+- `sqlite3_snprintf` calls in `sqlite_objs_vfs.c` (path construction)
 - Any `printf`-family call where the format string could be influenced by external data
 
 ---
 
 ### 5.2 Buffer Overflow Protection
 
-**Risk in azqlite:** High. Fixed-size buffers are used throughout:
+**Risk in sqlite-objs:** High. Fixed-size buffers are used throughout:
 - `azure_error_t.error_code[128]`
 - `azure_error_t.error_message[256]`
 - `azure_error_t.request_id[64]`
@@ -481,7 +481,7 @@ HARDEN_CFLAGS = -D_FORTIFY_SOURCE=2 -fstack-protector-strong \
 
 ### 5.3 Integer Overflow Risks
 
-**Risk in azqlite:** Medium. Size calculations involve `int64_t` and `size_t` arithmetic:
+**Risk in sqlite-objs:** Medium. Size calculations involve `int64_t` and `size_t` arithmetic:
 - `dirtyBitmapSize()` — page count from file size
 - `offset + len` in xRead/xWrite — could overflow on 32-bit
 - `(nData + 511) & ~511` alignment rounding
@@ -497,7 +497,7 @@ HARDEN_CFLAGS = -D_FORTIFY_SOURCE=2 -fstack-protector-strong \
 
 ### 5.4 Credential Handling
 
-**Risk in azqlite:** High. The client handles Azure Storage account keys and SAS tokens.
+**Risk in sqlite-objs:** High. The client handles Azure Storage account keys and SAS tokens.
 
 **Checks to implement:**
 - **No credential logging:** Grep for `printf`/`fprintf`/`sqlite3_log` calls near credential variables

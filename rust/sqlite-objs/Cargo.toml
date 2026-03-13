@@ -1,6 +1,6 @@
 [package]
-name = "azqlite"
-description = "Safe Rust bindings for azqlite - SQLite VFS backed by Azure Blob Storage"
+name = "sqlite-objs"
+description = "Safe Rust bindings for sqlite-objs - SQLite VFS backed by Azure Blob Storage"
 version.workspace = true
 authors.workspace = true
 edition.workspace = true
@@ -9,7 +9,7 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-azqlite-sys = { path = "../azqlite-sys" }
+sqlite-objs-sys = { path = "../sqlite-objs-sys" }
 thiserror = "2.0"
 
 [dev-dependencies]

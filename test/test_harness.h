@@ -1,5 +1,5 @@
 /*
-** test_harness.h — Minimal C test framework for azqlite
+** test_harness.h — Minimal C test framework for sqliteObjs
 **
 ** No external dependencies. Provides test declaration, assertion macros,
 ** suite grouping, colored output, and pass/fail summary.

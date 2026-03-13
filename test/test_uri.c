@@ -15,7 +15,7 @@
 #include "../sqlite-autoconf-3520000/sqlite3.h"
 #include "mock_azure_ops.h"
 #include "test_harness.h"
-#include "../src/azqlite.h"
+#include "../src/sqlite_objs.h"
 #include <string.h>
 #include <stdlib.h>
 
@@ -38,14 +38,14 @@ TEST(uri_register_uri_no_global_client) {
     uri_setup();
 
     /* Register VFS with no global ops (URI-only mode) */
-    int rc = azqlite_vfs_register_uri(0);
+    int rc = sqlite_objs_vfs_register_uri(0);
     ASSERT_OK(rc);
 
     /* Open a database WITHOUT URI params — should fail */
     sqlite3 *db = NULL;
     rc = sqlite3_open_v2("test_nouri.db", &db,
                           SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE,
-                          "azqlite");
+                          "sqlite-objs");
     ASSERT_EQ(rc, SQLITE_CANTOPEN);
     if (db) sqlite3_close(db);
 }
@@ -61,7 +61,7 @@ TEST(uri_parse_with_mock_fallback) {
     uri_setup();
 
     /* Register VFS with global mock ops */
-    int rc = azqlite_vfs_register_with_ops(uri_ops, uri_ctx, 0);
+    int rc = sqlite_objs_vfs_register_with_ops(uri_ops, uri_ctx, 0);
     ASSERT_OK(rc);
 
     /* Open a database WITH URI params — will attempt azure_client_create()
@@ -71,7 +71,7 @@ TEST(uri_parse_with_mock_fallback) {
         "file:uri_test.db?azure_account=acct&azure_container=cont&azure_sas=tok",
         &db,
         SQLITE_OPEN_URI | SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE,
-        "azqlite");
+        "sqlite-objs");
 
     /* azure_client_create from stub returns error → SQLITE_CANTOPEN */
     ASSERT_EQ(rc, SQLITE_CANTOPEN);
@@ -87,14 +87,14 @@ TEST(uri_fallback_to_global) {
     uri_setup();
 
     /* Register VFS with global mock ops */
-    int rc = azqlite_vfs_register_with_ops(uri_ops, uri_ctx, 0);
+    int rc = sqlite_objs_vfs_register_with_ops(uri_ops, uri_ctx, 0);
     ASSERT_OK(rc);
 
     /* Open WITHOUT URI params → uses global mock ops → should succeed */
     sqlite3 *db = NULL;
     rc = sqlite3_open_v2("fallback_test.db", &db,
                           SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE,
-                          "azqlite");
+                          "sqlite-objs");
     ASSERT_OK(rc);
     ASSERT_NOT_NULL(db);
 
@@ -130,20 +130,20 @@ TEST(uri_fallback_to_global) {
 TEST(uri_journal_cache_isolation) {
     uri_setup();
 
-    int rc = azqlite_vfs_register_with_ops(uri_ops, uri_ctx, 0);
+    int rc = sqlite_objs_vfs_register_with_ops(uri_ops, uri_ctx, 0);
     ASSERT_OK(rc);
 
     /* Open two separate databases */
     sqlite3 *db1 = NULL, *db2 = NULL;
     rc = sqlite3_open_v2("cache_iso_a.db", &db1,
                           SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE,
-                          "azqlite");
+                          "sqlite-objs");
     ASSERT_OK(rc);
     ASSERT_NOT_NULL(db1);
 
     rc = sqlite3_open_v2("cache_iso_b.db", &db2,
                           SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE,
-                          "azqlite");
+                          "sqlite-objs");
     ASSERT_OK(rc);
     ASSERT_NOT_NULL(db2);
 
@@ -191,7 +191,7 @@ TEST(uri_journal_cache_isolation) {
     sqlite3_close(db2);
 
     rc = sqlite3_open_v2("cache_iso_a.db", &db1,
-                          SQLITE_OPEN_READWRITE, "azqlite");
+                          SQLITE_OPEN_READWRITE, "sqlite-objs");
     ASSERT_OK(rc);
     rc = sqlite3_prepare_v2(db1, "SELECT val FROM t1 WHERE id=1;", -1, &stmt, NULL);
     ASSERT_OK(rc);
@@ -201,7 +201,7 @@ TEST(uri_journal_cache_isolation) {
     sqlite3_finalize(stmt);
 
     rc = sqlite3_open_v2("cache_iso_b.db", &db2,
-                          SQLITE_OPEN_READWRITE, "azqlite");
+                          SQLITE_OPEN_READWRITE, "sqlite-objs");
     ASSERT_OK(rc);
     rc = sqlite3_prepare_v2(db2, "SELECT val FROM t2 WHERE id=1;", -1, &stmt, NULL);
     ASSERT_OK(rc);
@@ -223,14 +223,14 @@ TEST(uri_cantopen_no_ops_no_uri) {
     uri_setup();
 
     /* Register URI-only VFS (NULL global ops) */
-    int rc = azqlite_vfs_register_uri(0);
+    int rc = sqlite_objs_vfs_register_uri(0);
     ASSERT_OK(rc);
 
     /* Try to open without URI params using sqlite3_open_v2 with URI flag */
     sqlite3 *db = NULL;
     rc = sqlite3_open_v2("file:no_uri_params.db", &db,
                           SQLITE_OPEN_URI | SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE,
-                          "azqlite");
+                          "sqlite-objs");
     ASSERT_EQ(rc, SQLITE_CANTOPEN);
     if (db) sqlite3_close(db);
 
@@ -238,20 +238,20 @@ TEST(uri_cantopen_no_ops_no_uri) {
     db = NULL;
     rc = sqlite3_open_v2("plain_no_uri.db", &db,
                           SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE,
-                          "azqlite");
+                          "sqlite-objs");
     ASSERT_EQ(rc, SQLITE_CANTOPEN);
     if (db) sqlite3_close(db);
 }
 
 /* ══════════════════════════════════════════════════════════════════════
 ** Test 6: Multiple DBs with journal writes — exercises per-blob cache
-** eviction when more than AZQLITE_MAX_JOURNAL_CACHE entries exist
+** eviction when more than SQLITE_OBJS_MAX_JOURNAL_CACHE entries exist
 ** ══════════════════════════════════════════════════════════════════════ */
 
 TEST(uri_journal_cache_multiple_dbs) {
     uri_setup();
 
-    int rc = azqlite_vfs_register_with_ops(uri_ops, uri_ctx, 0);
+    int rc = sqlite_objs_vfs_register_with_ops(uri_ops, uri_ctx, 0);
     ASSERT_OK(rc);
 
     /* Open 4 databases and write to each */
@@ -263,7 +263,7 @@ TEST(uri_journal_cache_multiple_dbs) {
     for (int i = 0; i < 4; i++) {
         rc = sqlite3_open_v2(names[i], &dbs[i],
                               SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE,
-                              "azqlite");
+                              "sqlite-objs");
         ASSERT_OK(rc);
         ASSERT_NOT_NULL(dbs[i]);
 
@@ -308,11 +308,11 @@ TEST(uri_journal_cache_multiple_dbs) {
 
 TEST(uri_register_returns_ok) {
     uri_setup();
-    int rc = azqlite_vfs_register_uri(0);
+    int rc = sqlite_objs_vfs_register_uri(0);
     ASSERT_OK(rc);
 
     /* Verify the VFS is findable */
-    sqlite3_vfs *vfs = sqlite3_vfs_find("azqlite");
+    sqlite3_vfs *vfs = sqlite3_vfs_find("sqlite-objs");
     ASSERT_NOT_NULL(vfs);
 }
 
@@ -324,18 +324,18 @@ TEST(uri_reregister_with_ops) {
     uri_setup();
 
     /* First register as URI-only */
-    int rc = azqlite_vfs_register_uri(0);
+    int rc = sqlite_objs_vfs_register_uri(0);
     ASSERT_OK(rc);
 
     /* Now re-register with global mock ops */
-    rc = azqlite_vfs_register_with_ops(uri_ops, uri_ctx, 0);
+    rc = sqlite_objs_vfs_register_with_ops(uri_ops, uri_ctx, 0);
     ASSERT_OK(rc);
 
     /* Should be able to open without URI params now */
     sqlite3 *db = NULL;
     rc = sqlite3_open_v2("reregister_test.db", &db,
                           SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE,
-                          "azqlite");
+                          "sqlite-objs");
     ASSERT_OK(rc);
     ASSERT_NOT_NULL(db);
     sqlite3_close(db);

@@ -1,12 +1,12 @@
-# azqlite Benchmark Harness
+# sqlite-objs Benchmark Harness
 
-This benchmark harness compares the performance of local SQLite against azqlite (Azure blob-backed SQLite) using SQLite's official `speedtest1` test suite.
+This benchmark harness compares the performance of local SQLite against sqlite-objs (Azure blob-backed SQLite) using SQLite's official `speedtest1` test suite.
 
 ## Overview
 
 The harness runs identical workloads against both:
 - **Local SQLite**: Using the default VFS with local file storage
-- **Azure SQLite**: Using the azqlite VFS with Azure Blob Storage backend
+- **Azure SQLite**: Using the sqlite-objs VFS with Azure Blob Storage backend
 
 It captures timing for each run and produces a comparison report showing speedup/slowdown ratios.
 
@@ -81,7 +81,7 @@ Run only Azure benchmark:
 ### Command-Line Options
 
 - `--local-only` — Run only local SQLite benchmark
-- `--azure-only` — Run only azqlite benchmark
+- `--azure-only` — Run only sqlite-objs benchmark
 - `--size N` — Size parameter passed to speedtest1 (default: 25)
   - Larger values = more operations, longer runtime
   - Recommended range: 10-100
@@ -130,7 +130,7 @@ The text output provides a human-readable comparison:
 Local SQLite (default VFS):
   Elapsed time:  12.345 seconds
 
-Azure SQLite (azqlite VFS):
+Azure SQLite (sqlite-objs VFS):
   Elapsed time:  45.678 seconds
 
 Performance Comparison:
@@ -171,7 +171,7 @@ Expected performance characteristics:
 - **Local SQLite**: Fast baseline (local disk I/O)
 - **Azure SQLite**: Higher latency due to network round-trips
 
-Typical slowdown factors for azqlite:
+Typical slowdown factors for sqlite-objs:
 - **Best case** (large transactions, good batching): 2-5x slower
 - **Worst case** (many small operations): 10-50x slower
 
@@ -179,7 +179,7 @@ The in-memory cache (D4) significantly reduces the gap by eliminating repeated b
 
 ## Troubleshooting
 
-### Azure benchmark fails with "Failed to register azqlite VFS"
+### Azure benchmark fails with "Failed to register sqlite-objs VFS"
 
 Check that the production build was used:
 ```bash
@@ -234,4 +234,4 @@ Example GitHub Actions workflow:
 
 ## License
 
-This benchmark harness is part of azqlite and is licensed under the MIT License.
+This benchmark harness is part of sqlite-objs and is licensed under the MIT License.

@@ -4,7 +4,7 @@
 
 ## Summary
 
-Benchmark harness completed. Three-binary subprocess architecture. speedtest1 (vanilla) and speedtest1-azure (with azqlite VFS) run as isolated processes. Main harness measures wall-clock time via `gettimeofday()`. Supports --local-only, --azure-only, --size N, --output csv/text.
+Benchmark harness completed. Three-binary subprocess architecture. speedtest1 (vanilla) and speedtest1-azure (with sqlite-objs VFS) run as isolated processes. Main harness measures wall-clock time via `gettimeofday()`. Supports --local-only, --azure-only, --size N, --output csv/text.
 
 **Files:**
 - `benchmark/benchmark.c` — Main harness

@@ -1,4 +1,4 @@
-# Azqlite Rust Development Guide
+# sqlite-objs Rust Development Guide
 
 ## Project Structure
 
@@ -9,12 +9,12 @@ rust/
 ├── QUICKSTART.md                   # Quick reference
 ├── DEVELOPMENT.md                  # This file
 ├── .gitignore                      # Ignore target/ and artifacts
-├── azqlite-sys/                    # FFI bindings (unsafe)
-│   ├── Cargo.toml                  # Links="azqlite", build-deps: cc
+├── sqlite-objs-sys/                # FFI bindings (unsafe)
+│   ├── Cargo.toml                  # Links="sqlite-objs", build-deps: cc
 │   ├── build.rs                    # Compiles C sources via cc crate
 │   └── src/lib.rs                  # Raw FFI declarations
-└── azqlite/                        # Safe wrapper (idiomatic Rust)
-    ├── Cargo.toml                  # Depends on azqlite-sys, thiserror
+└── sqlite-objs/                    # Safe wrapper (idiomatic Rust)
+    ├── Cargo.toml                  # Depends on sqlite-objs-sys, thiserror
     ├── src/lib.rs                  # Public API
     └── examples/basic.rs           # Usage demonstration
 ```
@@ -24,7 +24,7 @@ rust/
 ### How build.rs Works
 
 1. Compiles SQLite amalgamation (`sqlite3.c`) as static library
-2. Compiles azqlite C sources (`azqlite_vfs.c`, `azure_client.c`, `azure_auth.c`, `azure_error.c`)
+2. Compiles sqlite-objs C sources (`sqlite_objs_vfs.c`, `azure_client.c`, `azure_auth.c`, `azure_error.c`)
 3. Discovers OpenSSL paths via pkg-config or Homebrew
 4. Links system libraries: curl, ssl, crypto, pthread, m
 5. Generates rerun-if-changed directives for incremental builds
@@ -53,13 +53,13 @@ cargo doc --open     # Generate and view documentation
 
 ### Making Changes
 
-**To FFI bindings (azqlite-sys):**
+**To FFI bindings (sqlite-objs-sys):**
 1. Update `src/lib.rs` with new extern "C" declarations
 2. Update `build.rs` if new C sources added
 3. Run `cargo build` to verify compilation
 4. Run `cargo test` (basic linkage tests)
 
-**To safe wrapper (azqlite):**
+**To safe wrapper (sqlite-objs):**
 1. Update `src/lib.rs` with safe Rust API
 2. Add tests in `#[cfg(test)] mod tests`
 3. Update examples if API changes
@@ -96,8 +96,8 @@ cargo build --release  # Check optimized build
 **Current Status:** v0.1.0 (pre-release)
 
 **Stability Promise:**
-- FFI layer (`azqlite-sys`): Follows C API stability
-- Safe wrapper (`azqlite`): May change before 1.0
+- FFI layer (`sqlite-objs-sys`): Follows C API stability
+- Safe wrapper (`sqlite-objs`): May change before 1.0
 - Semantic versioning after 1.0 release
 
 ## Future Work
@@ -113,7 +113,7 @@ cargo build --release  # Check optimized build
 - [ ] Publish to crates.io
 
 **Non-Goals (out of scope):**
-- Pure-Rust Azure client (use C client from azqlite)
+- Pure-Rust Azure client (use C client from sqlite-objs)
 - Custom SQLite features (use upstream SQLite)
 - Windows support initially (focus on Unix-like first)
 

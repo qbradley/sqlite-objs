@@ -1,6 +1,6 @@
 # TPC-C OLTP Benchmark for SQLite
 
-A custom TPC-C style benchmark for measuring OLTP performance of local SQLite versus azqlite (Azure blob-backed SQLite).
+A custom TPC-C style benchmark for measuring OLTP performance of local SQLite versus sqlite-objs (Azure blob-backed SQLite).
 
 ## Overview
 
@@ -40,7 +40,7 @@ This builds `tpcc-local` which runs against standard SQLite.
 make all-production
 ```
 
-This builds both `tpcc-local` and `tpcc-azure` (which can use the azqlite VFS).
+This builds both `tpcc-local` and `tpcc-azure` (which can use the sqlite-objs VFS).
 
 ## Usage
 
@@ -149,7 +149,7 @@ Larger scale factors increase both database size and transaction complexity.
 
 ## Workload Characterization
 
-This section describes the I/O patterns of each transaction type and why they matter for comparing local SQLite versus azqlite over the network.
+This section describes the I/O patterns of each transaction type and why they matter for comparing local SQLite versus sqlite-objs over the network.
 
 ### Transaction Types
 
@@ -163,7 +163,7 @@ This section describes the I/O patterns of each transaction type and why they ma
 
 **Write-Heavy Operations (New Order, Payment):**
 - These transactions dominate the mix (~88% combined)
-- Each write requires a network round-trip with azqlite
+- Each write requires a network round-trip with sqlite-objs
 - New Order is particularly expensive due to multiple order line inserts
 - Payment is more efficient with fixed, predictable writes
 
@@ -174,7 +174,7 @@ This section describes the I/O patterns of each transaction type and why they ma
 
 ### Network Latency Impact
 
-| Operation Type | Local SQLite | azqlite (uncached) | azqlite (cached) |
+| Operation Type | Local SQLite | sqlite-objs (uncached) | sqlite-objs (cached) |
 |---------------|--------------|--------------------|--------------------|
 | Single read   | <1ms         | 20-100ms           | <1ms               |
 | Single write  | <1ms         | 20-100ms           | 20-100ms (always remote) |
@@ -188,7 +188,7 @@ This section describes the I/O patterns of each transaction type and why they ma
 - **Order Status benefits most from caching**: Read-only with cacheable data
 - **Payment is predictable**: Fixed write count makes latency consistent
 
-### Why TPC-C for azqlite Testing
+### Why TPC-C for sqlite-objs Testing
 
 1. **Realistic Mix**: Combines reads and writes like real applications
 2. **Variable Transaction Sizes**: New Order's 5-15 items tests both small and large transactions
@@ -198,7 +198,7 @@ This section describes the I/O patterns of each transaction type and why they ma
 
 ### Optimization Opportunities
 
-When analyzing azqlite vs local results, look for:
+When analyzing sqlite-objs vs local results, look for:
 - **Cache hit rate** on Order Status transactions
 - **Write batching** effectiveness in New Order
 - **Latency distribution** (p50 vs p99) to identify network variability
@@ -215,4 +215,4 @@ When analyzing azqlite vs local results, look for:
 
 - [TPC-C Specification](http://www.tpc.org/tpcc/) - Official TPC-C benchmark spec
 - `../benchmark.c` - Speedtest1-based benchmark harness
-- `../../src/azqlite_vfs.c` - Azure VFS implementation
+- `../../src/sqlite_objs_vfs.c` - Azure VFS implementation

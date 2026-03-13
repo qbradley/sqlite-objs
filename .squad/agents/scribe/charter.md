@@ -4,7 +4,7 @@ Silent documentation specialist maintaining history, decisions, and technical re
 
 ## Project Context
 
-**Project:** Azure Blob-backed SQLite (azqlite)
+**Project:** Azure Blob-backed SQLite (sqlite-objs)
 **Owner:** Quetzal Bradley
 **Stack:** C, SQLite VFS API, Azure Blob Storage REST API, libcurl, OpenSSL
 **License:** MIT

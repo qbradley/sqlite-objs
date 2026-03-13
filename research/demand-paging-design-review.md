@@ -3,7 +3,7 @@
 **Reviewer:** Gandalf (Lead Architect)  
 **Date:** 2025-07-17  
 **Scope:** Page cache, read-ahead, bulk prefetch, and dirty-page flush  
-**Files:** `src/azqlite_vfs.c` (2399 LOC), `src/azure_client.c` (2060 LOC)  
+**Files:** `src/sqlite_objs_vfs.c` (2399 LOC), `src/azure_client.c` (2060 LOC)  
 **Verdict:** Ship with follow-up — correct enough for current workloads, but multiple architectural issues must be addressed before production scale
 
 ---
@@ -35,7 +35,7 @@ xRead (cache hit path)
   
 xRead (cache miss path)
   │
-  ├─► cacheGetReadaheadPages() → getenv("AZQLITE_READAHEAD_PAGES")
+  ├─► cacheGetReadaheadPages() → getenv("SQLITE_OBJS_READAHEAD_PAGES")
   ├─► Single GET for pages [N, N+readahead)
   ├─► Split response → cacheInsert() for each (target first)
   └─► cacheEvictClean() as needed (LRU tail, skip dirty)
@@ -59,8 +59,8 @@ xSync (MAIN_DB)
 
 | Structure | Role | Lifetime |
 |-----------|------|----------|
-| `azqlite_page_cache_t` | Hash map + doubly-linked LRU | Per `azqliteFile`, xOpen→xClose |
-| `azqlite_cache_entry_t` | One page: pageNo, data ptr, dirty flag, LRU/hash pointers | Heap-allocated per page |
+| `sqlite_objs_page_cache_t` | Hash map + doubly-linked LRU | Per `sqlite-objsFile`, xOpen→xClose |
+| `sqlite_objs_cache_entry_t` | One page: pageNo, data ptr, dirty flag, LRU/hash pointers | Heap-allocated per page |
 | `azure_page_range_t` | Contiguous byte range for batch write | Stack (64) or heap, per xSync |
 
 ---
@@ -82,7 +82,7 @@ xSync (MAIN_DB)
 ### 3.2 Correctness Concerns
 
 **C-3.1: `aerr` potentially uninitialised on ETag capture (Low risk).**  
-At `azqlite_vfs.c:1411`, the sequential fallback path reads `aerr.etag[0]` to capture the ETag from the last write. The `aerr` variable is declared at function scope (line 1109) but only initialised inside the sequential write loop (line 1379) or the batch path (line 1325). If `nDirty > 0` but the resize operation at line 1266 is the only operation that initialises `aerr`, the stale `aerr` from resize doesn't carry a meaningful ETag. In practice, `nRanges ≥ 1` whenever `nDirty > 0` (the coalesce function guarantees this), so the loop always executes and `aerr` is always set. But the code relies on an invariant that isn't expressed in the control flow.  
+At `sqlite_objs_vfs.c:1411`, the sequential fallback path reads `aerr.etag[0]` to capture the ETag from the last write. The `aerr` variable is declared at function scope (line 1109) but only initialised inside the sequential write loop (line 1379) or the batch path (line 1325). If `nDirty > 0` but the resize operation at line 1266 is the only operation that initialises `aerr`, the stale `aerr` from resize doesn't carry a meaningful ETag. In practice, `nRanges ≥ 1` whenever `nDirty > 0` (the coalesce function guarantees this), so the loop always executes and `aerr` is always set. But the code relies on an invariant that isn't expressed in the control flow.  
 **Recommendation:** Initialise `aerr` with `azure_error_init(&aerr)` at declaration, or move the ETag capture into the sequential loop body on the last iteration.
 
 **C-3.2: Readahead can exceed cache capacity for one request cycle.**  
@@ -101,7 +101,7 @@ At `azqlite_vfs.c:1411`, the sequential fallback path reads `aerr.etag[0]` to ca
 **D-4.1: Per-page heap allocation creates O(n) malloc pressure.**
 
 Every page in the cache requires two separate heap allocations:
-- `calloc(1, sizeof(azqlite_cache_entry_t))` — 56 bytes (with pointers/padding)
+- `calloc(1, sizeof(sqlite_objs_cache_entry_t))` — 56 bytes (with pointers/padding)
 - `calloc(1, detectedPageSize)` — typically 4096 bytes
 
 For a 1024-page cache, this means 2048 `malloc` calls at open and 2 `malloc` + 2 `free` calls per evict-and-insert cycle. With glibc, this induces significant heap fragmentation and TLB pressure. On macOS (libmalloc with magazine allocator), the per-allocation overhead is ~16 bytes metadata, so a 4096-byte page actually consumes ~4112 bytes.
@@ -118,11 +118,11 @@ After:  [entry₁|entry₂|...|entryₙ] [data₁|data₂|...|dataₙ]   (two al
 **D-4.2: Prefetch size calculation uses wrong page size.**
 
 ```c
-// azqlite_vfs.c:1817
-size_t maxPrefetch = (size_t)maxPages * AZQLITE_DEFAULT_PAGE_SIZE;
+// sqlite_objs_vfs.c:1817
+size_t maxPrefetch = (size_t)maxPages * SQLITE_OBJS_DEFAULT_PAGE_SIZE;
 ```
 
-The prefetch size is computed using `AZQLITE_DEFAULT_PAGE_SIZE` (4096) before detecting the actual page size. If the database uses 8192-byte pages, this fetches `1024 × 4096 = 4 MiB` instead of the intended `1024 × 8192 = 8 MiB`, loading only 512 pages into the cache. For 16384-byte pages (common in WAL mode), only 256 pages are prefetched.
+The prefetch size is computed using `SQLITE_OBJS_DEFAULT_PAGE_SIZE` (4096) before detecting the actual page size. If the database uses 8192-byte pages, this fetches `1024 × 4096 = 4 MiB` instead of the intended `1024 × 8192 = 8 MiB`, loading only 512 pages into the cache. For 16384-byte pages (common in WAL mode), only 256 pages are prefetched.
 
 Conversely, if the DB uses 1024-byte pages, the prefetch loads 4× more data than intended by the maxPages limit, consuming memory unnecessarily.
 
@@ -133,20 +133,20 @@ After detection, the cache splits the buffer using the detected page size, so pa
 **D-4.3: `getenv()` called on every cache miss.**
 
 ```c
-// azqlite_vfs.c:634-641
+// sqlite_objs_vfs.c:634-641
 static int cacheGetReadaheadPages(void) {
-    const char *env = getenv("AZQLITE_READAHEAD_PAGES");
+    const char *env = getenv("SQLITE_OBJS_READAHEAD_PAGES");
     if (env) {
         int val = atoi(env);
         if (val > 0) return val;
     }
-    return AZQLITE_DEFAULT_READAHEAD;
+    return SQLITE_OBJS_DEFAULT_READAHEAD;
 }
 ```
 
 `getenv()` on most platforms walks the entire environment block (O(n) linear scan) on every call. This function is called once per cache miss in xRead. Under a scan-heavy workload, this could be thousands of calls per second.
 
-**Recommendation:** Cache the value in a `static` variable with a `static int once` guard, or resolve it once at xOpen and store in the `azqliteFile` struct.
+**Recommendation:** Cache the value in a `static` variable with a `static int once` guard, or resolve it once at xOpen and store in the `sqlite-objsFile` struct.
 
 **D-4.4: Readahead is not adaptive to access patterns.**
 
@@ -169,10 +169,10 @@ A fixed readahead of 64 pages (256 KiB with 4K pages) at ~22ms per HTTP GET mean
 
 ```c
 // Prefetch for 25000 pages × 4096 = ~100 MiB in one GET
-size_t maxPrefetch = (size_t)maxPages * AZQLITE_DEFAULT_PAGE_SIZE;
+size_t maxPrefetch = (size_t)maxPages * SQLITE_OBJS_DEFAULT_PAGE_SIZE;
 ```
 
-With `AZQLITE_MAX_PAGES=25000` (observed in benchmarks), the xOpen prefetch issues a single 100 MiB GET request. On a connection with 10 MiB/s throughput to Azure, this takes 10 seconds. On a saturated or throttled link, it blocks the calling thread for the full `CURLOPT_TIMEOUT` (60s). The benchmark observed **923-second hangs** attributed to macOS SecureTransport/curl interaction.
+With `SQLITE_OBJS_MAX_PAGES=25000` (observed in benchmarks), the xOpen prefetch issues a single 100 MiB GET request. On a connection with 10 MiB/s throughput to Azure, this takes 10 seconds. On a saturated or throttled link, it blocks the calling thread for the full `CURLOPT_TIMEOUT` (60s). The benchmark observed **923-second hangs** attributed to macOS SecureTransport/curl interaction.
 
 The single-GET design means: (a) no progress reporting, (b) no ability to cancel, (c) total failure if the request times out (no partial recovery), and (d) a single curl timeout governs the entire transfer.
 
@@ -183,7 +183,7 @@ The single-GET design means: (a) no progress reporting, (b) no ability to cancel
 `cacheCoalesceRanges()` allocates temporary contiguous buffers for each range by copying page data:
 
 ```c
-// azqlite_vfs.c:1059
+// sqlite_objs_vfs.c:1059
 unsigned char *buf = (unsigned char *)calloc(1, len);
 // ... memcpy each page's data into buf
 ```
@@ -196,18 +196,18 @@ For the batch write path, all range buffers must be live simultaneously (they're
 
 **D-4.7: No cache hit/miss metrics.**
 
-The implementation has no instrumentation for cache hit rate, eviction frequency, readahead effectiveness (pages read ahead that were subsequently accessed vs wasted), or dirty page high-water mark. Without these metrics, it's impossible to tune `AZQLITE_MAX_PAGES` and `AZQLITE_READAHEAD_PAGES` for a given workload.
+The implementation has no instrumentation for cache hit rate, eviction frequency, readahead effectiveness (pages read ahead that were subsequently accessed vs wasted), or dirty page high-water mark. Without these metrics, it's impossible to tune `SQLITE_OBJS_MAX_PAGES` and `SQLITE_OBJS_READAHEAD_PAGES` for a given workload.
 
 The existing `[TIMING]` infrastructure is well-designed but only covers HTTP timing, not cache behaviour.
 
-**Recommendation:** Add counters to `azqlite_page_cache_t`: `nHits`, `nMisses`, `nEvictions`, `nReadaheadUsed`, `nReadaheadWasted`. Log a summary at xClose or xSync. Expose via `SQLITE_FCNTL_*` for programmatic access.
+**Recommendation:** Add counters to `sqlite_objs_page_cache_t`: `nHits`, `nMisses`, `nEvictions`, `nReadaheadUsed`, `nReadaheadWasted`. Log a summary at xClose or xSync. Expose via `SQLITE_FCNTL_*` for programmatic access.
 
 ### 4.3 Minor — Code Quality
 
 **D-4.8: Insertion sort in `cacheCollectDirty` is O(n²).**
 
 ```c
-// azqlite_vfs.c:1010-1019
+// sqlite_objs_vfs.c:1010-1019
 for (int i = 1; i < n; i++) { ... }
 ```
 
@@ -230,7 +230,7 @@ These should be tuneable at runtime (environment variables or configuration stru
 **D-4.10: `cacheEvictClean` allows unbounded cache growth.**
 
 ```c
-// azqlite_vfs.c:257
+// sqlite_objs_vfs.c:257
 /* No clean pages to evict — allow cache to grow beyond soft limit */
 return SQLITE_OK;
 ```
@@ -350,7 +350,7 @@ SQLite's own page cache uses a **slab allocator** with pre-allocated page slots:
 - LRU list with unpinned/pinned distinction
 - `SQLITE_CONFIG_PAGECACHE` allows application to provide the memory
 
-**Lesson:** The azqlite cache should mirror this pattern. Pre-allocate a contiguous buffer and use a free-list.
+**Lesson:** The sqlite-objs cache should mirror this pattern. Pre-allocate a contiguous buffer and use a free-list.
 
 ### 7.2 Linux Block Layer Read-Ahead
 
@@ -379,10 +379,10 @@ LiteFS intercepts SQLite I/O at the VFS level and replicates to remote nodes:
 | # | Change | Risk | Impact |
 |---|--------|------|--------|
 | P1.1 | Cache `getenv()` result for readahead pages | Trivial | Eliminates O(n) env scan per miss |
-| P1.2 | Add `azure_error_init(&aerr)` at declaration in `azqliteSync` | Trivial | Defensive correctness |
+| P1.2 | Add `azure_error_init(&aerr)` at declaration in `sqlite-objsSync` | Trivial | Defensive correctness |
 | P1.3 | Validate Azure response length in `page_blob_read` | Low | Prevents silent corruption |
 | P1.4 | Add cache hit/miss counters and log at xClose | Low | Enables tuning |
-| P1.5 | Increase default `AZQLITE_MAX_PAGES` from 1024 to 4096 | Low | 4× larger working set |
+| P1.5 | Increase default `SQLITE_OBJS_MAX_PAGES` from 1024 to 4096 | Low | 4× larger working set |
 
 ### Phase 2 — Structural Improvements (3-5 days each)
 
@@ -431,7 +431,7 @@ The current test infrastructure (`test/` directory, VFS_TEST_INFRASTRUCTURE.md) 
 
 **Required before scaling:**
 - Slab allocator (P2.1) and adaptive readahead (P2.3) — needed for databases > 100 MiB
-- Chunked prefetch (P2.4) — needed if `AZQLITE_MAX_PAGES` is increased beyond ~1000
+- Chunked prefetch (P2.4) — needed if `SQLITE_OBJS_MAX_PAGES` is increased beyond ~1000
 
 The batch write infrastructure (`curl_multi`, coalesced ranges, retry with lease renewal) is the strongest part of the implementation and can be left as-is.
 

@@ -1,7 +1,7 @@
 # Project Context
 
 - **Owner:** Quetzal Bradley
-- **Project:** Azure Blob-backed SQLite (azqlite) — a drop-in replacement for SQLite where all storage is backed by Azure Blob Storage, implemented as a custom VFS layer. MIT licensed.
+- **Project:** Azure Blob-backed SQLite (sqlite-objs) — a drop-in replacement for SQLite where all storage is backed by Azure Blob Storage, implemented as a custom VFS layer. MIT licensed.
 - **Stack:** C, SQLite VFS API, Azure Blob Storage REST API, libcurl, OpenSSL
 - **SQLite source:** `sqlite-autoconf-3520000/` (do not modify unless absolutely necessary)
 - **Created:** 2026-03-10
@@ -42,8 +42,8 @@
 - **Write buffer with dirty page bitmap:** xWrite→memcpy+dirty bit, xSync→PUT Page per dirty page. Batches writes to sync time.
 - **Error handling:** 429/lease-conflict → SQLITE_BUSY (retryable). All else after retry → SQLITE_IOERR_* (fatal). 5 retries, 500ms exponential backoff + jitter.
 - **Device characteristics:** `SQLITE_IOCAP_SEQUENTIAL | SQLITE_IOCAP_POWERSAFE_OVERWRITE | SQLITE_IOCAP_SUBPAGE_READ`. NOT ATOMIC — journal safety is needed.
-- **VFS name "azqlite"**, non-default registration. Usage: `sqlite3_open_v2(name, &db, flags, "azqlite")`.
-- **Source layout:** `src/` (azqlite_vfs.c, azure_client.c/.h, azure_auth.c, azure_error.c, azqlite.h), `test/` (test_main.c, test_vfs.c, mock_azure_ops.c, test_integration.c).
+- **VFS name "sqlite-objs"**, non-default registration. Usage: `sqlite3_open_v2(name, &db, flags, "sqlite-objs")`.
+- **Source layout:** `src/` (sqlite_objs_vfs.c, azure_client.c/.h, azure_auth.c, azure_error.c, sqlite_objs.h), `test/` (test_main.c, test_vfs.c, mock_azure_ops.c, test_integration.c).
 - **Top risks:** (1) Lease expiry during long transactions, (2) Partial sync failure — both mitigated by journal-first ordering and inline lease renewal.
 - **Decisions written to:** `.squad/decisions.md` — all 11 decisions (D1-D11) now approved and merged from inbox.
 
@@ -51,7 +51,7 @@
 
 - **Full review at `research/code-review.md`.** Reviewed all 7 source files against D1–D11.
 - **Overall verdict: APPROVE WITH CONDITIONS** — 2 critical issues must fix before demo, 5 important issues for follow-up.
-- **C1 (CRITICAL): Device characteristics in `azqlite_vfs.c` claim ATOMIC512 + SAFE_APPEND.** Design spec (D4) says NOT ATOMIC. ATOMIC512 tells SQLite it can skip journal entries for 512-byte writes, which is dangerous — our multi-page xSync is not atomic. Must change to `SEQUENTIAL | POWERSAFE_OVERWRITE | SUBPAGE_READ`.
+- **C1 (CRITICAL): Device characteristics in `sqlite_objs_vfs.c` claim ATOMIC512 + SAFE_APPEND.** Design spec (D4) says NOT ATOMIC. ATOMIC512 tells SQLite it can skip journal entries for 512-byte writes, which is dangerous — our multi-page xSync is not atomic. Must change to `SEQUENTIAL | POWERSAFE_OVERWRITE | SUBPAGE_READ`.
 - **C2 (CRITICAL): URL construction in `azure_client.c` uses unbounded `strcat` on a 2048-byte stack buffer.** SAS tokens + long paths can overflow. Must use snprintf with bounds checking.
 - **Everything else is architecturally sound.** The azure_ops_t vtable is correctly implemented (all 13 operations, signatures match Appendix A). Lease-based locking has no race conditions. Journal workflow is correct. Error mapping follows D8. Both auth paths work.
 - **Key learning:** ATOMIC in SQLite device characteristics is a loaded term — it's about whether the pager can skip journal entries, not about whether individual writes are reliable. Always cross-check io capabilities against pager behavior, not just the underlying storage semantics.
@@ -74,7 +74,7 @@ Completed comprehensive design review (D1-D11). Verdict: **APPROVE WITH CONDITIO
 - **Key decision: No page copies during xSync.** Aragorn proved btree mutex is held during xSync → aData is stable → zero-copy parallel flush is safe. This only holds because we use curl_multi (single-threaded), not pthreads.
 - **Key decision: PRAGMA synchronous=NORMAL default.** Saves one journal upload per commit. FULL costs an extra HTTP round-trip for marginal safety gain (SQLite handles nRec recovery gracefully).
 - **Key decision: No pre-flush.** Both researchers agree. Pre-flush creates corruption windows (journal not yet synced) and data races (xWrite vs in-flight uploads). Parallel-at-xSync delivers 50–1000× improvement.
-- **Addressed user's write-through/write-back request directly.** azqlite is already write-through (xWrite→memcpy). Pure async write-back is unsafe (xSync cannot lie). The design gives the user what they want: instant writes + parallel flush at sync time.
+- **Addressed user's write-through/write-back request directly.** sqlite-objs is already write-through (xWrite→memcpy). Pure async write-back is unsafe (xSync cannot lie). The design gives the user what they want: instant writes + parallel flush at sync time.
 - **4-phase implementation plan:** (1) Coalescing only — 1–2 days, ≥5× for sequential, (2) curl_multi parallel — 3–5 days, ≥50× for bulk, (3) Connection pooling + lease hardening — 1–2 days, (4) Journal chunked upload — 2–3 days. Each phase delivers measurable value.
 - **Projected performance:** 100-page clustered commit drops from 10s → ~200ms. 5,000-page bulk load drops from 500s → ~500ms. VACUUM 100MB drops from 2500s → ~2s.
 - **9-item risk register** covering partial failure, lease expiry, throttling, Azurite compatibility, memory, vtable changes, TLS caching, alignment bugs, and event loop starvation.
@@ -92,7 +92,7 @@ Completed comprehensive design review (D1-D11). Verdict: **APPROVE WITH CONDITIO
 
 - **Produced complete design document:** `research/adaptive-readahead-design.md` — addresses D-4.4 (readahead not adaptive) and D-4.3 (getenv on every miss) from the demand paging design review.
 - **3-state machine:** INITIAL → SEQUENTIAL (window grows 4→1024 pages) or RANDOM (demand-only, window=1). Transitions based on whether cache misses follow the predicted sequential boundary.
-- **Key design choice: tolerance-based sequential detection.** Unlike Linux's exact-boundary match, azqlite allows a gap of `max(W/4, 4)` pages to handle pre-cached pages from xOpen prefetch. This is necessary because our prefetch populates arbitrary cache regions that Linux's page cache doesn't have.
+- **Key design choice: tolerance-based sequential detection.** Unlike Linux's exact-boundary match, sqlite-objs allows a gap of `max(W/4, 4)` pages to handle pre-cached pages from xOpen prefetch. This is necessary because our prefetch populates arbitrary cache regions that Linux's page cache doesn't have.
 - **Key design choice: no async readahead.** Linux's main innovation (overlapping I/O via async markers) requires background I/O threads. Deferred to future xFetch/xUnfetch implementation. The synchronous state machine captures most benefit with minimal complexity.
 - **Configuration migrated from env vars to URI parameters:** `readahead=auto|N`, `readahead_max=N`, `cache_pages=N`. Per team directive, no environment variables.
 - **Performance projections:** Sequential scans 9–15× fewer HTTP GETs (fixed 64 → adaptive max 1024). Index lookups eliminate 98% of bandwidth waste. Mixed OLTP 1.5–2× improvement during warmup.

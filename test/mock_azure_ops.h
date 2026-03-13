@@ -2,7 +2,7 @@
 ** mock_azure_ops.h — In-memory mock of the azure_ops_t interface
 **
 ** Provides a complete mock implementation of the Azure operations vtable
-** for unit testing the azqlite VFS without any network or Azure dependency.
+** for unit testing the sqliteObjs VFS without any network or Azure dependency.
 **
 ** Features:
 **   - Page blob simulation with 512-byte alignment enforcement

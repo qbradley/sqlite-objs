@@ -1,10 +1,10 @@
-# Azqlite Rust Quick Start
+# sqlite-objs Rust Quick Start
 
 ## Installation
 
 ```toml
 [dependencies]
-azqlite = { path = "../path/to/azqlite/rust/azqlite" }
+sqlite-objs = { path = "../path/to/sqlite-objs/rust/sqlite-objs" }
 rusqlite = "0.32"
 ```
 
@@ -12,7 +12,7 @@ Or when published to crates.io:
 
 ```toml
 [dependencies]
-azqlite = "0.1"
+sqlite-objs = "0.1"
 rusqlite = "0.32"
 ```
 
@@ -28,11 +28,11 @@ rusqlite = "0.32"
 ### URI Mode (Recommended)
 
 ```rust
-use azqlite::AzqliteVfs;
+use sqlite_objs::SqliteObjsVfs;
 use rusqlite::{Connection, OpenFlags};
 
 // Register VFS once at startup
-AzqliteVfs::register_uri(false)?;
+SqliteObjsVfs::register_uri(false)?;
 
 // Open database with Azure credentials in URI
 let conn = Connection::open_with_flags_and_vfs(
@@ -40,7 +40,7 @@ let conn = Connection::open_with_flags_and_vfs(
     OpenFlags::SQLITE_OPEN_READ_WRITE 
         | OpenFlags::SQLITE_OPEN_CREATE 
         | OpenFlags::SQLITE_OPEN_URI,
-    "azqlite"
+    "sqlite-objs"
 )?;
 
 // Use standard rusqlite API
@@ -50,7 +50,7 @@ conn.execute("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)", [])?;
 ### Environment Variable Mode
 
 ```rust
-use azqlite::AzqliteVfs;
+use sqlite_objs::SqliteObjsVfs;
 use rusqlite::{Connection, OpenFlags};
 
 // Set environment variables first:
@@ -58,21 +58,21 @@ use rusqlite::{Connection, OpenFlags};
 // export AZURE_STORAGE_CONTAINER=databases
 // export AZURE_STORAGE_SAS='sv=2024-08-04&...'
 
-AzqliteVfs::register(false)?;
+SqliteObjsVfs::register(false)?;
 
 let conn = Connection::open_with_flags_and_vfs(
     "mydb.db",
     OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_CREATE,
-    "azqlite"
+    "sqlite-objs"
 )?;
 ```
 
 ### Explicit Configuration
 
 ```rust
-use azqlite::{AzqliteVfs, AzqliteConfig};
+use sqlite_objs::{SqliteObjsVfs, SqliteObjsConfig};
 
-let config = AzqliteConfig {
+let config = SqliteObjsConfig {
     account: "myaccount".to_string(),
     container: "databases".to_string(),
     sas_token: Some("sv=2024-08-04&...".to_string()),
@@ -80,7 +80,7 @@ let config = AzqliteConfig {
     endpoint: None, // or Some("http://127.0.0.1:10000/devstoreaccount1".to_string()) for Azurite
 };
 
-AzqliteVfs::register_with_config(&config, false)?;
+SqliteObjsVfs::register_with_config(&config, false)?;
 ```
 
 ## Testing with Azurite
@@ -90,7 +90,7 @@ AzqliteVfs::register_with_config(&config, false)?;
 azurite-blob --silent --location /tmp/azurite &
 
 # Use Azurite endpoint in your config
-let config = AzqliteConfig {
+let config = SqliteObjsConfig {
     account: "devstoreaccount1".to_string(),
     container: "databases".to_string(),
     sas_token: None,
@@ -102,12 +102,12 @@ let config = AzqliteConfig {
 ## Error Handling
 
 ```rust
-use azqlite::{AzqliteVfs, AzqliteError};
+use sqlite_objs::{SqliteObjsVfs, SqliteObjsError};
 
-match AzqliteVfs::register_uri(false) {
+match SqliteObjsVfs::register_uri(false) {
     Ok(_) => println!("VFS registered"),
-    Err(AzqliteError::InvalidConfig(msg)) => eprintln!("Config error: {}", msg),
-    Err(AzqliteError::RegistrationFailed(msg)) => eprintln!("Registration failed: {}", msg),
+    Err(SqliteObjsError::InvalidConfig(msg)) => eprintln!("Config error: {}", msg),
+    Err(SqliteObjsError::RegistrationFailed(msg)) => eprintln!("Registration failed: {}", msg),
     Err(e) => eprintln!("Error: {}", e),
 }
 ```

@@ -6,7 +6,7 @@
 
 ## Problem Statement
 
-When azqlite opens an existing Azure-backed database, it must warm the
+When sqlite-objs opens an existing Azure-backed database, it must warm the
 local page cache before queries can execute efficiently. Without
 prefetching, every page access is a cold cache miss requiring an HTTP
 GET (~22ms to Azure). A TPC-C benchmark with ~22,000 pages showed
@@ -29,7 +29,7 @@ Different workloads need different strategies:
 ## URI Parameter Design
 
 ```
-file:db.db?vfs=azqlite&prefetch=<strategy>
+file:db.db?vfs=sqlite-objs&prefetch=<strategy>
 ```
 
 ### Strategy Values
@@ -40,7 +40,7 @@ file:db.db?vfs=azqlite&prefetch=<strategy>
 | `<N>` | Fixed: download the first N pages at open. Current behavior. Default: 1024 (4MB). |
 | `all` | Download the entire database if it fits in the cache. Falls back to fixed prefetch if DB > cache. |
 | `index` | Parse the SQLite btree structure and prefetch only interior (non-leaf) pages. These are the index and table root/branch pages that every query must traverse. |
-| `warm` | Load pages from a locally-saved working set file (`.azqlite-warm`) written at close time. On first open (no warm file), falls back to `all` if DB fits, else `index`. |
+| `warm` | Load pages from a locally-saved working set file (`.sqlite-objs-warm`) written at close time. On first open (no warm file), falls back to `all` if DB fits, else `index`. |
 
 ### Default
 
@@ -175,7 +175,7 @@ incrementally: first pass does breadth-first traversal from page 1.
 On `xClose`, write the set of cached page numbers to a local file:
 
 ```
-.azqlite-warm/<blobname>.pages
+.sqlite-objs-warm/<blobname>.pages
 ```
 
 Format: binary array of int32 page numbers, sorted. Header includes

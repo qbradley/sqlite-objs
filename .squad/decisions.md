@@ -39,10 +39,10 @@ Approved as Samwise proposed. Layers: C mocks (~300 tests, <5s), Azurite (~75, <
 
 ---
 
-### D6: VFS Name "azqlite", Non-Default, Delegating
+### D6: VFS Name "sqlite-objs", Non-Default, Delegating
 **Date:** 2026-03-10 | **From:** Gandalf (Design Review)
 
-Register as "azqlite" via `sqlite3_vfs_register(pVfs, 0)`. Delegate xDlOpen/xRandomness/xSleep/xCurrentTime to default VFS. Route temp files to default VFS xOpen.
+Register as "sqlite-objs" via `sqlite3_vfs_register(pVfs, 0)`. Delegate xDlOpen/xRandomness/xSleep/xCurrentTime to default VFS. Route temp files to default VFS xOpen.
 
 ---
 
@@ -77,7 +77,7 @@ GNU Makefile. Targets: all, test-unit, test-integration, test, clean, amalgamati
 ### D11: MVP 1 Scope
 **Date:** 2026-03-10 | **From:** Gandalf (Design Review)
 
-**IN:** Page blob DB, block blob journal, in-memory cache+write buffer, lease locking, journal mode, azure_ops_t vtable, SAS+SharedKey auth, retry logic, temp file delegation, VFS registration, Layer 1+2 tests, Makefile, azqlite-shell.
+**IN:** Page blob DB, block blob journal, in-memory cache+write buffer, lease locking, journal mode, azure_ops_t vtable, SAS+SharedKey auth, retry logic, temp file delegation, VFS registration, Layer 1+2 tests, Makefile, sqlite-objs-shell.
 
 **OUT:** WAL, LRU page cache, background lease renewal, multi-machine, Azure AD auth, connection pooling, HTTP/2, Content-MD5, amalgamation, Layers 3+4.
 
@@ -145,7 +145,7 @@ Integrate pkg-config into Makefile for discovering OpenSSL and libcurl compile/l
 **Date:** 2026-03-10 | **From:** Gandalf (Lead/Architect)
 
 Code approved for MVP 1 demo **pending two mechanical fixes**:
-- **C1 (azqlite_vfs.c:693):** Change device flags from `ATOMIC512|SAFE_APPEND` to `SEQUENTIAL|POWERSAFE_OVERWRITE|SUBPAGE_READ` (data corruption prevention)
+- **C1 (sqlite_objs_vfs.c:693):** Change device flags from `ATOMIC512|SAFE_APPEND` to `SEQUENTIAL|POWERSAFE_OVERWRITE|SUBPAGE_READ` (data corruption prevention)
 - **C2 (azure_client.c:173–187):** Replace `strcat` with bounds-checked `snprintf` (URL buffer overflow fix)
 
 No additional review required for these fixes — they are straightforward. Full code review in `research/code-review.md`.
@@ -194,7 +194,7 @@ Added `azure_container_create(azure_client_t *client, azure_error_t *err)` as pu
 ### D14: Benchmark Harness Design
 **Date:** 2026-03-10 | **From:** Aragorn (SQLite/C Dev)
 
-Three-binary architecture: lightweight harness that shells out to speedtest1 subprocesses. speedtest1 (standard SQLite) and speedtest1-azure (with azqlite VFS registered as default) run as isolated processes measured via `system()` and `gettimeofday()`. speedtest1.c used unmodified from SQLite upstream. Rejected embedding via #define main trick (speedtest1's `exit()` terminates harness before results capture) and patching upstream (maintenance burden).
+Three-binary architecture: lightweight harness that shells out to speedtest1 subprocesses. speedtest1 (standard SQLite) and speedtest1-azure (with sqlite-objs VFS registered as default) run as isolated processes measured via `system()` and `gettimeofday()`. speedtest1.c used unmodified from SQLite upstream. Rejected embedding via #define main trick (speedtest1's `exit()` terminates harness before results capture) and patching upstream (maintenance burden).
 
 **Usage:** `./benchmark --local-only --size 25`, `./benchmark --size 50` (full comparison with Azure env vars), `./benchmark --output csv` (automation).
 
@@ -265,11 +265,11 @@ Three-binary architecture: lightweight harness that shells out to speedtest1 sub
 
 **Problem:** xSync flushed each dirty page as a separate Azure Put Page request. For sequential workloads (100 contiguous dirty pages), this meant 100 HTTP round-trips (~10s).
 
-**Solution:** Implemented `coalesceDirtyRanges()` in `azqlite_vfs.c` — scans dirty bitmap left-to-right, merges contiguous dirty pages into single `azure_page_range_t` ranges, caps each at 4 MiB (Azure Put Page limit). Sequential fallback iterates coalesced ranges instead of individual pages.
+**Solution:** Implemented `coalesceDirtyRanges()` in `sqlite_objs_vfs.c` — scans dirty bitmap left-to-right, merges contiguous dirty pages into single `azure_page_range_t` ranges, caps each at 4 MiB (Azure Put Page limit). Sequential fallback iterates coalesced ranges instead of individual pages.
 
 **Files modified:**
-- `src/azure_client.h` — Added `azure_page_range_t` struct and `AZQLITE_MAX_PARALLEL_PUTS` define. Added `page_blob_write_batch` to end of `azure_ops_t` vtable (NULL until Phase 2 curl_multi).
-- `src/azqlite_vfs.c` — Added `coalesceDirtyRanges()`, rewrote `azqliteSync` MAIN_DB path: coalesce → try batch (NULL for now) → sequential fallback with lease renewal every 50 ranges.
+- `src/azure_client.h` — Added `azure_page_range_t` struct and `SQLITE_OBJS_MAX_PARALLEL_PUTS` define. Added `page_blob_write_batch` to end of `azure_ops_t` vtable (NULL until Phase 2 curl_multi).
+- `src/sqlite_objs_vfs.c` — Added `coalesceDirtyRanges()`, rewrote `sqlite-objsSync` MAIN_DB path: coalesce → try batch (NULL for now) → sequential fallback with lease renewal every 50 ranges.
 - `src/azure_client.c` — Added `.page_blob_write_batch = NULL` to production vtable.
 - `src/azure_client_stub.c` — Added `NULL` for `page_blob_write_batch` to stub vtable.
 - `test/mock_azure_ops.c` — Added `.page_blob_write_batch = NULL` to mock vtable.
@@ -290,7 +290,7 @@ Three-binary architecture: lightweight harness that shells out to speedtest1 sub
 
 Created custom TPC-C simplified OLTP benchmark to measure realistic transaction workloads (vs. upstream SQLite speedtest1 which is I/O focused). Benchmark suite:
 
-- **Two binaries:** `tpcc-local` (local SQLite only, no Azure deps), `tpcc-azure` (with azqlite VFS)
+- **Two binaries:** `tpcc-local` (local SQLite only, no Azure deps), `tpcc-azure` (with sqlite-objs VFS)
 - **Schema:** 8 tables (warehouse, district, customer, item, stock, orders, history)
 - **Transactions:** New Order (45%), Payment (43%), Order Status (12%)
 - **Metrics:** Per-transaction latency (p50, p95, p99), throughput (tps)
@@ -317,7 +317,7 @@ Created custom TPC-C simplified OLTP benchmark to measure realistic transaction 
 - **Approach:** Option B (test via xSync) — tests the full VFS integration path, validates real code execution
 - **Mock write recording:** `mock_write_record_t` tracking records `{offset, len}` for each page blob write call
 - **Gating strategy:** Coalescing-specific assertions (e.g., "100 contiguous pages → ≤2 writes") gated behind `ENABLE_COALESCE_TESTS`; correctness assertions always run
-- **maxranges_overflow test:** Requires `azqlite_test_coalesce_dirty_ranges()` exposed behind `AZQLITE_TESTING` flag for direct algorithm testing
+- **maxranges_overflow test:** Requires `sqlite_objs_test_coalesce_dirty_ranges()` exposed behind `SQLITE_OBJS_TESTING` flag for direct algorithm testing
 
 **Impact:** Write recording seam enables coalescing algorithm verification without exposing internals. All 9 coalescing tests pass; 1 gated test awaits algorithm exposure.
 

@@ -1,10 +1,10 @@
-# AZQLite VFS Test Infrastructure — Quick Reference
+# SQLite-Objs VFS Test Infrastructure — Quick Reference
 
 ## Essential Files
 - `/Users/qbradley/src/sqlite/test/test_harness.h` — Test macros & framework
 - `/Users/qbradley/src/sqlite/test/mock_azure_ops.h/c` — Mock Azure ops
 - `/Users/qbradley/src/sqlite/test/test_vfs.c` — 105 integration tests
-- `/Users/qbradley/src/sqlite/src/azqlite_vfs.c` — Production VFS implementation
+- `/Users/qbradley/src/sqlite/src/sqlite_objs_vfs.c` — Production VFS implementation
 
 ## Test Execution Pattern
 
@@ -49,7 +49,7 @@ mock_clear_write_records(ctx);
 
 **LRU Demand-Paging Cache**
 - Default: 1024 pages
-- Override: `export AZQLITE_CACHE_PAGES=2048`
+- Override: `export SQLITE_OBJS_CACHE_PAGES=2048`
 - Hash table for O(1) lookup
 - Doubly-linked LRU list for eviction
 
@@ -93,13 +93,13 @@ xSync()
 ## Key Constants
 
 ```c
-AZQLITE_DEFAULT_PAGE_SIZE       4096        // SQLite page size
-AZQLITE_LEASE_DURATION          30          // Standard lease (seconds)
-AZQLITE_LEASE_DURATION_LONG     60          // Extended lease for large flushes
-AZQLITE_DIRTY_PAGE_THRESHOLD    100         // Triggers extended lease
-AZQLITE_DEFAULT_CACHE_PAGES     1024        // LRU cache size
+SQLITE_OBJS_DEFAULT_PAGE_SIZE       4096        // SQLite page size
+SQLITE_OBJS_LEASE_DURATION          30          // Standard lease (seconds)
+SQLITE_OBJS_LEASE_DURATION_LONG     60          // Extended lease for large flushes
+SQLITE_OBJS_DIRTY_PAGE_THRESHOLD    100         // Triggers extended lease
+SQLITE_OBJS_DEFAULT_CACHE_PAGES     1024        // LRU cache size
 PAGE_BLOB_ALIGNMENT             512         // Enforced on offset & length
-AZQLITE_MAX_PUT_PAGE            (4*1024*1024) // 4 MiB max per page_blob_write range
+SQLITE_OBJS_MAX_PUT_PAGE            (4*1024*1024) // 4 MiB max per page_blob_write range
 ```
 
 ## VFS Operations Routing
@@ -217,8 +217,8 @@ mock_clear_write_records(ctx);
 ## Environment Variables
 
 ```bash
-export AZQLITE_CACHE_PAGES=2048      # Override default 1024 pages
-export AZQLITE_DEBUG_TIMING=1        # Enable timing output in xSync
+export SQLITE_OBJS_CACHE_PAGES=2048      # Override default 1024 pages
+export SQLITE_OBJS_DEBUG_TIMING=1        # Enable timing output in xSync
 ```
 
 ## Common Test Patterns

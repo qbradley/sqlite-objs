@@ -1,12 +1,12 @@
-# azqlite
+# sqlite-objs
 
 A drop-in SQLite replacement where all storage is backed by Azure Blob Storage.
 
-azqlite implements a custom SQLite VFS (Virtual File System) layer that stores database files as Azure Page Blobs and journal files as Azure Block Blobs. This enables cloud-native SQLite databases with durability guarantees — if a transaction commits and the machine disappears, a new machine can connect and see all committed data after normal SQLite recovery.
+sqlite-objs implements a custom SQLite VFS (Virtual File System) layer that stores database files as Azure Page Blobs and journal files as Azure Block Blobs. This enables cloud-native SQLite databases with durability guarantees — if a transaction commits and the machine disappears, a new machine can connect and see all committed data after normal SQLite recovery.
 
 ## Features
 
-- **Drop-in replacement**: Use standard SQLite APIs — just register the azqlite VFS
+- **Drop-in replacement**: Use standard SQLite APIs — just register the sqlite-objs VFS
 - **Azure Page Blobs for database files**: Random read/write with 512-byte alignment
 - **Azure Block Blobs for journals**: Sequential write, whole-object semantics
 - **Lease-based locking**: Azure blob leases provide distributed write exclusion
@@ -48,8 +48,8 @@ make all-production
 ```
 
 This produces:
-- `build/libazqlite.a` — static library
-- `azqlite-shell` — SQLite shell with azqlite VFS
+- `build/libsqlite_objs.a` — static library
+- `sqlite-objs-shell` — SQLite shell with sqlite-objs VFS
 
 ## Testing
 
@@ -75,7 +75,7 @@ Runs 10 tests against a local Azurite instance.
 
 ### Benchmarks
 
-Compare local SQLite vs azqlite performance using SQLite's official speedtest1 benchmark:
+Compare local SQLite vs sqlite-objs performance using SQLite's official speedtest1 benchmark:
 
 ```bash
 cd benchmark
@@ -142,13 +142,13 @@ az storage container generate-sas \
 
 ```bash
 # Environment variable mode:
-./azqlite-shell mydb.db
+./sqlite-objs-shell mydb.db
 
 # URI mode (no environment variables needed):
-./azqlite-shell --uri "file:mydb.db?azure_account=myacct&azure_container=mycontainer&azure_sas=sv%3D2024..."
+./sqlite-objs-shell --uri "file:mydb.db?azure_account=myacct&azure_container=mycontainer&azure_sas=sv%3D2024..."
 ```
 
-The shell automatically registers the azqlite VFS. Your database file `mydb.db` will be stored as a page blob in the configured container.
+The shell automatically registers the sqlite-objs VFS. Your database file `mydb.db` will be stored as a page blob in the configured container.
 
 ```sql
 sqlite> CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT);
@@ -161,12 +161,12 @@ sqlite> .quit
 ### Programmatic Usage (C)
 
 ```c
-#include "azqlite.h"
+#include "sqlite_objs.h"
 #include <sqlite3.h>
 
 int main() {
-    // Register azqlite VFS (reads config from environment)
-    int rc = azqlite_register_vfs("azqlite", 1);  // 1 = make default
+    // Register sqlite-objs VFS (reads config from environment)
+    int rc = sqlite_objs_register_vfs("sqlite-objs", 1);  // 1 = make default
     if (rc != SQLITE_OK) {
         fprintf(stderr, "Failed to register VFS\n");
         return 1;
@@ -200,7 +200,7 @@ int main() {
 
 ### Locking Model
 
-azqlite uses Azure blob leases for write exclusion:
+sqlite-objs uses Azure blob leases for write exclusion:
 
 - **SHARED lock**: No lease required (read-only)
 - **RESERVED/PENDING/EXCLUSIVE**: 30-second lease acquired
@@ -221,14 +221,14 @@ Instead of environment variables, you can pass Azure credentials directly in the
 
 ```c
 // Register VFS without any global credentials
-azqlite_vfs_register_uri(1);  // 1 = make default
+sqlite_objs_vfs_register_uri(1);  // 1 = make default
 
 // Open with credentials in the URI
 sqlite3_open_v2(
     "file:mydb.db?azure_account=myacct&azure_container=mycontainer&azure_sas=sv%3D2024...",
     &db,
     SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_URI,
-    "azqlite"
+    "sqlite-objs"
 );
 ```
 
@@ -264,7 +264,7 @@ MIT License. See [LICENSE](LICENSE) for details.
 
 ## Contributing
 
-This project was built by the azqlite Squad:
+This project was built by the sqlite-objs Squad:
 - 🏗️ Gandalf — Lead/Architect
 - 🔧 Aragorn — SQLite/C Expert  
 - 🔵 Frodo — Azure Expert

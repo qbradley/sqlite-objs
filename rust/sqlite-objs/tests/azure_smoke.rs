@@ -1,4 +1,4 @@
-//! Azure Blob Storage smoke tests for the azqlite Rust crate.
+//! Azure Blob Storage smoke tests for the sqlite-objs Rust crate.
 //!
 //! These tests require live Azure credentials via environment variables:
 //!   AZURE_STORAGE_ACCOUNT, AZURE_STORAGE_CONTAINER, AZURE_STORAGE_SAS
@@ -6,7 +6,7 @@
 //! Run with: cargo test --test azure_smoke
 //! Skip with: cargo test (these are ignored by default)
 
-use azqlite::AzqliteVfs;
+use sqlite_objs::SqliteObjsVfs;
 use rusqlite::{Connection, OpenFlags};
 use std::sync::Once;
 
@@ -14,7 +14,7 @@ static REGISTER_VFS: Once = Once::new();
 
 fn register_vfs() {
     REGISTER_VFS.call_once(|| {
-        AzqliteVfs::register_uri(false).expect("VFS registration should succeed");
+        SqliteObjsVfs::register_uri(false).expect("VFS registration should succeed");
     });
 }
 
@@ -55,7 +55,7 @@ fn smoke_create_table_insert_query() {
         | OpenFlags::SQLITE_OPEN_URI;
 
     let conn =
-        Connection::open_with_flags_and_vfs(&uri, flags, "azqlite").expect("Failed to open DB");
+        Connection::open_with_flags_and_vfs(&uri, flags, "sqlite-objs").expect("Failed to open DB");
 
     // Create table
     conn.execute_batch("DROP TABLE IF EXISTS smoke_test")
@@ -120,7 +120,7 @@ fn smoke_multiple_transactions() {
         | OpenFlags::SQLITE_OPEN_URI;
 
     let mut conn =
-        Connection::open_with_flags_and_vfs(&uri, flags, "azqlite").expect("Failed to open DB");
+        Connection::open_with_flags_and_vfs(&uri, flags, "sqlite-objs").expect("Failed to open DB");
 
     conn.execute_batch("DROP TABLE IF EXISTS txn_test")
         .expect("DROP TABLE failed");
@@ -179,7 +179,7 @@ fn smoke_reopen_persists() {
 
     // Open, create, insert, close
     {
-        let conn = Connection::open_with_flags_and_vfs(&uri, flags, "azqlite")
+        let conn = Connection::open_with_flags_and_vfs(&uri, flags, "sqlite-objs")
             .expect("Failed to open DB (write)");
 
         conn.execute_batch("DROP TABLE IF EXISTS persist_test")
@@ -192,7 +192,7 @@ fn smoke_reopen_persists() {
 
     // Reopen and verify data persisted
     {
-        let conn = Connection::open_with_flags_and_vfs(&uri, flags, "azqlite")
+        let conn = Connection::open_with_flags_and_vfs(&uri, flags, "sqlite-objs")
             .expect("Failed to open DB (read)");
 
         let val: i32 = conn

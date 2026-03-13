@@ -1,6 +1,6 @@
 [package]
-name = "azqlite-sys"
-description = "Raw FFI bindings to azqlite C library"
+name = "sqlite-objs-sys"
+description = "Raw FFI bindings to sqlite-objs C library"
 version.workspace = true
 authors.workspace = true
 edition.workspace = true
@@ -8,7 +8,7 @@ license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 
-links = "azqlite"
+links = "sqlite-objs"
 build = "build.rs"
 
 [dependencies]

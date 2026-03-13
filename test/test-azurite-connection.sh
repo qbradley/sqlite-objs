@@ -14,7 +14,7 @@ sleep 3
 
 # Test connection
 echo "Testing connection..."
-curl -v "http://127.0.0.1:10000/devstoreaccount1/azqlite-test?restype=container&comp=list" 2>&1 | head -20
+curl -v "http://127.0.0.1:10000/devstoreaccount1/sqlite-objs-test?restype=container&comp=list" 2>&1 | head -20
 
 # Kill Azurite
 kill $AZURITE_PID 2>/dev/null || true

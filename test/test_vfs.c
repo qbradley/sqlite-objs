@@ -1,5 +1,5 @@
 /*
-** test_vfs.c — VFS Unit Tests (Layer 1) for azqlite
+** test_vfs.c — VFS Unit Tests (Layer 1) for sqliteObjs
 **
 ** Tests the VFS through SQLite's API with mock_azure_ops underneath.
 ** Until the VFS implementation exists (Aragorn is building it), these
@@ -8,7 +8,7 @@
 ** Each test follows: setup mock → perform SQLite operation → assert
 ** mock state + SQLite result.
 **
-** Since azqlite_vfs.c doesn't exist yet, we test what we CAN test
+** Since sqlite_objs_vfs.c doesn't exist yet, we test what we CAN test
 ** (the mock itself, the types, the interface contract) and write the
 ** VFS integration tests as compile-ready stubs that will link once
 ** Aragorn delivers the VFS.
@@ -1314,23 +1314,23 @@ TEST(concurrent_page_and_block_blobs) {
 /* ══════════════════════════════════════════════════════════════════════
 ** SECTION 12: VFS Integration Tests (stubs)
 **
-** These tests require the azqlite VFS implementation. They document
+** These tests require the sqliteObjs VFS implementation. They document
 ** the expected behavior and will be enabled once Aragorn delivers
-** azqlite_vfs.c. For now they serve as the spec-in-code.
+** sqlite_objs_vfs.c. For now they serve as the spec-in-code.
 **
 ** Uncomment ENABLE_VFS_INTEGRATION to activate.
 ** ══════════════════════════════════════════════════════════════════════ */
 
 #ifdef ENABLE_VFS_INTEGRATION
 
-#include "../src/azqlite.h"
+#include "../src/sqlite_objs.h"
 
 static sqlite3 *open_test_db(mock_azure_ctx_t *mctx) {
     sqlite3 *db = NULL;
-    azqlite_vfs_register_with_ops(mock_azure_get_ops(), mctx, 0);
+    sqlite_objs_vfs_register_with_ops(mock_azure_get_ops(), mctx, 0);
     int rc = sqlite3_open_v2("test.db", &db,
                               SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE,
-                              "azqlite");
+                              "sqlite-objs");
     return (rc == SQLITE_OK) ? db : NULL;
 }
 
@@ -1342,34 +1342,34 @@ static void close_test_db(sqlite3 *db) {
 
 TEST(vfs_registers_with_correct_name) {
     setup();
-    azqlite_vfs_register_with_ops(g_ops, g_ctx, 0);
-    sqlite3_vfs *vfs = sqlite3_vfs_find("azqlite");
+    sqlite_objs_vfs_register_with_ops(g_ops, g_ctx, 0);
+    sqlite3_vfs *vfs = sqlite3_vfs_find("sqlite-objs");
     ASSERT_NOT_NULL(vfs);
-    ASSERT_STR_EQ(vfs->zName, "azqlite");
+    ASSERT_STR_EQ(vfs->zName, "sqlite-objs");
 }
 
 TEST(vfs_not_default_unless_requested) {
     setup();
     sqlite3_vfs *before = sqlite3_vfs_find(NULL);
-    azqlite_vfs_register_with_ops(g_ops, g_ctx, 0);
+    sqlite_objs_vfs_register_with_ops(g_ops, g_ctx, 0);
     sqlite3_vfs *after = sqlite3_vfs_find(NULL);
     ASSERT_TRUE(before == after);
 }
 
 TEST(vfs_can_be_default) {
     setup();
-    azqlite_vfs_register_with_ops(g_ops, g_ctx, 1);
+    sqlite_objs_vfs_register_with_ops(g_ops, g_ctx, 1);
     sqlite3_vfs *def = sqlite3_vfs_find(NULL);
-    ASSERT_STR_EQ(def->zName, "azqlite");
+    ASSERT_STR_EQ(def->zName, "sqlite-objs");
 }
 
 TEST(vfs_open_with_name_parameter) {
     setup();
-    azqlite_vfs_register_with_ops(g_ops, g_ctx, 0);
+    sqlite_objs_vfs_register_with_ops(g_ops, g_ctx, 0);
     sqlite3 *db = NULL;
     int rc = sqlite3_open_v2("test.db", &db,
                               SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE,
-                              "azqlite");
+                              "sqlite-objs");
     ASSERT_OK(rc);
     ASSERT_NOT_NULL(db);
     close_test_db(db);
@@ -1593,10 +1593,10 @@ TEST(vfs_lease_conflict_returns_busy) {
     g_ops->lease_acquire(g_ctx, "test.db", 30, id, sizeof(id), &err);
 
     /* Now try to open and write — should get SQLITE_BUSY */
-    azqlite_vfs_register_with_ops(g_ops, g_ctx, 0);
+    sqlite_objs_vfs_register_with_ops(g_ops, g_ctx, 0);
     sqlite3 *db;
     sqlite3_open_v2("test.db", &db,
-                     SQLITE_OPEN_READWRITE, "azqlite");
+                     SQLITE_OPEN_READWRITE, "sqlite-objs");
 
     int rc = sqlite3_exec(db, "INSERT INTO t VALUES(1);", NULL, NULL, NULL);
     ASSERT_ERR(rc, SQLITE_BUSY);
@@ -1629,10 +1629,10 @@ TEST(vfs_azure_read_failure_on_open) {
 
     mock_set_fail_operation(g_ctx, "page_blob_read", AZURE_ERR_NETWORK);
 
-    azqlite_vfs_register_with_ops(g_ops, g_ctx, 0);
+    sqlite_objs_vfs_register_with_ops(g_ops, g_ctx, 0);
     sqlite3 *db;
     int rc = sqlite3_open_v2("broken.db", &db,
-                              SQLITE_OPEN_READWRITE, "azqlite");
+                              SQLITE_OPEN_READWRITE, "sqlite-objs");
     ASSERT_NE(rc, SQLITE_OK);
 
     mock_clear_failures(g_ctx);
@@ -2201,38 +2201,38 @@ TEST(vfs_close_releases_lease_on_failure) {
 
 TEST(vfs_path_traversal_rejected) {
     setup();
-    azqlite_vfs_register_with_ops(g_ops, g_ctx, 0);
+    sqlite_objs_vfs_register_with_ops(g_ops, g_ctx, 0);
     sqlite3 *db = NULL;
 
     /* Blob name with ".." path traversal should be rejected */
     int rc = sqlite3_open_v2("../../etc/passwd", &db,
                               SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE,
-                              "azqlite");
+                              "sqlite-objs");
     ASSERT_NE(rc, SQLITE_OK);
     if (db) sqlite3_close(db);
 }
 
 TEST(vfs_path_traversal_in_directory) {
     setup();
-    azqlite_vfs_register_with_ops(g_ops, g_ctx, 0);
+    sqlite_objs_vfs_register_with_ops(g_ops, g_ctx, 0);
     sqlite3 *db = NULL;
 
     int rc = sqlite3_open_v2("foo/../bar/db.sqlite", &db,
                               SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE,
-                              "azqlite");
+                              "sqlite-objs");
     ASSERT_NE(rc, SQLITE_OK);
     if (db) sqlite3_close(db);
 }
 
 TEST(vfs_empty_name_rejected) {
     setup();
-    azqlite_vfs_register_with_ops(g_ops, g_ctx, 0);
+    sqlite_objs_vfs_register_with_ops(g_ops, g_ctx, 0);
     sqlite3 *db = NULL;
 
     /* Empty name - SQLite may treat this as in-memory db or fail */
     int rc = sqlite3_open_v2("", &db,
                               SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE,
-                              "azqlite");
+                              "sqlite-objs");
     /* Either it fails, or it creates an in-memory db that doesn't touch Azure */
     if (rc == SQLITE_OK) {
         /* If it succeeds, verify no Azure operations were performed */
@@ -2246,13 +2246,13 @@ TEST(vfs_empty_name_rejected) {
 
 TEST(vfs_leading_slashes_stripped) {
     setup();
-    azqlite_vfs_register_with_ops(g_ops, g_ctx, 0);
+    sqlite_objs_vfs_register_with_ops(g_ops, g_ctx, 0);
 
     /* Open a db with leading slashes — should be normalized */
     sqlite3 *db = NULL;
     int rc = sqlite3_open_v2("///test.db", &db,
                               SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE,
-                              "azqlite");
+                              "sqlite-objs");
     /* Should succeed and create blob named "test.db" (not "///test.db") */
     ASSERT_OK(rc);
     ASSERT_NOT_NULL(db);

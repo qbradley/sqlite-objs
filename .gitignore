@@ -4,7 +4,7 @@ build/
 *.a
 
 # Binaries
-azqlite-shell
+sqlite-objs-shell
 benchmark/speedtest1-azure
 benchmark/tpcc/tpcc-azure
 benchmark/tpcc/tpcc-local

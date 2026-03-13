@@ -1,6 +1,6 @@
 # Squad Team
 
-> Azure Blob-backed SQLite (azqlite)
+> Azure Blob-backed SQLite (sqlite-objs)
 
 ## Coordinator
 
@@ -23,7 +23,7 @@
 
 ## Project Context
 
-- **Project:** Azure Blob-backed SQLite (azqlite)
+- **Project:** Azure Blob-backed SQLite (sqlite-objs)
 - **User:** Quetzal Bradley
 - **Stack:** C, SQLite VFS API, Azure Blob Storage REST API, libcurl, OpenSSL
 - **License:** MIT

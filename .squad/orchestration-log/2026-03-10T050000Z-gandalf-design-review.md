@@ -19,7 +19,7 @@
 | D3 | Two-Level Lease-Based Locking | ✅ APPROVED |
 | D4 | Full-Blob Cache from Day 1 | ✅ APPROVED |
 | D5 | 4-Layer Testing Pyramid with azure_ops_t Vtable | ✅ APPROVED |
-| D6 | VFS Name "azqlite", Non-Default, Delegating | ✅ APPROVED |
+| D6 | VFS Name "sqlite-objs", Non-Default, Delegating | ✅ APPROVED |
 | D7 | Filename = Blob Name, Container from Env Vars | ✅ APPROVED |
 | D8 | Azure Errors → SQLITE_BUSY or SQLITE_IOERR | ✅ APPROVED |
 | D9 | Both SAS + Shared Key Auth | ✅ APPROVED |

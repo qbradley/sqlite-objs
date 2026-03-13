@@ -1,6 +1,6 @@
-# Test Matrix for azqlite
+# Test Matrix for sqlite-objs
 
-> Comprehensive test coverage matrix for the azqlite SQLite VFS backed by Azure Blob Storage.
+> Comprehensive test coverage matrix for the sqlite-objs SQLite VFS backed by Azure Blob Storage.
 >
 > **Legend:** ✅ Covered | ⚠️ Partial | ❌ Missing
 >
@@ -21,7 +21,7 @@
 
 ## 1. VFS Layer Tests
 
-Source: `src/azqlite_vfs.c` (1,167 lines)
+Source: `src/sqlite_objs_vfs.c` (1,167 lines)
 Tests: `test/test_vfs.c` (118 tests)
 
 ### 1.1 File Operations
@@ -419,7 +419,7 @@ AVAILABLE ──→ LEASED ──→ BREAKING ──→ AVAILABLE
 | Lease ID buffer (37 bytes) — exact fit | ⚠️ | **P2** |
 | `azure_buffer_t` — growth overflow | ❌ | **P1** |
 | URL buffer — long account/container/blob | ❌ | **P1** |
-| `azqliteFullPathname` — path buffer | ❌ | **P2** |
+| `sqlite-objsFullPathname` — path buffer | ❌ | **P2** |
 
 ### 5.3 Integer Overflow Risks
 
@@ -475,7 +475,7 @@ AVAILABLE ──→ LEASED ──→ BREAKING ──→ AVAILABLE
 
 | File | Line Coverage (Est.) | Branch Coverage (Est.) | Notes |
 |------|---------------------|----------------------|-------|
-| `azqlite_vfs.c` | ~70% | ~50% | Error paths and delegation poorly covered |
+| `sqlite_objs_vfs.c` | ~70% | ~50% | Error paths and delegation poorly covered |
 | `azure_client.c` | ~40% | ~30% | Production client only tested via integration |
 | `azure_auth.c` | ~60% | ~50% | Happy paths well tested, error paths missing |
 | `azure_error.c` | ~75% | ~60% | Good coverage, needs fuzz testing |

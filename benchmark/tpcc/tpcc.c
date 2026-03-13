@@ -1,7 +1,7 @@
 /*
 ** tpcc.c - TPC-C OLTP Benchmark for SQLite
 **
-** Measures OLTP performance against local SQLite vs azqlite (Azure blob-backed)
+** Measures OLTP performance against local SQLite vs sqliteObjs (Azure blob-backed)
 **
 ** Usage:
 **   ./tpcc --local --warehouses 1 --duration 60
@@ -15,7 +15,7 @@
 #include <sys/time.h>
 #include <unistd.h>
 #include "sqlite3.h"
-#include "azqlite.h"
+#include "sqlite_objs.h"
 #include "tpcc_schema.h"
 
 /* Forward declarations from other TPC-C modules */
@@ -153,7 +153,7 @@ static void print_usage(const char *prog) {
   fprintf(stderr, "\n");
   fprintf(stderr, "Options:\n");
   fprintf(stderr, "  --local            Use local SQLite (default VFS)\n");
-  fprintf(stderr, "  --azure            Use azqlite (Azure blob-backed VFS)\n");
+  fprintf(stderr, "  --azure            Use sqliteObjs (Azure blob-backed VFS)\n");
   fprintf(stderr, "  --uri              Use URI-based Azure config (no env vars needed)\n");
   fprintf(stderr, "  --account NAME     Azure storage account (with --uri)\n");
   fprintf(stderr, "  --container NAME   Azure container name (with --uri)\n");
@@ -209,7 +209,7 @@ static int run_benchmark(benchmark_config_t *config) {
   
   printf("\nTPC-C Benchmark Configuration\n");
   printf("=================================================================\n");
-  printf("Mode:       %s\n", config->use_uri ? "azure (URI-mode VFS)" : config->use_azure ? "azure (azqlite VFS)" : "local (default VFS)");
+  printf("Mode:       %s\n", config->use_uri ? "azure (URI-mode VFS)" : config->use_azure ? "azure (sqliteObjs VFS)" : "local (default VFS)");
   if (config->use_wal) {
     printf("Journal:    WAL (write-ahead logging)\n");
   } else {
@@ -223,35 +223,35 @@ static int run_benchmark(benchmark_config_t *config) {
   
   /* Open database */
   if (config->use_uri) {
-#ifdef AZQLITE_VFS_AVAILABLE
+#ifdef SQLITE_OBJS_VFS_AVAILABLE
     /* URI mode: register VFS with no global client */
-    rc = azqlite_vfs_register_uri(1);
+    rc = sqlite_objs_vfs_register_uri(1);
     if (rc != SQLITE_OK) {
-      fprintf(stderr, "Failed to register azqlite URI-mode VFS\n");
+      fprintf(stderr, "Failed to register sqliteObjs URI-mode VFS\n");
       return 1;
     }
     
     rc = sqlite3_open_v2(config->db_path, &db, 
                          SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_URI,
-                         "azqlite");
+                         "sqlite-objs");
 #else
     fprintf(stderr, "Error: URI mode requested but binary not built with Azure support\n");
     fprintf(stderr, "Build with 'make all-production' to enable Azure mode\n");
     return 1;
 #endif
   } else if (config->use_azure) {
-#ifdef AZQLITE_VFS_AVAILABLE
-    /* Register azqlite VFS */
+#ifdef SQLITE_OBJS_VFS_AVAILABLE
+    /* Register sqliteObjs VFS */
 
-    rc = azqlite_vfs_register(1);
+    rc = sqlite_objs_vfs_register(1);
     if (rc != SQLITE_OK) {
-      fprintf(stderr, "Failed to register azqlite VFS\n");
+      fprintf(stderr, "Failed to register sqliteObjs VFS\n");
       return 1;
     }
     
     rc = sqlite3_open_v2(config->db_path, &db, 
                          SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE,
-                         "azqlite");
+                         "sqlite-objs");
 #else
     fprintf(stderr, "Error: Azure mode requested but binary not built with Azure support\n");
     fprintf(stderr, "Build with 'make all-production' to enable Azure mode\n");
@@ -465,7 +465,7 @@ static int run_benchmark(benchmark_config_t *config) {
   printf("\n=================================================================\n");
   printf("\nTPC-C Benchmark Results\n");
   printf("=================================================================\n");
-  printf("Mode:       %s\n", config->use_uri ? "azure (URI-mode VFS)" : config->use_azure ? "azure (azqlite VFS)" : "local (default VFS)");
+  printf("Mode:       %s\n", config->use_uri ? "azure (URI-mode VFS)" : config->use_azure ? "azure (sqliteObjs VFS)" : "local (default VFS)");
   printf("Journal:    %s\n", config->use_wal ? "WAL" : "DELETE");
   printf("Warehouses: %d\n", config->num_warehouses);
   printf("Duration:   %.1f seconds\n", elapsed);

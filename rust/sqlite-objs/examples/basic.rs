@@ -1,4 +1,4 @@
-//! Basic example showing how to use azqlite with rusqlite.
+//! Basic example showing how to use sqlite-objs with rusqlite.
 //!
 //! This example demonstrates VFS registration and basic API usage.
 //! The VFS integrates with rusqlite's standard APIs.
@@ -15,17 +15,17 @@
 //!
 //! See the README for full usage examples with Azure credentials.
 
-use azqlite::AzqliteVfs;
+use sqlite_objs::SqliteObjsVfs;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    println!("=== Azqlite Basic Example ===\n");
+    println!("=== sqlite-objs Basic Example ===\n");
 
     // Demonstrate VFS registration in URI mode
-    println!("Registering azqlite VFS in URI mode...");
-    AzqliteVfs::register_uri(false)?;
+    println!("Registering sqlite-objs VFS in URI mode...");
+    SqliteObjsVfs::register_uri(false)?;
     println!("✓ VFS registered successfully\n");
 
-    println!("The azqlite VFS is now available for use with rusqlite.");
+    println!("The sqlite-objs VFS is now available for use with rusqlite.");
     println!("To open a database with Azure Blob Storage:\n");
     
     println!("  use rusqlite::{{Connection, OpenFlags}};");
@@ -33,7 +33,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("  let conn = Connection::open_with_flags_and_vfs(");
     println!("      \"file:mydb.db?azure_account=acct&azure_container=cont&azure_sas=token\",");
     println!("      OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_CREATE | OpenFlags::SQLITE_OPEN_URI,");
-    println!("      \"azqlite\"");
+    println!("      \"sqlite-objs\"");
     println!("  )?;\n");
 
     println!("Or use environment variables:");
@@ -41,11 +41,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("  export AZURE_STORAGE_CONTAINER=databases");
     println!("  export AZURE_STORAGE_SAS='sv=2024-08-04&...'");
     println!("  ");
-    println!("  AzqliteVfs::register(false)?;");
+    println!("  SqliteObjsVfs::register(false)?;");
     println!("  let conn = Connection::open_with_flags_and_vfs(");
     println!("      \"mydb.db\",");
     println!("      OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_CREATE,");
-    println!("      \"azqlite\"");
+    println!("      \"sqlite-objs\"");
     println!("  )?;\n");
 
     println!("✓ Example complete");

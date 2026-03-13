@@ -1,4 +1,4 @@
-# Azure Blob Storage Analysis for azqlite
+# Azure Blob Storage Analysis for sqlite-objs
 
 > Research findings from the Azure REST API proof-of-concept.
 > Author: Frodo (Azure Expert) | Date: 2026-03-10

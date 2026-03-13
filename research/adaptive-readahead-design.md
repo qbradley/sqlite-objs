@@ -105,15 +105,15 @@ For index lookups on the same database, each B-tree traversal touches 3–5 scat
 
 ### 3.1 State Data
 
-Added to the `azqliteFile` struct:
+Added to the `sqlite-objsFile` struct:
 
 ```c
 /* Adaptive readahead state — per-file, per-connection */
-typedef struct azqlite_readahead {
+typedef struct sqlite_objs_readahead {
     int state;           /* RA_INITIAL, RA_SEQUENTIAL, or RA_RANDOM    */
     int lastMissPage;    /* Page number of last cache miss (-1 = none) */
     int window;          /* Current readahead window (pages)           */
-} azqlite_readahead_t;
+} sqlite_objs_readahead_t;
 ```
 
 **Size:** 12 bytes. Negligible overhead per connection.
@@ -163,7 +163,7 @@ If P falls inside the last readahead window (L < P < L+W), a readahead page was 
 ** Determine readahead window for a cache miss at page P.
 ** Updates state in-place. Returns the number of pages to readahead.
 */
-static int readaheadOnMiss(azqlite_readahead_t *ra, int P, int maxWindow, int maxPages) {
+static int readaheadOnMiss(sqlite_objs_readahead_t *ra, int P, int maxWindow, int maxPages) {
     int L = ra->lastMissPage;
     int W = ra->window;
     int result;
@@ -278,17 +278,17 @@ Compare to current fixed 64-page readahead: 262,144 / 64 = **4,096 GETs × ~23ms
 ### 4.1 Struct Changes
 
 ```c
-/* In azqliteFile (src/azqlite_vfs.c, ~line 297): */
-typedef struct azqliteFile {
+/* In sqlite-objsFile (src/sqlite_objs_vfs.c, ~line 297): */
+typedef struct sqlite-objsFile {
     /* ... existing fields ... */
 
     /* Adaptive readahead state (per-file, per-connection) */
-    azqlite_readahead_t readahead;
+    sqlite_objs_readahead_t readahead;
 
     /* Readahead configuration */
     int readaheadMode;       /* 0=auto (adaptive), >0=fixed N pages */
     int readaheadMaxWindow;  /* Max window for adaptive mode */
-} azqliteFile;
+} sqlite-objsFile;
 ```
 
 ### 4.2 xRead Modification
@@ -296,7 +296,7 @@ typedef struct azqliteFile {
 The change is surgical — replace the fixed `cacheGetReadaheadPages()` call with the adaptive state machine. The readahead fetch loop (lines 693–748 of current code) is unchanged.
 
 ```c
-/* CURRENT CODE (azqlite_vfs.c:693): */
+/* CURRENT CODE (sqlite_objs_vfs.c:693): */
 int readaheadPages = cacheGetReadaheadPages();
 
 /* REPLACEMENT: */
@@ -325,7 +325,7 @@ None of this changes. Only the *number of pages* in the readahead window changes
 ### 4.3 xOpen Initialisation
 
 ```c
-/* In azqliteOpen, after cache init: */
+/* In sqlite-objsOpen, after cache init: */
 p->readahead.state = RA_INITIAL;
 p->readahead.lastMissPage = -1;
 p->readahead.window = 0;
@@ -379,25 +379,25 @@ All configuration via [SQLite URI filenames](https://www.sqlite.org/uri.html). N
 |---|---|---|---|
 | `readahead` | `auto` or integer | `auto` | `auto` = adaptive state machine. Integer N = fixed N-page readahead. `0` = demand-only (no readahead). |
 | `readahead_max` | integer | 1024 | Maximum readahead window for adaptive mode (pages). Ignored in fixed mode. |
-| `cache_pages` | integer | 262144 | Maximum cache pages (replaces `AZQLITE_CACHE_PAGES` env var). |
+| `cache_pages` | integer | 262144 | Maximum cache pages (replaces `SQLITE_OBJS_CACHE_PAGES` env var). |
 
 **Usage examples:**
 
 ```sql
 -- Adaptive readahead (default, recommended)
-.open file:mydb.db?vfs=azqlite
+.open file:mydb.db?vfs=sqlite-objs
 
 -- Fixed 64-page readahead (legacy behaviour)
-.open file:mydb.db?vfs=azqlite&readahead=64
+.open file:mydb.db?vfs=sqlite-objs&readahead=64
 
 -- Demand-only, no readahead (for pure random workloads)
-.open file:mydb.db?vfs=azqlite&readahead=0
+.open file:mydb.db?vfs=sqlite-objs&readahead=0
 
 -- Aggressive readahead for known-sequential workloads
-.open file:mydb.db?vfs=azqlite&readahead_max=4096
+.open file:mydb.db?vfs=sqlite-objs&readahead_max=4096
 
 -- Small cache with adaptive readahead
-.open file:mydb.db?vfs=azqlite&cache_pages=1024
+.open file:mydb.db?vfs=sqlite-objs&cache_pages=1024
 ```
 
 ### 5.2 sqlite3_file_control Interface
@@ -405,33 +405,33 @@ All configuration via [SQLite URI filenames](https://www.sqlite.org/uri.html). N
 For programmatic control from application code:
 
 ```c
-#define AZQLITE_FCNTL_READAHEAD_MODE  (SQLITE_FCNTL_SIZE + 100)
-#define AZQLITE_FCNTL_READAHEAD_STATS (SQLITE_FCNTL_SIZE + 101)
+#define SQLITE_OBJS_FCNTL_READAHEAD_MODE  (SQLITE_FCNTL_SIZE + 100)
+#define SQLITE_OBJS_FCNTL_READAHEAD_STATS (SQLITE_FCNTL_SIZE + 101)
 
 /* Set readahead mode */
 int mode = 0; /* 0=adaptive, >0=fixed N pages */
-sqlite3_file_control(db, "main", AZQLITE_FCNTL_READAHEAD_MODE, &mode);
+sqlite3_file_control(db, "main", SQLITE_OBJS_FCNTL_READAHEAD_MODE, &mode);
 
 /* Read readahead statistics */
-typedef struct azqlite_readahead_stats {
+typedef struct sqlite_objs_readahead_stats {
     int currentState;     /* RA_INITIAL, RA_SEQUENTIAL, RA_RANDOM */
     int currentWindow;    /* Current readahead window (pages) */
     int lastMissPage;     /* Last miss page number */
     int totalMisses;      /* Total cache misses since xOpen */
     int sequentialMisses; /* Misses classified as sequential */
     int randomMisses;     /* Misses classified as random */
-} azqlite_readahead_stats_t;
+} sqlite_objs_readahead_stats_t;
 
-azqlite_readahead_stats_t stats;
-sqlite3_file_control(db, "main", AZQLITE_FCNTL_READAHEAD_STATS, &stats);
+sqlite_objs_readahead_stats_t stats;
+sqlite3_file_control(db, "main", SQLITE_OBJS_FCNTL_READAHEAD_STATS, &stats);
 ```
 
 ### 5.3 Migration from Environment Variables
 
 | Old (env var) | New (URI parameter) | Notes |
 |---|---|---|
-| `AZQLITE_READAHEAD_PAGES=64` | `readahead=64` | Exact equivalent |
-| `AZQLITE_CACHE_PAGES=4096` | `cache_pages=4096` | Exact equivalent |
+| `SQLITE_OBJS_READAHEAD_PAGES=64` | `readahead=64` | Exact equivalent |
+| `SQLITE_OBJS_CACHE_PAGES=4096` | `cache_pages=4096` | Exact equivalent |
 | (no equivalent) | `readahead=auto` | New adaptive mode (default) |
 | (no equivalent) | `readahead_max=2048` | New max window control |
 
@@ -505,7 +505,7 @@ sqlite3_file_control(db, "main", AZQLITE_FCNTL_READAHEAD_STATS, &stats);
 
 **Scenario:** `ATTACH 'db2.db' AS aux;` — two databases on the same connection.
 
-**Behaviour:** Each attached database has its own `azqliteFile` with its own `readahead` state. The state machines are completely independent. A sequential scan on `main` doesn't affect readahead for `aux`. This is correct — access patterns are per-file.
+**Behaviour:** Each attached database has its own `sqlite-objsFile` with its own `readahead` state. The state machines are completely independent. A sequential scan on `main` doesn't affect readahead for `aux`. This is correct — access patterns are per-file.
 
 ### 6.9 Interleaved Reads and Writes to the Same Pages
 
@@ -590,29 +590,29 @@ struct file_ra_state {
 
 **Thrashing detection:** If pages in the readahead window are evicted before being read (detected via page flags), Linux reduces the window.
 
-### 8.2 How azqlite Differs and Why
+### 8.2 How sqlite-objs Differs and Why
 
-| Aspect | Linux | azqlite | Rationale |
+| Aspect | Linux | sqlite-objs | Rationale |
 |---|---|---|---|
-| **Async readahead** | Background I/O via `submit_bio()` + page cache | Not supported (synchronous HTTP only) | azqlite has no background I/O thread. HTTP GET blocks the calling thread. Async would require curl_multi or threads — significant complexity for read path. |
+| **Async readahead** | Background I/O via `submit_bio()` + page cache | Not supported (synchronous HTTP only) | sqlite-objs has no background I/O thread. HTTP GET blocks the calling thread. Async would require curl_multi or threads — significant complexity for read path. |
 | **Async marker** | Triggers next readahead before current window is exhausted | N/A | Without async I/O, there's no benefit to early triggering. |
-| **Window growth** | Doubles per sequential hit | Doubles per sequential miss (same effect) | In Linux, "sequential hit" means the page was in the readahead window. In azqlite, we detect the same pattern by the miss being at the window boundary. |
-| **Maximum window** | 128–256 KiB (32–64 pages) | 4 MiB (1024 pages) | Linux's small window reflects ~0.1ms disk latency. azqlite's 22ms HTTP latency demands larger windows to amortise cost. The optimal window is proportional to `latency × bandwidth`. |
-| **Thrashing detection** | Reduces window on eviction-before-read | Inside-window miss → don't grow | Same intent, different mechanism. azqlite detects eviction pressure when a miss occurs inside the current readahead window. |
+| **Window growth** | Doubles per sequential hit | Doubles per sequential miss (same effect) | In Linux, "sequential hit" means the page was in the readahead window. In sqlite-objs, we detect the same pattern by the miss being at the window boundary. |
+| **Maximum window** | 128–256 KiB (32–64 pages) | 4 MiB (1024 pages) | Linux's small window reflects ~0.1ms disk latency. sqlite-objs's 22ms HTTP latency demands larger windows to amortise cost. The optimal window is proportional to `latency × bandwidth`. |
+| **Thrashing detection** | Reduces window on eviction-before-read | Inside-window miss → don't grow | Same intent, different mechanism. sqlite-objs detects eviction pressure when a miss occurs inside the current readahead window. |
 | **Backward detection** | Separate backward sequential detection | Not in v1 (treated as random) | Linux sees backward scans frequently (e.g., `tail -r`). SQLite backward scans are rare enough to defer. |
-| **Per-file state** | `struct file_ra_state` per `struct file` | `azqlite_readahead_t` per `azqliteFile` | Same granularity. |
+| **Per-file state** | `struct file_ra_state` per `struct file` | `sqlite_objs_readahead_t` per `sqlite-objsFile` | Same granularity. |
 | **Direction handling** | Tracks forward and backward | Forward only (v1) | Simplicity; backward scans are rare in SQLite workloads. |
 
 ### 8.3 Why Not Copy Linux Exactly?
 
-1. **No async I/O primitive.** Linux's key innovation is *overlapping* I/O with computation via the async marker. azqlite would need a dedicated I/O thread or curl_multi integration on the read path. This is significant complexity (comparable to D-PERF Phase 2 for writes) and is better addressed by the long-term `xFetch`/`xUnfetch` plan.
+1. **No async I/O primitive.** Linux's key innovation is *overlapping* I/O with computation via the async marker. sqlite-objs would need a dedicated I/O thread or curl_multi integration on the read path. This is significant complexity (comparable to D-PERF Phase 2 for writes) and is better addressed by the long-term `xFetch`/`xUnfetch` plan.
 
-2. **Different latency regime.** Linux readahead optimises for ~0.1ms SSD / ~5ms HDD latency. azqlite faces 22ms minimum HTTP latency. This means:
+2. **Different latency regime.** Linux readahead optimises for ~0.1ms SSD / ~5ms HDD latency. sqlite-objs faces 22ms minimum HTTP latency. This means:
    - Larger windows are needed (the cost of an HTTP GET is dominated by latency, not transfer size)
    - False sequential detection is more expensive (one wasted 4 MiB GET = 42ms, vs. one wasted 256 KiB read = 0.15ms on SSD)
    - The optimal initial window is smaller (to avoid waste on false detection)
 
-3. **Simpler page cache model.** Linux has page-level eviction flags, page locks, and writeback state. azqlite's cache is simpler (entry = clean or dirty, evict = remove). The simpler model means simpler detection logic suffices.
+3. **Simpler page cache model.** Linux has page-level eviction flags, page locks, and writeback state. sqlite-objs's cache is simpler (entry = clean or dirty, evict = remove). The simpler model means simpler detection logic suffices.
 
 ---
 
@@ -620,10 +620,10 @@ struct file_ra_state {
 
 ### 9.1 Readahead Statistics (Addresses D-4.7)
 
-Add counters to `azqlite_readahead_t`:
+Add counters to `sqlite_objs_readahead_t`:
 
 ```c
-typedef struct azqlite_readahead {
+typedef struct sqlite_objs_readahead {
     /* State machine (see §3.1) */
     int state;
     int lastMissPage;
@@ -636,12 +636,12 @@ typedef struct azqlite_readahead {
     int nWindowGrows;        /* Times the window doubled */
     int nWindowResets;       /* Times the window reset to 1 */
     int peakWindow;          /* High-water mark of window size */
-} azqlite_readahead_t;
+} sqlite_objs_readahead_t;
 ```
 
 ### 9.2 Debug Logging
 
-When `AZQLITE_DEBUG_TIMING` is enabled, log state transitions:
+When `SQLITE_OBJS_DEBUG_TIMING` is enabled, log state transitions:
 
 ```
 [READAHEAD] miss page=1024 state=SEQUENTIAL window=64→128 (sequential continuation)
@@ -661,7 +661,7 @@ When `AZQLITE_DEBUG_TIMING` is enabled, log state transitions:
 
 ### Phase 1: Core State Machine (1 day)
 
-1. Add `azqlite_readahead_t` to `azqliteFile` struct
+1. Add `sqlite_objs_readahead_t` to `sqlite-objsFile` struct
 2. Implement `readaheadOnMiss()` function
 3. Replace `cacheGetReadaheadPages()` call in xRead with state machine
 4. Initialise state in xOpen
@@ -671,13 +671,13 @@ When `AZQLITE_DEBUG_TIMING` is enabled, log state transitions:
 
 1. Add `readahead`, `readahead_max`, `cache_pages` URI parameter parsing in xOpen
 2. Remove `cacheGetReadaheadPages()` and `cacheGetMaxPages()` functions (delete `getenv()` calls)
-3. Add `AZQLITE_FCNTL_READAHEAD_MODE` handling in xFileControl
-4. Update any tests that set `AZQLITE_READAHEAD_PAGES` or `AZQLITE_CACHE_PAGES` env vars
+3. Add `SQLITE_OBJS_FCNTL_READAHEAD_MODE` handling in xFileControl
+4. Update any tests that set `SQLITE_OBJS_READAHEAD_PAGES` or `SQLITE_OBJS_CACHE_PAGES` env vars
 
 ### Phase 3: Observability (0.5 days)
 
 1. Add counters to readahead state
-2. Add `AZQLITE_FCNTL_READAHEAD_STATS` handling
+2. Add `SQLITE_OBJS_FCNTL_READAHEAD_STATS` handling
 3. Debug logging for state transitions
 4. Summary logging at xClose
 
@@ -707,7 +707,7 @@ When `AZQLITE_DEBUG_TIMING` is enabled, log state transitions:
 
 ## 12. Future Work (Not In This Design)
 
-1. **Async readahead via curl_multi on read path.** Would allow overlapping I/O with SQLite's page processing. High complexity but would bring azqlite closer to Linux's async readahead performance.
+1. **Async readahead via curl_multi on read path.** Would allow overlapping I/O with SQLite's page processing. High complexity but would bring sqlite-objs closer to Linux's async readahead performance.
 
 2. **Backward sequential detection.** Add `RA_SEQUENTIAL_BACKWARD` state for ORDER BY ... DESC workloads.
 

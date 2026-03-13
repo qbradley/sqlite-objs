@@ -1,13 +1,13 @@
 [workspace]
-members = ["azqlite-sys", "azqlite"]
+members = ["sqlite-objs-sys", "sqlite-objs"]
 resolver = "2"
 
 [workspace.package]
 version = "0.1.0"
-authors = ["Azqlite Contributors"]
+authors = ["sqlite-objs Contributors"]
 edition = "2021"
 license = "MIT"
-repository = "https://github.com/yourusername/azqlite"
+repository = "https://github.com/yourusername/sqlite-objs"
 rust-version = "1.70"
 
 [workspace.dependencies]

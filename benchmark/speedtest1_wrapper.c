@@ -1,12 +1,12 @@
 /*
-** speedtest1_wrapper.c — Wrapper to run speedtest1 with azqlite VFS
+** speedtest1_wrapper.c — Wrapper to run speedtest1 with sqliteObjs VFS
 */
 
 #include "sqlite3.h"
 #include <stdio.h>
 
 /* Public API for VFS registration */
-#include "azqlite.h"
+#include "sqlite_objs.h"
 
 /* Include speedtest1 as a library */
 #define main speedtest1_main
@@ -14,10 +14,10 @@
 #undef main
 
 int main(int argc, char **argv) {
-  /* Register azqlite VFS as default */
-  int rc = azqlite_vfs_register(1);
+  /* Register sqliteObjs VFS as default */
+  int rc = sqlite_objs_vfs_register(1);
   if (rc != SQLITE_OK) {
-    fprintf(stderr, "Failed to register azqlite VFS: %d\n", rc);
+    fprintf(stderr, "Failed to register sqliteObjs VFS: %d\n", rc);
     return 1;
   }
   

@@ -6,7 +6,7 @@
 
 ## Summary
 
-Five research agents completed comprehensive investigation of azqlite architecture space. 5 artifacts, 4,328 lines of research, 11 approved design decisions gates all downstream implementation work.
+Five research agents completed comprehensive investigation of sqlite-objs architecture space. 5 artifacts, 4,328 lines of research, 11 approved design decisions gates all downstream implementation work.
 
 ## Artifacts
 
@@ -27,7 +27,7 @@ Five research agents completed comprehensive investigation of azqlite architectu
 2. **Established critical azure_ops_t interface** — vtable boundary between VFS and Azure client
 3. **Approved 11 architectural decisions** — D1-D11 unblock implementation
 4. **Eliminated uncertainty:** Journal mode (not WAL), two-level locking (not nolock), full cache (not deferred)
-5. **Defined MVP 1 scope precisely** — page blob DB, block blob journal, in-memory cache, lease locking, Layer 1+2 tests, Makefile, azqlite-shell
+5. **Defined MVP 1 scope precisely** — page blob DB, block blob journal, in-memory cache, lease locking, Layer 1+2 tests, Makefile, sqlite-objs-shell
 
 ## Decision Gate
 

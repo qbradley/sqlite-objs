@@ -1,14 +1,14 @@
 /*
-** test_wal.c — WAL Mode Unit Tests for azqlite VFS
+** test_wal.c — WAL Mode Unit Tests for sqliteObjs VFS
 **
-** Tests Write-Ahead Logging support through the azqlite VFS layer.
+** Tests Write-Ahead Logging support through the sqliteObjs VFS layer.
 ** WAL mode maps to Azure Append Blobs (sequential append-only writes)
 ** and requires EXCLUSIVE locking mode (no shared memory needed).
 **
 ** Dependencies (Frodo/Aragorn — not yet implemented):
 **   - azure_ops_t extended with append_blob_create/append/delete fields
 **   - mock_azure_ops.c extended with mock append blob implementations
-**   - azqlite_vfs.c updated to support WAL file type routing
+**   - sqlite_objs_vfs.c updated to support WAL file type routing
 **
 ** Gated behind ENABLE_WAL_TESTS. Define when dependencies are ready:
 **   make test-unit CFLAGS+="-DENABLE_WAL_TESTS"
@@ -30,7 +30,7 @@
 
 #ifdef ENABLE_WAL_TESTS
 
-#include "../src/azqlite.h"
+#include "../src/sqlite_objs.h"
 
 /* ── Test Context ────────────────────────────────────────────────── */
 
@@ -151,7 +151,7 @@ static sqlite3 *wal_open_db(azure_ops_t *ops, mock_azure_ctx_t *ctx,
                              const char *dbname) {
     sqlite3 *db = NULL;
 
-    int rc = azqlite_vfs_register_with_ops(ops, ctx, 0);
+    int rc = sqlite_objs_vfs_register_with_ops(ops, ctx, 0);
     if (rc != SQLITE_OK) {
         fprintf(stderr, "    VFS register failed: %d\n", rc);
         return NULL;
@@ -159,7 +159,7 @@ static sqlite3 *wal_open_db(azure_ops_t *ops, mock_azure_ctx_t *ctx,
 
     rc = sqlite3_open_v2(dbname, &db,
                           SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE,
-                          "azqlite");
+                          "sqlite-objs");
     if (rc != SQLITE_OK) {
         fprintf(stderr, "    open failed: %d\n", rc);
         if (db) sqlite3_close(db);
@@ -217,13 +217,13 @@ TEST(wal_mode_requires_append_ops) {
 
     /* Build ops with NULL append blob fields */
     azure_ops_t no_append_ops = wal_make_no_append_ops();
-    int rc = azqlite_vfs_register_with_ops(&no_append_ops, wal_ctx, 0);
+    int rc = sqlite_objs_vfs_register_with_ops(&no_append_ops, wal_ctx, 0);
     ASSERT_OK(rc);
 
     sqlite3 *db = NULL;
     rc = sqlite3_open_v2("wal_prereq.db", &db,
                           SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE,
-                          "azqlite");
+                          "sqlite-objs");
     ASSERT_OK(rc);
     ASSERT_NOT_NULL(db);
 
@@ -575,13 +575,13 @@ TEST(wal_create_failure_returns_error) {
     /* Inject failure on append_blob_create BEFORE opening the DB */
     mock_set_fail_operation(wal_ctx, "append_blob_create", AZURE_ERR_IO);
 
-    int rc = azqlite_vfs_register_with_ops(wal_base_ops, wal_ctx, 0);
+    int rc = sqlite_objs_vfs_register_with_ops(wal_base_ops, wal_ctx, 0);
     ASSERT_OK(rc);
 
     sqlite3 *db = NULL;
     rc = sqlite3_open_v2("walfail_create.db", &db,
                           SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE,
-                          "azqlite");
+                          "sqlite-objs");
     if (rc != SQLITE_OK) {
         /* xOpen itself failed — acceptable behavior */
         if (db) sqlite3_close(db);
@@ -654,11 +654,11 @@ TEST(wal_insert_select_roundtrip) {
     db = NULL;
 
     /* Phase 2: Reopen and verify data persists */
-    rc = azqlite_vfs_register_with_ops(wal_base_ops, wal_ctx, 0);
+    rc = sqlite_objs_vfs_register_with_ops(wal_base_ops, wal_ctx, 0);
     ASSERT_OK(rc);
 
     rc = sqlite3_open_v2("walround.db", &db,
-                          SQLITE_OPEN_READWRITE, "azqlite");
+                          SQLITE_OPEN_READWRITE, "sqlite-objs");
     ASSERT_OK(rc);
     ASSERT_NOT_NULL(db);
 
@@ -747,7 +747,7 @@ TEST(wal_concurrent_reads_during_write) {
 /* ══════════════════════════════════════════════════════════════════════
 ** Suite: WAL Mode — Crash Recovery on Open
 **
-** When azqlite opens a DB and a WAL blob already exists in Azure,
+** When sqliteObjs opens a DB and a WAL blob already exists in Azure,
 ** the VFS downloads it via block_blob_download to restore crash
 ** recovery data.  These tests exercise the walExists download path
 ** in xOpen for WAL files.
@@ -815,11 +815,11 @@ TEST(wal_recovery_downloads_existing_wal) {
     mock_reset_call_counts(wal_ctx);
 
     /* Phase 3: Reopen — should detect WAL blob and download it */
-    rc = azqlite_vfs_register_with_ops(wal_base_ops, wal_ctx, 0);
+    rc = sqlite_objs_vfs_register_with_ops(wal_base_ops, wal_ctx, 0);
     ASSERT_OK(rc);
 
     rc = sqlite3_open_v2("walrecov.db", &db,
-                          SQLITE_OPEN_READWRITE, "azqlite");
+                          SQLITE_OPEN_READWRITE, "sqlite-objs");
     ASSERT_OK(rc);
     ASSERT_NOT_NULL(db);
 
@@ -851,13 +851,13 @@ TEST(wal_recovery_download_failure) {
     wal_setup();
 
     /* Phase 1: Create a non-empty database in DELETE journal mode */
-    int rc = azqlite_vfs_register_with_ops(wal_base_ops, wal_ctx, 0);
+    int rc = sqlite_objs_vfs_register_with_ops(wal_base_ops, wal_ctx, 0);
     ASSERT_OK(rc);
 
     sqlite3 *db = NULL;
     rc = sqlite3_open_v2("walfail_dl.db", &db,
                           SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE,
-                          "azqlite");
+                          "sqlite-objs");
     ASSERT_OK(rc);
     ASSERT_NOT_NULL(db);
 
@@ -881,11 +881,11 @@ TEST(wal_recovery_download_failure) {
     mock_set_fail_operation(wal_ctx, "block_blob_download", AZURE_ERR_IO);
 
     /* Phase 3: Reopen and try WAL mode */
-    rc = azqlite_vfs_register_with_ops(wal_base_ops, wal_ctx, 0);
+    rc = sqlite_objs_vfs_register_with_ops(wal_base_ops, wal_ctx, 0);
     ASSERT_OK(rc);
 
     rc = sqlite3_open_v2("walfail_dl.db", &db,
-                          SQLITE_OPEN_READWRITE, "azqlite");
+                          SQLITE_OPEN_READWRITE, "sqlite-objs");
     ASSERT_OK(rc);
     ASSERT_NOT_NULL(db);
 
@@ -894,7 +894,7 @@ TEST(wal_recovery_download_failure) {
 
     /* PRAGMA journal_mode=WAL should fail:
     **   pagerOpenWalIfPresent → blob_exists → 1 → nPage > 0 →
-    **   sqlite3PagerOpenWal → azqliteOpen → blob_exists → 1 →
+    **   sqlite3PagerOpenWal → sqliteObjsOpen → blob_exists → 1 →
     **   block_blob_download → fails → SQLITE_CANTOPEN
     ** The journal mode should remain "delete". */
     const char *mode = wal_set_journal_mode(db, "wal");

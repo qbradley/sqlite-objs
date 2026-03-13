@@ -398,7 +398,7 @@ mod tests {
 - `rusqlite` / `libsqlite3-sys`
 - `openssl` / `openssl-sys`
 - `curl` / `curl-sys`
-- `azqlite` / `azqlite-sys` (this project)
+- `sqlite-objs` / `sqlite-objs-sys` (this project)
 
 ## Checklist
 

@@ -1,7 +1,7 @@
-//! Raw FFI bindings to the azqlite C library.
+//! Raw FFI bindings to the sqlite-objs C library.
 //!
-//! This crate provides low-level unsafe bindings to the azqlite VFS.
-//! Most users should use the `azqlite` crate instead, which provides
+//! This crate provides low-level unsafe bindings to the sqlite-objs VFS.
+//! Most users should use the `sqlite-objs` crate instead, which provides
 //! a safe, idiomatic Rust API.
 
 #![allow(non_camel_case_types)]
@@ -14,12 +14,12 @@ pub struct azure_ops_t {
     _private: [u8; 0],
 }
 
-/// Configuration for the azqlite VFS.
+/// Configuration for the sqlite-objs VFS.
 ///
-/// This struct maps directly to the C `azqlite_config_t` type.
+/// This struct maps directly to the C `sqlite_objs_config_t` type.
 #[repr(C)]
 #[derive(Debug)]
-pub struct azqlite_config_t {
+pub struct sqlite_objs_config_t {
     /// Azure Storage account name
     pub account: *const c_char,
     /// Blob container name
@@ -37,7 +37,7 @@ pub struct azqlite_config_t {
 }
 
 extern "C" {
-    /// Register the "azqlite" VFS.
+    /// Register the "sqlite-objs" VFS.
     ///
     /// Reads configuration from environment variables:
     /// - AZURE_STORAGE_ACCOUNT
@@ -47,28 +47,28 @@ extern "C" {
     ///
     /// If `makeDefault` is non-zero, this VFS becomes the default.
     /// Returns SQLITE_OK (0) on success, or an appropriate error code.
-    pub fn azqlite_vfs_register(makeDefault: c_int) -> c_int;
+    pub fn sqlite_objs_vfs_register(makeDefault: c_int) -> c_int;
 
-    /// Register the "azqlite" VFS with an explicit configuration.
+    /// Register the "sqlite-objs" VFS with an explicit configuration.
     ///
     /// The config struct is copied — the caller may free it after this call.
     /// If `makeDefault` is non-zero, this VFS becomes the default.
     /// Returns SQLITE_OK (0) on success, or an appropriate error code.
-    pub fn azqlite_vfs_register_with_config(
-        config: *const azqlite_config_t,
+    pub fn sqlite_objs_vfs_register_with_config(
+        config: *const sqlite_objs_config_t,
         makeDefault: c_int,
     ) -> c_int;
 
-    /// Register the "azqlite" VFS with an explicit ops vtable and context.
+    /// Register the "sqlite-objs" VFS with an explicit ops vtable and context.
     ///
     /// Convenience wrapper for test code.
-    pub fn azqlite_vfs_register_with_ops(
+    pub fn sqlite_objs_vfs_register_with_ops(
         ops: *mut azure_ops_t,
         ctx: *mut c_void,
         makeDefault: c_int,
     ) -> c_int;
 
-    /// Register the "azqlite" VFS with no global Azure client.
+    /// Register the "sqlite-objs" VFS with no global Azure client.
     ///
     /// All databases MUST provide Azure credentials via URI parameters:
     /// `file:mydb.db?azure_account=acct&azure_container=cont&azure_sas=token`
@@ -82,7 +82,7 @@ extern "C" {
     ///
     /// If `makeDefault` is non-zero, this VFS becomes the default.
     /// Returns SQLITE_OK (0) on success, or an appropriate error code.
-    pub fn azqlite_vfs_register_uri(makeDefault: c_int) -> c_int;
+    pub fn sqlite_objs_vfs_register_uri(makeDefault: c_int) -> c_int;
 }
 
 // SQLite constants
@@ -98,7 +98,7 @@ mod tests {
     #[test]
     fn test_config_size() {
         // Ensure the struct layout matches C expectations
-        assert!(std::mem::size_of::<azqlite_config_t>() > 0);
+        assert!(std::mem::size_of::<sqlite_objs_config_t>() > 0);
     }
 
     #[test]
@@ -106,7 +106,7 @@ mod tests {
         // Test that we can call the FFI function (registration will fail
         // without Azure config, but linkage should work)
         unsafe {
-            let result = azqlite_vfs_register_uri(0);
+            let result = sqlite_objs_vfs_register_uri(0);
             // Should return SQLITE_OK since URI mode doesn't require config upfront
             assert_eq!(result, SQLITE_OK);
         }

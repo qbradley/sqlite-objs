@@ -1,14 +1,14 @@
 # Merry — History
 
 ## Project Context
-- **Project:** azqlite — Azure Blob-backed SQLite VFS
+- **Project:** sqlite-objs — Azure Blob-backed SQLite VFS
 - **User:** Quetzal Bradley
 - **Stack:** C, SQLite VFS API, Azure Blob Storage REST API, libcurl, OpenSSL
 - **Role:** AWS/S3 Expert — adding Amazon S3 as an alternative cloud storage backend
-- **Team root:** /workspace/home/qbradley/src/azqlite
+- **Team root:** /workspace/home/qbradley/src/sqlite-objs
 
 ## Key Context
-- azqlite already has a working Azure Blob Storage backend (Frodo's domain)
+- sqlite-objs already has a working Azure Blob Storage backend (Frodo's domain)
 - The VFS uses an ops vtable (`azure_ops_t`) for storage operations
 - URI-based per-file configuration is implemented (Phase 1-6 complete)
 - URI params: `azure_account`, `azure_container`, `azure_sas`, `azure_key`, `azure_endpoint`

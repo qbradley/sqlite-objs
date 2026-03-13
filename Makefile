@@ -1,7 +1,7 @@
-# Makefile for azqlite — SQLite VFS backed by Azure Blob Storage
+# Makefile for sqlite-objs — SQLite VFS backed by Azure Blob Storage
 #
 # Targets:
-#   all              Build libazqlite.a and azqlite-shell (stub, no external deps)
+#   all              Build libsqlite_objs.a and sqlite-objs-shell (stub, no external deps)
 #   all-production   Build with real Azure client (requires libcurl + OpenSSL)
 #   test-unit        Build and run Layer 1 unit tests
 #   test-integration Build and run Layer 2 integration tests (requires Azurite)
@@ -64,32 +64,32 @@ TEST_CFLAGS = $(CFLAGS) $(OPENSSL_CFLAGS) -I$(TEST_DIR)
 SQLITE_SRC  = $(SQLITE_DIR)/sqlite3.c
 SQLITE_OBJ  = $(BUILD_DIR)/sqlite3.o
 
-VFS_SRCS    = $(SRC_DIR)/azqlite_vfs.c \
+VFS_SRCS    = $(SRC_DIR)/sqlite_objs_vfs.c \
               $(SRC_DIR)/azure_client_stub.c
-VFS_OBJS    = $(BUILD_DIR)/azqlite_vfs.o \
+VFS_OBJS    = $(BUILD_DIR)/sqlite_objs_vfs.o \
               $(BUILD_DIR)/azure_client_stub.o
 
-PROD_SRCS   = $(SRC_DIR)/azqlite_vfs.c \
+PROD_SRCS   = $(SRC_DIR)/sqlite_objs_vfs.c \
               $(SRC_DIR)/azure_client.c \
               $(SRC_DIR)/azure_auth.c \
               $(SRC_DIR)/azure_error.c
-PROD_OBJS   = $(BUILD_DIR)/azqlite_vfs.o \
+PROD_OBJS   = $(BUILD_DIR)/sqlite_objs_vfs.o \
               $(BUILD_DIR)/azure_client.o \
               $(BUILD_DIR)/azure_auth.o \
               $(BUILD_DIR)/azure_error.o
 
 LIB_OBJS    = $(SQLITE_OBJ) $(VFS_OBJS)
-LIBRARY      = $(BUILD_DIR)/libazqlite.a
+LIBRARY      = $(BUILD_DIR)/libsqlite_objs.a
 
 PROD_LIB_OBJS = $(SQLITE_OBJ) $(PROD_OBJS)
-PROD_LIBRARY   = $(BUILD_DIR)/libazqlite.a
+PROD_LIBRARY   = $(BUILD_DIR)/libsqlite_objs.a
 
-SHELL_SRC   = $(SRC_DIR)/azqlite_shell.c
-SHELL_BIN   = azqlite-shell
+SHELL_SRC   = $(SRC_DIR)/sqlite_objs_shell.c
+SHELL_BIN   = sqlite-objs-shell
 
 # Test objects — tests link against mock + stub + auth + error modules
 MOCK_OBJ    = $(BUILD_DIR)/mock_azure_ops.o
-TEST_OBJS   = $(SQLITE_OBJ) $(BUILD_DIR)/azqlite_vfs.o $(BUILD_DIR)/azure_client_stub.o $(MOCK_OBJ) \
+TEST_OBJS   = $(SQLITE_OBJ) $(BUILD_DIR)/sqlite_objs_vfs.o $(BUILD_DIR)/azure_client_stub.o $(MOCK_OBJ) \
               $(BUILD_DIR)/azure_auth.o $(BUILD_DIR)/azure_error.o
 
 # ---------- Default target ----------
@@ -111,7 +111,7 @@ $(SQLITE_OBJ): $(SQLITE_SRC) | $(BUILD_DIR)
 
 # ---------- VFS sources ----------
 
-$(BUILD_DIR)/azqlite_vfs.o: $(SRC_DIR)/azqlite_vfs.c $(SRC_DIR)/azqlite.h $(SRC_DIR)/azure_client.h | $(BUILD_DIR)
+$(BUILD_DIR)/sqlite_objs_vfs.o: $(SRC_DIR)/sqlite_objs_vfs.c $(SRC_DIR)/sqlite_objs.h $(SRC_DIR)/azure_client.h | $(BUILD_DIR)
 	$(CC) $(CFLAGS) -c -o $@ $<
 
 $(BUILD_DIR)/azure_client_stub.o: $(SRC_DIR)/azure_client_stub.c $(SRC_DIR)/azure_client.h | $(BUILD_DIR)
@@ -139,8 +139,8 @@ all-production: $(PROD_LIB_OBJS) $(SHELL_SRC) | $(BUILD_DIR)
 	$(AR) rcs $(PROD_LIBRARY) $(PROD_LIB_OBJS)
 	$(CC) $(CFLAGS_PROD) -w -I$(SRC_DIR) -I$(SQLITE_DIR) \
 		-DSQLITE_THREADSAFE=1 \
-		-o $(SHELL_BIN) $(SRC_DIR)/azqlite_shell.c \
-		$(BUILD_DIR)/azqlite_vfs.o \
+		-o $(SHELL_BIN) $(SRC_DIR)/sqlite_objs_shell.c \
+		$(BUILD_DIR)/sqlite_objs_vfs.o \
 		$(BUILD_DIR)/azure_client.o \
 		$(BUILD_DIR)/azure_auth.o \
 		$(BUILD_DIR)/azure_error.o \
@@ -151,11 +151,11 @@ all-production: $(PROD_LIB_OBJS) $(SHELL_SRC) | $(BUILD_DIR)
 # The shell is compiled as a single translation unit that #includes shell.c.
 # We suppress warnings from the SQLite shell code with -w.
 
-$(SHELL_BIN): $(SRC_DIR)/azqlite_shell.c $(LIBRARY)
+$(SHELL_BIN): $(SRC_DIR)/sqlite_objs_shell.c $(LIBRARY)
 	$(CC) $(CFLAGS) -w -I$(SRC_DIR) -I$(SQLITE_DIR) \
 		-DSQLITE_THREADSAFE=1 \
-		-o $@ $(SRC_DIR)/azqlite_shell.c \
-		$(BUILD_DIR)/azqlite_vfs.o \
+		-o $@ $(SRC_DIR)/sqlite_objs_shell.c \
+		$(BUILD_DIR)/sqlite_objs_vfs.o \
 		$(BUILD_DIR)/azure_client_stub.o \
 		$(SQLITE_OBJ) \
 		$(LDFLAGS)
@@ -239,4 +239,4 @@ coverage: clean
 
 amalgamation:
 	@echo "Amalgamation target is planned for post-MVP 1."
-	@echo "It will produce azqlite.c + azqlite.h as single-file distribution."
+	@echo "It will produce sqlite_objs.c + sqlite_objs.h as single-file distribution."

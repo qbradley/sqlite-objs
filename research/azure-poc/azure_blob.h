@@ -2,7 +2,7 @@
  * azure_blob.h — Azure Blob Storage REST API client (PoC)
  *
  * Direct REST API implementation using libcurl + OpenSSL.
- * No Azure SDK dependency. For the azqlite project.
+ * No Azure SDK dependency. For the sqliteObjs project.
  *
  * Environment variables:
  *   AZURE_STORAGE_ACCOUNT   — Storage account name

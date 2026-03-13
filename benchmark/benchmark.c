@@ -1,8 +1,8 @@
 /*
-** benchmark.c — Performance comparison harness for azqlite
+** benchmark.c — Performance comparison harness for sqliteObjs
 **
 ** This harness runs SQLite's speedtest1 to compare local SQLite 
-** performance against azqlite (Azure blob-backed) performance.
+** performance against sqliteObjs (Azure blob-backed) performance.
 */
 
 #include <stdio.h>
@@ -97,11 +97,11 @@ static void print_text_results(BenchmarkResult *local, BenchmarkResult *azure, i
   }
   
   if (azure && azure->success) {
-    printf("Azure SQLite (azqlite VFS):\n");
+    printf("Azure SQLite (sqliteObjs VFS):\n");
     printf("  Elapsed time:  %.3f seconds\n", azure->elapsed_seconds);
     printf("\n");
   } else if (azure && !azure->success) {
-    printf("Azure SQLite (azqlite VFS):\n");
+    printf("Azure SQLite (sqliteObjs VFS):\n");
     printf("  FAILED: %s\n", azure->error_msg);
     printf("\n");
   }
@@ -148,7 +148,7 @@ static void print_usage(const char *prog) {
   fprintf(stderr, "\n");
   fprintf(stderr, "Options:\n");
   fprintf(stderr, "  --local-only       Run only local SQLite benchmark\n");
-  fprintf(stderr, "  --azure-only       Run only azqlite benchmark\n");
+  fprintf(stderr, "  --azure-only       Run only sqliteObjs benchmark\n");
   fprintf(stderr, "  --size N           Size parameter for speedtest1 (default: 25)\n");
   fprintf(stderr, "  --output FORMAT    Output format: text (default) or csv\n");
   fprintf(stderr, "  --help             Show this help message\n");
@@ -256,7 +256,7 @@ int main(int argc, char **argv) {
       printf("-----------------------------------------------------------------\n");
     }
     
-    /* Build command for azqlite */
+    /* Build command for sqliteObjs */
     snprintf(command, sizeof(command), 
              "./speedtest1-azure --size %d benchmark_azure.db >/dev/null 2>&1",
              size_param);

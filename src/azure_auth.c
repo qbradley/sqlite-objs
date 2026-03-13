@@ -7,7 +7,7 @@
  * Evolved from research/azure-poc/azure_auth.c into production quality.
  *
  * Dependencies: OpenSSL (HMAC-SHA256, base64), standard C library
- * Part of the azqlite project. License: MIT
+ * Part of the sqliteObjs project. License: MIT
  */
 
 #include "azure_client_impl.h"

@@ -9,7 +9,7 @@
  * Evolved from research/azure-poc/azure_blob.c into production quality.
  *
  * Dependencies: libcurl, OpenSSL (via azure_auth.c)
- * Part of the azqlite project. License: MIT
+ * Part of the sqliteObjs project. License: MIT
  */
 
 #include "azure_client_impl.h"
@@ -66,14 +66,14 @@ static inline int clamp_http_status(long s) {
 }
 
 /* ================================================================
- * Debug timing — opt-in via AZQLITE_DEBUG_TIMING=1 env var
+ * Debug timing — opt-in via SQLITE_OBJS_DEBUG_TIMING=1 env var
  * ================================================================ */
 
 static int g_az_debug_timing = -1;
 
 static int az_debug_timing(void) {
     if (g_az_debug_timing < 0) {
-        const char *val = getenv("AZQLITE_DEBUG_TIMING");
+        const char *val = getenv("SQLITE_OBJS_DEBUG_TIMING");
         g_az_debug_timing = (val && val[0] == '1') ? 1 : 0;
     }
     return g_az_debug_timing;
@@ -617,7 +617,7 @@ static azure_err_t execute_with_retry(
         /* Transient/throttled error — retry with backoff */
         if (attempt < AZURE_MAX_RETRIES) {
             int delay_ms = azure_compute_retry_delay(attempt, rh.retry_after);
-            fprintf(stderr, "[azqlite] %s %s: %s (HTTP %d) — "
+            fprintf(stderr, "[sqlite-objs] %s %s: %s (HTTP %d) — "
                     "retry %d/%d in %dms\n",
                     method, blob_name, azure_err_str(rc),
                     err->http_status, attempt + 1, AZURE_MAX_RETRIES,
@@ -626,7 +626,7 @@ static azure_err_t execute_with_retry(
         }
     }
 
-    fprintf(stderr, "[azqlite] %s %s: all %d retries exhausted\n",
+    fprintf(stderr, "[sqlite-objs] %s %s: all %d retries exhausted\n",
             method, blob_name, AZURE_MAX_RETRIES);
 
     if (resp_headers) *resp_headers = rh;
@@ -1119,8 +1119,8 @@ static azure_err_t az_lease_break(void *ctx, const char *name,
  * btree mutex (D17).  No concurrent calls to write_batch are possible.
  *
  * Pool tuning:
- *   CURLMOPT_MAX_HOST_CONNECTIONS = AZQLITE_MAX_PARALLEL_PUTS (32)
- *   CURLMOPT_MAXCONNECTS          = AZQLITE_MAX_PARALLEL_PUTS (32)
+ *   CURLMOPT_MAX_HOST_CONNECTIONS = SQLITE_OBJS_MAX_PARALLEL_PUTS (32)
+ *   CURLMOPT_MAXCONNECTS          = SQLITE_OBJS_MAX_PARALLEL_PUTS (32)
  */
 static CURLM *ensure_multi_handle(azure_client_t *c)
 {
@@ -1130,9 +1130,9 @@ static CURLM *ensure_multi_handle(azure_client_t *c)
     if (!multi) return NULL;
 
     curl_multi_setopt(multi, CURLMOPT_MAX_HOST_CONNECTIONS,
-                      (long)AZQLITE_MAX_PARALLEL_PUTS);
+                      (long)SQLITE_OBJS_MAX_PARALLEL_PUTS);
     curl_multi_setopt(multi, CURLMOPT_MAXCONNECTS,
-                      (long)AZQLITE_MAX_PARALLEL_PUTS);
+                      (long)SQLITE_OBJS_MAX_PARALLEL_PUTS);
 
     c->multi_handle = multi;
     return multi;
@@ -1390,7 +1390,7 @@ static azure_err_t az_page_blob_write_batch(
             }
 #endif
             fprintf(stderr,
-                    "[azqlite] batch write: %d/%d ranges pending, "
+                    "[sqlite-objs] batch write: %d/%d ranges pending, "
                     "retry %d/%d in %dms\n",
                     pending, nRanges, attempt, BATCH_MAX_RETRIES, delay_ms);
             azure_retry_sleep_ms(delay_ms);
@@ -1457,7 +1457,7 @@ static azure_err_t az_page_blob_write_batch(
                                                      lease_id, &le);
                     if (lrc != AZURE_OK) {
                         fprintf(stderr,
-                                "[azqlite] batch write: lease renewal "
+                                "[sqlite-objs] batch write: lease renewal "
                                 "failed (%s), aborting\n",
                                 azure_err_str(lrc));
                         lease_lost = 1;

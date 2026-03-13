@@ -37,14 +37,14 @@ static void co_setup(void) {
 
 #ifdef ENABLE_VFS_INTEGRATION
 
-#include "../src/azqlite.h"
+#include "../src/sqlite_objs.h"
 
 static sqlite3 *co_open_db(void) {
     sqlite3 *db = NULL;
-    azqlite_vfs_register_with_ops(co_ops, co_ctx, 0);
+    sqlite_objs_vfs_register_with_ops(co_ops, co_ctx, 0);
     int rc = sqlite3_open_v2("coalesce_test.db", &db,
                               SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE,
-                              "azqlite");
+                              "sqlite-objs");
     if (rc != SQLITE_OK) {
         if (db) sqlite3_close(db);
         return NULL;
@@ -464,17 +464,17 @@ TEST(coalesce_last_page_short) {
 #ifdef ENABLE_COALESCE_TESTS
 
 /*
-** Expected function signature from azqlite_vfs.c:
+** Expected function signature from sqlite_objs_vfs.c:
 **
 **   int coalesceDirtyRanges(
-**       azqliteFile *p,
+**       sqliteObjsFile *p,
 **       azure_page_range_t *ranges,
 **       int maxRanges
 **   );
 **
 ** Returns number of ranges, or -1 if maxRanges is exceeded.
 */
-extern int azqlite_test_coalesce_dirty_ranges(
+extern int sqlite_objs_test_coalesce_dirty_ranges(
     const unsigned char *aDirty, int nBitmapBytes,
     const unsigned char *aData, sqlite3_int64 nData,
     int pageSize,
@@ -506,7 +506,7 @@ TEST(coalesce_maxranges_overflow) {
 
     /* Attempt coalescing with maxRanges=4 — should overflow */
     azure_page_range_t ranges[4];
-    int nRanges = azqlite_test_coalesce_dirty_ranges(
+    int nRanges = sqlite_objs_test_coalesce_dirty_ranges(
         aDirty, nBitmapBytes, aData, nData, pageSize,
         ranges, 4
     );
@@ -555,9 +555,9 @@ TEST(sync_coalesced_sequential) {
     co_close_db(db);
 
     db = NULL;
-    azqlite_vfs_register_with_ops(co_ops, co_ctx, 0);
+    sqlite_objs_vfs_register_with_ops(co_ops, co_ctx, 0);
     int rc = sqlite3_open_v2("coalesce_test.db", &db,
-                              SQLITE_OPEN_READWRITE, "azqlite");
+                              SQLITE_OPEN_READWRITE, "sqlite-objs");
     ASSERT_OK(rc);
     ASSERT_NOT_NULL(db);
 
@@ -810,9 +810,9 @@ TEST(sync_batch_all_succeed) {
     co_close_db(db);
 
     db = NULL;
-    azqlite_vfs_register_with_ops(co_ops, co_ctx, 0);
+    sqlite_objs_vfs_register_with_ops(co_ops, co_ctx, 0);
     int rc = sqlite3_open_v2("coalesce_test.db", &db,
-                              SQLITE_OPEN_READWRITE, "azqlite");
+                              SQLITE_OPEN_READWRITE, "sqlite-objs");
     ASSERT_OK(rc);
     ASSERT_NOT_NULL(db);
 

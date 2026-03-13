@@ -1,7 +1,7 @@
 # Project Context
 
 - **Owner:** Quetzal Bradley
-- **Project:** Azure Blob-backed SQLite (azqlite) — a drop-in replacement for SQLite where all storage is backed by Azure Blob Storage, implemented as a custom VFS layer. MIT licensed.
+- **Project:** Azure Blob-backed SQLite (sqlite-objs) — a drop-in replacement for SQLite where all storage is backed by Azure Blob Storage, implemented as a custom VFS layer. MIT licensed.
 - **Stack:** C, SQLite VFS API, Azure Blob Storage REST API, libcurl, OpenSSL
 - **SQLite source:** `sqlite-autoconf-3520000/` (do not modify unless absolutely necessary)
 - **Created:** 2026-03-10
@@ -31,7 +31,7 @@
 - **Build command:** `cc -o test_runner test/test_main.c test/mock_azure_ops.c sqlite-autoconf-3520000/sqlite3.c -I sqlite-autoconf-3520000 -I test -lpthread -ldl -lm`
 - **Key patterns:**
   - Test files use `#include "test_file.c"` in test_main.c (not separate compilation) to share test_harness.h statics.
-  - VFS integration tests gated behind `ENABLE_VFS_INTEGRATION` — define it when linking with azqlite_vfs.o.
+  - VFS integration tests gated behind `ENABLE_VFS_INTEGRATION` — define it when linking with sqlite_objs_vfs.o.
   - Azure client tests gated behind `ENABLE_AZURE_CLIENT_TESTS` — define it when linking with azure_client.o.
   - mock_azure_ops.h IS the authoritative interface definition until reconciliation with azure_client.h.
 - **Lease state machine:** AVAILABLE → LEASED (on acquire) → BREAKING (on break with period > 0) → AVAILABLE. Immediate break (period=0) goes straight to AVAILABLE. Acquire during BREAKING returns CONFLICT.
@@ -61,10 +61,10 @@
 ### Cross-Agent Context: Working with Aragorn and Frodo (2026-03-10)
 
 - **I (Samwise) provide:** mock_azure_ops.c for testing, test harness that accepts both real and mock azure_ops_t.
-- **Aragorn (VFS) provides:** azqlite_vfs.c that accepts azure_ops_t* pointer at init, calls functions through it.
+- **Aragorn (VFS) provides:** sqlite_objs_vfs.c that accepts azure_ops_t* pointer at init, calls functions through it.
 - **Frodo (Azure client) provides:** Real azure_client.c with azure_ops_t vtable pointing to actual Azure REST API calls.
 - **How it works:** At compile time, link with either mock_azure_ops.o (unit tests) or azure_client.o (integration/real). Both export identical azure_ops_t interface.
-- **Test structure:** test_vfs.c calls azqlite VFS methods, which internally call whatever azure_ops_t is linked in. For unit tests: deterministic behavior. For integration: real Azurite emulator.
+- **Test structure:** test_vfs.c calls sqlite-objs VFS methods, which internally call whatever azure_ops_t is linked in. For unit tests: deterministic behavior. For integration: real Azurite emulator.
 
 ### Layer 2 Integration Test Infrastructure Delivered (2026-03-10)
 
@@ -90,14 +90,14 @@
   10. Lease break (immediate + delayed)
 - **Infrastructure additions:**
   - `azure_client_config_t.endpoint` field added (for Azurite custom endpoints)
-  - `azqlite_config_t.endpoint` field added (passes through to Azure client)
+  - `sqlite_objs_config_t.endpoint` field added (passes through to Azure client)
   - URL construction updated to use custom endpoint if provided
   - Default: `https://<account>.blob.core.windows.net` (Azure)
   - Override: `http://127.0.0.1:10000/<account>` (Azurite)
 - **Azurite integration:**
   - Wrapper script starts Azurite via `npx azurite --blobPort 10000 --silent`
   - Well-known credentials: account=`devstoreaccount1`, key=`Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==`
-  - Container name: `azqlite-test`
+  - Container name: `sqlite-objs-test`
 - **Current status:** All test infrastructure complete. Tests fail with `AZURE_ERR_NETWORK` due to azure_client Shared Key auth not being Azurite-compatible yet. This is a Frodo (Azure client) issue, not a test issue. Once auth is fixed, all 10 scenarios should pass.
 - **Handoff note for Frodo:** The endpoint override is working (URLs are constructed correctly). The issue is in Shared Key signature generation or header formatting. Azurite responds with 403 "Server failed to authenticate the request." Real Azure may work fine — Azurite has stricter/different auth requirements.
 
@@ -141,18 +141,18 @@ Completed Layer 2 infrastructure: 75 integration test cases written against Azur
   5. `coalesce_4mb_split` — 1200 pages (>4 MiB) → verifies 4 MiB limit respected. Coalescing assertion gated. ✅ Active.
   6. `coalesce_every_other` — Scattered updates across indexed table → multiple non-contiguous writes. ✅ Active.
   7. `coalesce_last_page_short` — Small DB → all writes 512-aligned including short last page. ✅ Active.
-  8. `coalesce_maxranges_overflow` — Direct algorithm test requiring `azqlite_test_coalesce_dirty_ranges` exposure. 🔒 Gated behind `ENABLE_COALESCE_TESTS`.
+  8. `coalesce_maxranges_overflow` — Direct algorithm test requiring `sqlite_objs_test_coalesce_dirty_ranges` exposure. 🔒 Gated behind `ENABLE_COALESCE_TESTS`.
   9. `sync_coalesced_sequential` — Full round-trip: write 50 rows, sync, close, reopen, verify all data intact. ✅ Active.
   10. `sync_batch_null_fallback` — Confirms `page_blob_write_batch=NULL` → sequential `page_blob_write` fallback with correct data. ✅ Active.
 - **Test approach:** Option B (test via xSync) preferred for 9 of 10 tests. Creates known workload patterns through SQLite operations, verifies mock write records for alignment/ordering/limits, and checks data integrity through close/reopen cycles.
 - **Helper assertions:** `assert_writes_aligned()`, `assert_writes_ordered_nonoverlapping()`, `assert_writes_within_4mb()` — reusable validators for any test that checks write patterns.
 - **Mock write recording:** Each `page_blob_write` call now records `{offset, len}` in `ctx->write_records[]` (up to 1024 entries). This is the key test seam for coalescing verification.
-- **Handoff for Aragorn:** When coalesceDirtyRanges is implemented, enable coalescing-specific assertions by defining `ENABLE_COALESCE_TESTS`. Also expose `azqlite_test_coalesce_dirty_ranges()` for test 8 (maxranges_overflow).
+- **Handoff for Aragorn:** When coalesceDirtyRanges is implemented, enable coalescing-specific assertions by defining `ENABLE_COALESCE_TESTS`. Also expose `sqlite_objs_test_coalesce_dirty_ranges()` for test 8 (maxranges_overflow).
 
 ### WAL Mode Test Suite (2026-03-11)
 
 - **12 tests across 5 suites**, all gated behind `ENABLE_WAL_TESTS`.
-- **File created:** `test/test_wal.c` — WAL mode unit tests for azqlite VFS.
+- **File created:** `test/test_wal.c` — WAL mode unit tests for sqlite-objs VFS.
 - **Files modified:**
   - `test/test_main.c` — Added `#include "test_wal.c"` and `run_wal_tests()` call.
   - `Makefile` — Added `test_wal.c` to test_main build dependencies.

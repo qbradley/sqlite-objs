@@ -1,6 +1,6 @@
-# Makefile for azqlite benchmark harness
+# Makefile for sqlite-objs benchmark harness
 #
-# This benchmark compares local SQLite performance against azqlite
+# This benchmark compares local SQLite performance against sqlite-objs
 # (Azure blob-backed SQLite) using the speedtest1 test harness.
 #
 # Targets:
@@ -55,11 +55,11 @@ LDFLAGS_PROD = $(LDFLAGS) $(CURL_LDFLAGS) $(OPENSSL_LDFLAGS)
 SQLITE_OBJ = $(BUILD_DIR)/sqlite3.o
 
 # VFS objects (stub build)
-VFS_STUB_OBJS = $(BUILD_DIR)/azqlite_vfs.o \
+VFS_STUB_OBJS = $(BUILD_DIR)/sqlite_objs_vfs.o \
                 $(BUILD_DIR)/azure_client_stub.o
 
 # VFS objects (production build)
-VFS_PROD_OBJS = $(BUILD_DIR)/azqlite_vfs.o \
+VFS_PROD_OBJS = $(BUILD_DIR)/sqlite_objs_vfs.o \
                 $(BUILD_DIR)/azure_client.o \
                 $(BUILD_DIR)/azure_auth.o \
                 $(BUILD_DIR)/azure_error.o
@@ -87,7 +87,7 @@ $(BENCHMARK_BIN): $(BENCH_SRC) | $(BENCH_BUILD)
 $(SPEEDTEST1_BIN): speedtest1.c $(SQLITE_OBJ) | $(BENCH_BUILD)
 	$(CC) $(CFLAGS) -w -o $@ speedtest1.c $(SQLITE_OBJ) $(LDFLAGS)
 
-# Build speedtest1 with azqlite VFS (stub)
+# Build speedtest1 with sqlite-objs VFS (stub)
 # -w needed because speedtest1_wrapper.c #includes third-party speedtest1.c
 $(SPEEDTEST1_AZURE_BIN): speedtest1_wrapper.c speedtest1.c $(SQLITE_OBJ) $(VFS_STUB_OBJS) | $(BENCH_BUILD)
 	$(CC) $(CFLAGS) -w -o $@ speedtest1_wrapper.c \
@@ -108,9 +108,9 @@ $(SQLITE_OBJ):
 	@echo "Building SQLite amalgamation..."
 	@cd $(PARENT_DIR) && $(MAKE) $(BUILD_DIR)/sqlite3.o
 
-$(BUILD_DIR)/azqlite_vfs.o:
+$(BUILD_DIR)/sqlite_objs_vfs.o:
 	@echo "Building VFS layer..."
-	@cd $(PARENT_DIR) && $(MAKE) $(BUILD_DIR)/azqlite_vfs.o
+	@cd $(PARENT_DIR) && $(MAKE) $(BUILD_DIR)/sqlite_objs_vfs.o
 
 $(BUILD_DIR)/azure_client_stub.o:
 	@echo "Building Azure client stub..."

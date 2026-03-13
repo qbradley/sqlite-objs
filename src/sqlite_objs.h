@@ -1,31 +1,31 @@
 /*
-** azqlite.h — Public API for the azqlite VFS
+** sqlite_objs.h — Public API for the sqliteObjs VFS
 **
 ** This is the ONLY header users need to include.  It provides:
 **   - VFS registration functions
 **   - Configuration struct
 **
 ** Usage:
-**   #include "azqlite.h"
+**   #include "sqlite_objs.h"
 **
 **   // Option 1: Read config from environment variables
-**   int rc = azqlite_vfs_register(0);  // 0 = not the default VFS
+**   int rc = sqlite_objs_vfs_register(0);  // 0 = not the default VFS
 **
 **   // Option 2: Provide config explicitly
-**   azqlite_config_t cfg = {
+**   sqlite_objs_config_t cfg = {
 **       .account   = "myaccount",
 **       .container = "databases",
 **       .sas_token = "sv=2024-08-04&...",
 **   };
-**   int rc = azqlite_vfs_register_with_config(&cfg, 0);
+**   int rc = sqlite_objs_vfs_register_with_config(&cfg, 0);
 **
-**   // Then open databases with the "azqlite" VFS:
+**   // Then open databases with the "sqlite-objs" VFS:
 **   sqlite3 *db;
 **   sqlite3_open_v2("mydb.db", &db,
-**       SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, "azqlite");
+**       SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, "sqlite-objs");
 */
-#ifndef AZQLITE_H
-#define AZQLITE_H
+#ifndef SQLITE_OBJS_H
+#define SQLITE_OBJS_H
 
 #include "sqlite3.h"
 
@@ -37,9 +37,9 @@ extern "C" {
 typedef struct azure_ops azure_ops_t;
 
 /*
-** Configuration for the azqlite VFS.
+** Configuration for the sqliteObjs VFS.
 */
-typedef struct azqlite_config {
+typedef struct sqlite_objs_config {
     const char *account;        /* Azure Storage account name */
     const char *container;      /* Blob container name */
     const char *sas_token;      /* SAS token (preferred), or NULL */
@@ -54,11 +54,11 @@ typedef struct azqlite_config {
     */
     const azure_ops_t *ops;
     void *ops_ctx;
-} azqlite_config_t;
+} sqlite_objs_config_t;
 
 
 /*
-** Register the "azqlite" VFS.  Reads configuration from environment
+** Register the "sqlite-objs" VFS.  Reads configuration from environment
 ** variables:
 **   AZURE_STORAGE_ACCOUNT    — Storage account name
 **   AZURE_STORAGE_CONTAINER  — Container name
@@ -68,28 +68,28 @@ typedef struct azqlite_config {
 ** If makeDefault is non-zero, this VFS becomes the default.
 ** Returns SQLITE_OK on success, or an appropriate error code.
 */
-int azqlite_vfs_register(int makeDefault);
+int sqlite_objs_vfs_register(int makeDefault);
 
 /*
-** Register the "azqlite" VFS with an explicit configuration.
+** Register the "sqlite-objs" VFS with an explicit configuration.
 ** The config struct is copied — the caller may free it after this call.
 **
 ** If makeDefault is non-zero, this VFS becomes the default.
 ** Returns SQLITE_OK on success, or an appropriate error code.
 */
-int azqlite_vfs_register_with_config(const azqlite_config_t *config,
+int sqlite_objs_vfs_register_with_config(const sqlite_objs_config_t *config,
                                      int makeDefault);
 
 /*
-** Register the "azqlite" VFS with an explicit ops vtable and context.
+** Register the "sqlite-objs" VFS with an explicit ops vtable and context.
 ** Convenience wrapper for test code — equivalent to calling
-** azqlite_vfs_register_with_config with ops/ops_ctx fields set.
+** sqlite_objs_vfs_register_with_config with ops/ops_ctx fields set.
 */
-int azqlite_vfs_register_with_ops(azure_ops_t *ops, void *ctx,
+int sqlite_objs_vfs_register_with_ops(azure_ops_t *ops, void *ctx,
                                   int makeDefault);
 
 /*
-** Register the "azqlite" VFS with no global Azure client.
+** Register the "sqlite-objs" VFS with no global Azure client.
 ** All databases MUST provide Azure credentials via URI parameters:
 **
 **   file:mydb.db?azure_account=acct&azure_container=cont&azure_sas=token
@@ -105,10 +105,10 @@ int azqlite_vfs_register_with_ops(azure_ops_t *ops, void *ctx,
 ** If makeDefault is non-zero, this VFS becomes the default.
 ** Returns SQLITE_OK on success, or an appropriate error code.
 */
-int azqlite_vfs_register_uri(int makeDefault);
+int sqlite_objs_vfs_register_uri(int makeDefault);
 
 #ifdef __cplusplus
 }
 #endif
 
-#endif /* AZQLITE_H */
+#endif /* SQLITE_OBJS_H */

@@ -1,5 +1,5 @@
 /*
- * test_integration.c — Layer 2 Integration Tests for azqlite
+ * test_integration.c — Layer 2 Integration Tests for sqliteObjs
  *
  * These tests run against Azurite — a local Azure Storage emulator — and use
  * the REAL azure_client.c code (not mocks). They validate:
@@ -9,16 +9,16 @@
  *
  * Prerequisites:
  *   - Azurite running on 127.0.0.1:10000
- *   - Container "azqlite-test" created
+ *   - Container "sqlite-objs-test" created
  *
  * The test/run-integration.sh wrapper script handles Azurite lifecycle.
  *
- * Part of the azqlite project. License: MIT
+ * Part of the sqliteObjs project. License: MIT
  */
 
 #include "test_harness.h"
 #include "azure_client.h"
-#include "azqlite.h"
+#include "sqlite_objs.h"
 #include "sqlite3.h"
 
 #include <stdio.h>
@@ -31,7 +31,7 @@
  * ================================================================ */
 
 #define AZURITE_ACCOUNT    "devstoreaccount1"
-#define AZURITE_CONTAINER  "azqlite-test"
+#define AZURITE_CONTAINER  "sqlite-objs-test"
 #define AZURITE_ENDPOINT   "http://127.0.0.1:10000"
 
 /* Well-known Azurite shared key (same on every install — NOT a secret) */
@@ -314,8 +314,8 @@ TEST(vfs_roundtrip) {
     cleanup_blob(db_name);
     cleanup_blob("vfs-test.db-journal");
 
-    /* Register the azqlite VFS with Azurite config */
-    azqlite_config_t cfg = {
+    /* Register the sqliteObjs VFS with Azurite config */
+    sqlite_objs_config_t cfg = {
         .account = AZURITE_ACCOUNT,
         .container = AZURITE_CONTAINER,
         .sas_token = NULL,
@@ -324,14 +324,14 @@ TEST(vfs_roundtrip) {
         .ops = NULL,  /* Use production client */
         .ops_ctx = NULL
     };
-    int rc = azqlite_vfs_register_with_config(&cfg, 0);
+    int rc = sqlite_objs_vfs_register_with_config(&cfg, 0);
     ASSERT_OK(rc);
 
-    /* Open a database using the azqlite VFS */
+    /* Open a database using the sqliteObjs VFS */
     sqlite3 *db = NULL;
     rc = sqlite3_open_v2(db_name, &db,
                          SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE,
-                         "azqlite");
+                         "sqlite-objs");
     ASSERT_OK(rc);
     ASSERT_NOT_NULL(db);
 
@@ -363,7 +363,7 @@ TEST(vfs_roundtrip) {
     /* Reopen and verify data persists */
     db = NULL;
     rc = sqlite3_open_v2(db_name, &db,
-                         SQLITE_OPEN_READWRITE, "azqlite");
+                         SQLITE_OPEN_READWRITE, "sqlite-objs");
     ASSERT_OK(rc);
 
     sqlite3_stmt *stmt = NULL;
@@ -393,7 +393,7 @@ TEST(journal_roundtrip) {
     cleanup_blob("journal-test.db-journal");
 
     /* Register VFS (reuse from previous test) */
-    azqlite_config_t cfg = {
+    sqlite_objs_config_t cfg = {
         .account = AZURITE_ACCOUNT,
         .container = AZURITE_CONTAINER,
         .sas_token = NULL,
@@ -402,13 +402,13 @@ TEST(journal_roundtrip) {
         .ops = NULL,
         .ops_ctx = NULL
     };
-    int rc = azqlite_vfs_register_with_config(&cfg, 0);
+    int rc = sqlite_objs_vfs_register_with_config(&cfg, 0);
     ASSERT_OK(rc);
 
     sqlite3 *db = NULL;
     rc = sqlite3_open_v2(db_name, &db,
                          SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE,
-                         "azqlite");
+                         "sqlite-objs");
     ASSERT_OK(rc);
 
     /* Create a table */
@@ -563,7 +563,7 @@ TEST(integ_uri_open_with_params) {
     cleanup_blob("uritest.db-journal");
 
     /* Register the VFS in URI-only mode */
-    int rc = azqlite_vfs_register_uri(0);
+    int rc = sqlite_objs_vfs_register_uri(0);
     ASSERT_OK(rc);
 
     /* Open database with URI parameters pointing to Azurite */
@@ -576,7 +576,7 @@ TEST(integ_uri_open_with_params) {
         "&azure_endpoint=" AZURITE_ENDPOINT,
         &db,
         SQLITE_OPEN_URI | SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE,
-        "azqlite");
+        "sqlite-objs");
     ASSERT_OK(rc);
     ASSERT_NOT_NULL(db);
 
@@ -623,7 +623,7 @@ TEST(integ_multi_db_independent) {
     cleanup_blob("multi_b.db-journal");
 
     /* Register VFS with Azurite config */
-    azqlite_config_t cfg = {
+    sqlite_objs_config_t cfg = {
         .account = AZURITE_ACCOUNT,
         .container = AZURITE_CONTAINER,
         .sas_token = NULL,
@@ -632,20 +632,20 @@ TEST(integ_multi_db_independent) {
         .ops = NULL,
         .ops_ctx = NULL
     };
-    int rc = azqlite_vfs_register_with_config(&cfg, 0);
+    int rc = sqlite_objs_vfs_register_with_config(&cfg, 0);
     ASSERT_OK(rc);
 
     /* Open two databases */
     sqlite3 *db1 = NULL, *db2 = NULL;
     rc = sqlite3_open_v2(db1_name, &db1,
                           SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE,
-                          "azqlite");
+                          "sqlite-objs");
     ASSERT_OK(rc);
     ASSERT_NOT_NULL(db1);
 
     rc = sqlite3_open_v2(db2_name, &db2,
                           SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE,
-                          "azqlite");
+                          "sqlite-objs");
     ASSERT_OK(rc);
     ASSERT_NOT_NULL(db2);
 
@@ -691,7 +691,7 @@ TEST(integ_multi_db_independent) {
     sqlite3_close(db1);
     sqlite3_close(db2);
 
-    rc = sqlite3_open_v2(db1_name, &db1, SQLITE_OPEN_READWRITE, "azqlite");
+    rc = sqlite3_open_v2(db1_name, &db1, SQLITE_OPEN_READWRITE, "sqlite-objs");
     ASSERT_OK(rc);
     rc = sqlite3_prepare_v2(db1, "SELECT val FROM t WHERE id=1;", -1, &stmt, NULL);
     ASSERT_OK(rc);
@@ -701,7 +701,7 @@ TEST(integ_multi_db_independent) {
     sqlite3_finalize(stmt);
     sqlite3_close(db1);
 
-    rc = sqlite3_open_v2(db2_name, &db2, SQLITE_OPEN_READWRITE, "azqlite");
+    rc = sqlite3_open_v2(db2_name, &db2, SQLITE_OPEN_READWRITE, "sqlite-objs");
     ASSERT_OK(rc);
     rc = sqlite3_prepare_v2(db2, "SELECT val FROM t WHERE id=1;", -1, &stmt, NULL);
     ASSERT_OK(rc);
@@ -726,8 +726,8 @@ TEST(integ_multi_db_independent) {
  * ================================================================ */
 
 TEST(integ_uri_two_containers) {
-    const char *container1 = "azqlite-uri-c1";
-    const char *container2 = "azqlite-uri-c2";
+    const char *container1 = "sqlite-objs-uri-c1";
+    const char *container2 = "sqlite-objs-uri-c2";
 
     /* Create two separate containers via two clients */
     azure_client_config_t cfg1 = {
@@ -764,7 +764,7 @@ TEST(integ_uri_two_containers) {
     azure_client_destroy(client2);
 
     /* Register VFS in URI-only mode */
-    int rc = azqlite_vfs_register_uri(0);
+    int rc = sqlite_objs_vfs_register_uri(0);
     ASSERT_OK(rc);
 
     /* Open DB1 in container1 via URI */
@@ -776,7 +776,7 @@ TEST(integ_uri_two_containers) {
         AZURITE_ACCOUNT, container1, AZURITE_KEY, AZURITE_ENDPOINT);
     rc = sqlite3_open_v2(uri1, &db1,
                           SQLITE_OPEN_URI | SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE,
-                          "azqlite");
+                          "sqlite-objs");
     ASSERT_OK(rc);
     ASSERT_NOT_NULL(db1);
 
@@ -789,7 +789,7 @@ TEST(integ_uri_two_containers) {
         AZURITE_ACCOUNT, container2, AZURITE_KEY, AZURITE_ENDPOINT);
     rc = sqlite3_open_v2(uri2, &db2,
                           SQLITE_OPEN_URI | SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE,
-                          "azqlite");
+                          "sqlite-objs");
     ASSERT_OK(rc);
     ASSERT_NOT_NULL(db2);
 
@@ -846,11 +846,11 @@ TEST(integ_uri_two_containers) {
  * ================================================================ */
 
 TEST(integ_attach_cross_container) {
-    const char *container_main = "azqlite-uri-c1";
-    const char *container_att  = "azqlite-uri-c2";
+    const char *container_main = "sqlite-objs-uri-c1";
+    const char *container_att  = "sqlite-objs-uri-c2";
 
     /* Register VFS with Azurite config for primary container */
-    azqlite_config_t cfg = {
+    sqlite_objs_config_t cfg = {
         .account = AZURITE_ACCOUNT,
         .container = container_main,
         .sas_token = NULL,
@@ -859,14 +859,14 @@ TEST(integ_attach_cross_container) {
         .ops = NULL,
         .ops_ctx = NULL
     };
-    int rc = azqlite_vfs_register_with_config(&cfg, 0);
+    int rc = sqlite_objs_vfs_register_with_config(&cfg, 0);
     ASSERT_OK(rc);
 
     /* Open primary database */
     sqlite3 *db = NULL;
     rc = sqlite3_open_v2("attach_main.db", &db,
                           SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE,
-                          "azqlite");
+                          "sqlite-objs");
     ASSERT_OK(rc);
     ASSERT_NOT_NULL(db);
 
@@ -928,7 +928,7 @@ TEST(integ_attach_cross_container) {
 int main(void) {
     fprintf(stdout, "\n");
     fprintf(stdout, "╔════════════════════════════════════════════════════════╗\n");
-    fprintf(stdout, "║  azqlite Layer 2 Integration Tests (Azurite)          ║\n");
+    fprintf(stdout, "║  sqliteObjs Layer 2 Integration Tests (Azurite)          ║\n");
     fprintf(stdout, "║  Testing REAL azure_client.c against local emulator   ║\n");
     fprintf(stdout, "╚════════════════════════════════════════════════════════╝\n");
 

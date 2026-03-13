@@ -1,6 +1,6 @@
 # Azure Demo
 
-This directory contains a demonstration script showing azqlite in action with real Azure Blob Storage.
+This directory contains a demonstration script showing sqlite-objs in action with real Azure Blob Storage.
 
 ## Prerequisites
 
@@ -44,7 +44,7 @@ From the project root directory:
 
 The script will:
 1. Verify environment variables are set
-2. Build `azqlite-shell` with production Azure client
+2. Build `sqlite-objs-shell` with production Azure client
 3. Create a database in Azure Blob Storage
 4. Create a table and insert test data
 5. Query and update the data
@@ -56,7 +56,7 @@ The demo creates a **page blob** in your Azure container named `demo-{timestamp}
 
 You can:
 - View it in Azure Portal or Azure Storage Explorer
-- Connect to it again using `azqlite-shell demo-{timestamp}.db`
+- Connect to it again using `sqlite-objs-shell demo-{timestamp}.db`
 - Delete it when done (see cleanup command in script output)
 
 ## Troubleshooting

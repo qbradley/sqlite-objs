@@ -1,6 +1,6 @@
 # SQLite VFS API Deep Analysis
 
-> Research by Aragorn (SQLite/C Dev) — azqlite project
+> Research by Aragorn (SQLite/C Dev) — sqlite-objs project
 > Source: `sqlite-autoconf-3520000/sqlite3.h` and `sqlite3.c` (SQLite 3.52.0 amalgamation)
 
 ---
@@ -573,8 +573,8 @@ myVfs.xSleep = pDefault->xSleep;
 ### Selecting the VFS
 
 Applications specify the VFS in three ways:
-1. `sqlite3_open_v2(filename, &db, flags, "azqlite")` — explicit VFS name
-2. URI parameter: `sqlite3_open_v2("file:test.db?vfs=azqlite", &db, SQLITE_OPEN_URI, NULL)`
+1. `sqlite3_open_v2(filename, &db, flags, "sqlite-objs")` — explicit VFS name
+2. URI parameter: `sqlite3_open_v2("file:test.db?vfs=sqlite-objs", &db, SQLITE_OPEN_URI, NULL)`
 3. Making it the default: `sqlite3_vfs_register(pVfs, 1)` — all opens use it
 
 ---
@@ -829,17 +829,17 @@ If `xOpen` sets `pFile->pMethods` to a non-NULL value, `xClose` WILL be called e
 ### MVP Architecture
 
 ```
-azqliteVfs (sqlite3_vfs)
-    ├── xOpen (MAIN_DB)     → azqliteFile (our struct, Azure blob-backed)
-    ├── xOpen (MAIN_JOURNAL) → azqliteFile (Azure blob-backed)
+sqlite-objsVfs (sqlite3_vfs)
+    ├── xOpen (MAIN_DB)     → sqlite-objsFile (our struct, Azure blob-backed)
+    ├── xOpen (MAIN_JOURNAL) → sqlite-objsFile (Azure blob-backed)
     ├── xOpen (TEMP/*)       → delegate to default VFS (local files)
     ├── xDelete              → Azure blob delete
     ├── xAccess              → Azure blob exists check
     ├── xFullPathname        → normalize Azure path (container/blob)
     └── xRandomness/xSleep/xCurrentTime → delegate to default VFS
 
-azqliteFile (sqlite3_file subclass)
-    ├── pMethod → azqliteIoMethods (iVersion=1)
+sqlite-objsFile (sqlite3_file subclass)
+    ├── pMethod → sqlite-objsIoMethods (iVersion=1)
     │   ├── xRead         → read from local cache, fill from Azure on miss
     │   ├── xWrite        → write to local buffer
     │   ├── xSync         → flush local buffer to Azure blob
@@ -856,8 +856,8 @@ azqliteFile (sqlite3_file subclass)
 ### Struct Layout
 
 ```c
-typedef struct azqliteFile azqliteFile;
-struct azqliteFile {
+typedef struct sqlite-objsFile sqlite-objsFile;
+struct sqlite-objsFile {
     sqlite3_io_methods const *pMethod;  /* MUST be first */
     /* Azure connection state */
     char *zBlobUrl;                     /* Full Azure blob URL */

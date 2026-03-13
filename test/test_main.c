@@ -1,5 +1,5 @@
 /*
-** test_main.c — Test Runner for azqlite Layer 1 tests
+** test_main.c — Test Runner for sqliteObjs Layer 1 tests
 **
 ** Runs all test suites, reports summary, returns 0 on all pass.
 **
@@ -33,7 +33,7 @@ int main(int argc, char **argv) {
 
     fprintf(stdout,
         "%s%s╔══════════════════════════════════════╗%s\n"
-        "%s%s║   azqlite Layer 1 Test Suite         ║%s\n"
+        "%s%s║   sqliteObjs Layer 1 Test Suite         ║%s\n"
         "%s%s╚══════════════════════════════════════╝%s\n",
         TH_BOLD, TH_YELLOW, TH_RESET,
         TH_BOLD, TH_YELLOW, TH_RESET,

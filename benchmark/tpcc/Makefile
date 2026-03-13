@@ -1,6 +1,6 @@
 # Makefile for TPC-C benchmark
 #
-# Builds TPC-C OLTP benchmark for local SQLite and azqlite (Azure blob-backed)
+# Builds TPC-C OLTP benchmark for local SQLite and sqlite-objs (Azure blob-backed)
 
 # ---------- Configuration ----------
 
@@ -48,11 +48,11 @@ LDFLAGS_PROD = $(LDFLAGS) $(CURL_LDFLAGS) $(OPENSSL_LDFLAGS)
 SQLITE_OBJ = $(BUILD_DIR)/sqlite3.o
 
 # VFS objects (stub build - local only)
-VFS_STUB_OBJS = $(BUILD_DIR)/azqlite_vfs.o \
+VFS_STUB_OBJS = $(BUILD_DIR)/sqlite_objs_vfs.o \
                 $(BUILD_DIR)/azure_client_stub.o
 
 # VFS objects (production build - with Azure support)
-VFS_PROD_OBJS = $(BUILD_DIR)/azqlite_vfs.o \
+VFS_PROD_OBJS = $(BUILD_DIR)/sqlite_objs_vfs.o \
                 $(BUILD_DIR)/azure_client.o \
                 $(BUILD_DIR)/azure_auth.o \
                 $(BUILD_DIR)/azure_error.o
@@ -90,7 +90,7 @@ $(TPCC_LOCAL_BIN): $(TPCC_LOCAL_OBJS) $(SQLITE_OBJ) | $(TPCC_BUILD)
 
 # Build TPC-C Azure version
 $(TPCC_AZURE_BIN): $(TPCC_AZURE_OBJS) $(SQLITE_OBJ) $(VFS_PROD_OBJS) | $(TPCC_BUILD)
-	$(CC) $(CFLAGS_PROD) -DAZQLITE_VFS_AVAILABLE -o $@ $(TPCC_AZURE_OBJS) $(SQLITE_OBJ) $(VFS_PROD_OBJS) $(LDFLAGS_PROD)
+	$(CC) $(CFLAGS_PROD) -DSQLITE_OBJS_VFS_AVAILABLE -o $@ $(TPCC_AZURE_OBJS) $(SQLITE_OBJ) $(VFS_PROD_OBJS) $(LDFLAGS_PROD)
 
 # TPC-C object files (local version - no VFS flag)
 $(TPCC_BUILD)/%_local.o: %.c tpcc_schema.h | $(TPCC_BUILD)
@@ -98,7 +98,7 @@ $(TPCC_BUILD)/%_local.o: %.c tpcc_schema.h | $(TPCC_BUILD)
 
 # TPC-C object files (Azure version - with VFS flag)
 $(TPCC_BUILD)/%_azure.o: %.c tpcc_schema.h | $(TPCC_BUILD)
-	$(CC) $(CFLAGS_PROD) -DAZQLITE_VFS_AVAILABLE -c -o $@ $<
+	$(CC) $(CFLAGS_PROD) -DSQLITE_OBJS_VFS_AVAILABLE -c -o $@ $<
 
 # Build directory
 $(TPCC_BUILD):
@@ -109,9 +109,9 @@ $(SQLITE_OBJ):
 	@echo "Building SQLite amalgamation..."
 	@cd $(PARENT_DIR) && $(MAKE) $(BUILD_DIR)/sqlite3.o
 
-$(BUILD_DIR)/azqlite_vfs.o:
+$(BUILD_DIR)/sqlite_objs_vfs.o:
 	@echo "Building VFS layer..."
-	@cd $(PARENT_DIR) && $(MAKE) $(BUILD_DIR)/azqlite_vfs.o
+	@cd $(PARENT_DIR) && $(MAKE) $(BUILD_DIR)/sqlite_objs_vfs.o
 
 $(BUILD_DIR)/azure_client_stub.o:
 	@echo "Building Azure client stub..."

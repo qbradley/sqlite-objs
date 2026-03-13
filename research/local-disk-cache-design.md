@@ -6,7 +6,7 @@
 
 ## Problem Statement
 
-When azqlite opens an Azure-backed database, it must download pages from
+When sqlite-objs opens an Azure-backed database, it must download pages from
 blob storage before any reads can proceed. Even with `prefetch=all`, a
 90MB database takes several seconds to download. On reconnect from the
 same machine, the entire download repeats — even if nothing changed.
@@ -66,7 +66,7 @@ handle immediate needs while the background thread fills in the rest.
 ### Cache Directory
 
 Configurable via URI parameter `cache_dir=<path>`, defaulting to a
-platform-appropriate location (e.g., `~/.azqlite/cache/`). The
+platform-appropriate location (e.g., `~/.sqlite-objs/cache/`). The
 directory is created on first use.
 
 Each remote database maps to a pair of files. The filename is derived
@@ -74,7 +74,7 @@ from a hash of `account + container + blob_name` to avoid path
 collisions and filesystem-unfriendly characters:
 
 ```
-~/.azqlite/cache/
+~/.sqlite-objs/cache/
   <hash>.meta     — Metadata: header, bitmaps, checksums
   <hash>.pages    — Page data store
 ```
@@ -300,7 +300,7 @@ typedef struct {
     int pages_total;            /* Total pages to fetch */
     int complete;               /* 1 when prefetch is done */
     /* ... file pointers, mmap bases, azure_ops, etc. */
-} azqlite_prefetch_ctx_t;
+} sqlite_objs_prefetch_ctx_t;
 ```
 
 ### Algorithm
@@ -368,33 +368,33 @@ negligible because:
 
 ```c
 /* Wait for prefetch to complete (blocks until done or timeout) */
-#define AZQLITE_FCNTL_PREFETCH_WAIT     1002
+#define SQLITE_OBJS_FCNTL_PREFETCH_WAIT     1002
 
 /* Query prefetch progress (non-blocking) */
-#define AZQLITE_FCNTL_PREFETCH_PROGRESS 1003
+#define SQLITE_OBJS_FCNTL_PREFETCH_PROGRESS 1003
 
 typedef struct {
     int pages_fetched;    /* Pages downloaded so far */
     int pages_total;      /* Total pages to download (0 = already cached) */
     int complete;         /* 1 if prefetch is done */
     double elapsed_ms;    /* Time since prefetch started */
-} azqlite_prefetch_progress_t;
+} sqlite_objs_prefetch_progress_t;
 ```
 
 Usage patterns:
 
 ```c
 /* "prefetch=all" equivalent: open + wait */
-sqlite3_open_v2("file:db.db?cache_dir=/tmp/cache", &db, flags, "azqlite");
-sqlite3_file_control(db, "main", AZQLITE_FCNTL_PREFETCH_WAIT, NULL);
+sqlite3_open_v2("file:db.db?cache_dir=/tmp/cache", &db, flags, "sqlite-objs");
+sqlite3_file_control(db, "main", SQLITE_OBJS_FCNTL_PREFETCH_WAIT, NULL);
 
 /* Low-latency open: let prefetch run in background */
-sqlite3_open_v2("file:db.db?cache_dir=/tmp/cache", &db, flags, "azqlite");
+sqlite3_open_v2("file:db.db?cache_dir=/tmp/cache", &db, flags, "sqlite-objs");
 /* Start querying immediately — demand-load handles misses */
 
 /* Progress monitoring */
-azqlite_prefetch_progress_t prog;
-sqlite3_file_control(db, "main", AZQLITE_FCNTL_PREFETCH_PROGRESS, &prog);
+sqlite_objs_prefetch_progress_t prog;
+sqlite3_file_control(db, "main", SQLITE_OBJS_FCNTL_PREFETCH_PROGRESS, &prog);
 printf("Prefetch: %d/%d pages (%.1f%%)\n",
        prog.pages_fetched, prog.pages_total,
        100.0 * prog.pages_fetched / prog.pages_total);
@@ -402,10 +402,10 @@ printf("Prefetch: %d/%d pages (%.1f%%)\n",
 
 ## Replacing the In-Memory LRU Cache
 
-The mmap-backed page store **replaces** the current `azqlite_page_cache_t`
+The mmap-backed page store **replaces** the current `sqlite_objs_page_cache_t`
 entirely. The following code is removed:
 
-- `azqlite_page_cache_t` struct and all methods (~300 lines)
+- `sqlite_objs_page_cache_t` struct and all methods (~300 lines)
 - `cacheInit`, `cacheDestroy`, `cacheLookup`, `cacheInsert`
 - `cacheRemove`, `cacheLruTouch`, `cacheEvictClean`
 - `cacheCollectDirty` — replaced by dirty_bitmap scan
@@ -498,7 +498,7 @@ Because **no pointers are stored in the mapped files** — only page
 indices and byte offsets — remapping is safe at any time. The derived
 pointers (`valid_bitmap`, `dirty_bitmap`, `checksums`) are recomputed
 from the mmap base address and `page_count` after every remap. They
-live in the `azqliteFile` struct (process memory), never in the mmap.
+live in the `sqlite-objsFile` struct (process memory), never in the mmap.
 
 The prefetch thread must be paused during remap (it holds pointers to
 the old mapping). Sequence: signal pause → join or wait for ack →
@@ -558,7 +558,7 @@ azure_err_t (*page_blob_read_batch)(
 
 Mirrors `page_blob_write_batch`: uses the existing `curl_multi` handle
 and connection pool. Each range becomes a GET request with a `Range`
-header. Up to `AZQLITE_MAX_PARALLEL_GETS` (32) concurrent requests.
+header. Up to `SQLITE_OBJS_MAX_PARALLEL_GETS` (32) concurrent requests.
 
 The existing `ensure_multi_handle()`, `curl_multi_perform()` loop, and
 lease renewal logic are reused directly.
@@ -567,13 +567,13 @@ lease renewal logic are reused directly.
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
-| `cache_dir` | `~/.azqlite/cache/` | Local directory for cache files |
+| `cache_dir` | `~/.sqlite-objs/cache/` | Local directory for cache files |
 | `cache` | `on` | `on` = use local disk cache, `off` = in-memory only |
 | `prefetch` | `lazy` | `lazy` = background download, `off` = demand-load only |
 | `checksum` | `on` | `on` = CRC32C per page, `off` = no checksums |
 
 The old `prefetch=all` becomes: open with `prefetch=lazy`, then
-immediately call `AZQLITE_FCNTL_PREFETCH_WAIT`. The old
+immediately call `SQLITE_OBJS_FCNTL_PREFETCH_WAIT`. The old
 `prefetch=off` maps directly.
 
 The old `cache_pages` parameter is removed — the mmap handles
@@ -649,7 +649,7 @@ Defer until there is a concrete customer need.
 - Parse ETag in `curl_header_cb`
 - Populate `azure_error_t.etag` after each Azure operation
 - Pipe ETag through `blob_get_properties` to VFS
-- Capture in `azqliteFile.etag` on open and after sync
+- Capture in `sqlite-objsFile.etag` on open and after sync
 - **Tests:** Verify ETag captured from HEAD, GET, PUT responses
 
 ### Phase 2: Metadata + Page Store Files
@@ -669,7 +669,7 @@ Defer until there is a concrete customer need.
 - xSync: scan dirty_bitmap → coalesce → write_batch → clear dirty
   → store ETag → msync
 - xClose: msync + munmap + clear session_active
-- Remove azqlite_page_cache_t and all LRU code
+- Remove sqlite_objs_page_cache_t and all LRU code
 - Single mutex for page store + bitmap operations
 - **Tests:** Read/write/sync cycle, cache persistence across close/open
 
@@ -712,7 +712,7 @@ Defer until there is a concrete customer need.
    at open time with a clear error message may be sufficient.
 
 3. **Cache eviction policy:** When should old cache files be deleted?
-   A `~/.azqlite/cache/` directory could accumulate stale caches.
+   A `~/.sqlite-objs/cache/` directory could accumulate stale caches.
    Options: LRU eviction when total cache size exceeds a limit,
    manual cleanup, or TTL-based expiry.
 

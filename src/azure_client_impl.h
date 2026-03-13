@@ -6,7 +6,7 @@
  * This header adds only internal constants, the concrete azure_client struct,
  * internal response types, and internal function declarations.
  *
- * Part of the azqlite project — Azure Blob-backed SQLite VFS.
+ * Part of the sqliteObjs project — Azure Blob-backed SQLite VFS.
  * License: MIT
  */
 

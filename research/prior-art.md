@@ -4,7 +4,7 @@
 >
 > A comprehensive survey of existing projects that back SQLite with remote or cloud
 > storage, with particular attention to Azure Blob Storage, S3, and other object stores.
-> This research informs the design of **azqlite** — our Azure Blob-backed SQLite VFS.
+> This research informs the design of **sqlite-objs** — our Azure Blob-backed SQLite VFS.
 
 ---
 
@@ -30,7 +30,7 @@
 18. [go-cloud-sqlite-vfs (PDOK)](#18-go-cloud-sqlite-vfs-pdok)
 19. [ncruces/go-sqlite3 VFS Framework](#19-ncrucesgo-sqlite3-vfs-framework)
 20. [Taxonomy & Comparison Matrix](#20-taxonomy--comparison-matrix)
-21. [Key Lessons for azqlite](#21-key-lessons-for-azqlite)
+21. [Key Lessons for sqlite-objs](#21-key-lessons-for-sqlite-objs)
 22. [Anti-Patterns & Known Failure Modes](#22-anti-patterns--known-failure-modes)
 23. [Architectural Recommendations](#23-architectural-recommendations)
 
@@ -72,7 +72,7 @@ The SQLite team is warning against *naively* mounting a remote filesystem and po
 
 ### Architecture
 
-CBS is **the most directly relevant prior art for azqlite**, developed by the SQLite team themselves.
+CBS is **the most directly relevant prior art for sqlite-objs**, developed by the SQLite team themselves.
 
 - **Block-based storage:** The database is split into fixed-size blocks (default 4MB, configurable). Each block is stored as a separate blob (`.bcv` files).
 - **Manifest file:** A central `manifest.bcv` maps block IDs to database offsets, enabling reassembly.
@@ -113,13 +113,13 @@ CBS uses **block blobs** (not page blobs). Each 4MB chunk is a complete block bl
 - Flat storage structure — no subdirectories in the blob container.
 - Limited community adoption despite being official.
 
-### Lessons for azqlite
+### Lessons for sqlite-objs
 
 - **The VFS approach is blessed by SQLite's own team.** This validates our architectural direction.
 - **Block-based chunking is the proven pattern** for mapping SQLite's page I/O to object storage.
 - **We can do better on locking** — CBS punts on this; we should use Azure Blob Leases.
 - **We can do better on write amplification** — our use of Azure Page Blobs (512-byte aligned random writes) could avoid the 4MB write amplification problem entirely.
-- **We should not use block blobs for the database file** if we want efficient random writes. Page blobs are the right primitive for azqlite.
+- **We should not use block blobs for the database file** if we want efficient random writes. Page blobs are the right primitive for sqlite-objs.
 
 ---
 
@@ -168,7 +168,7 @@ Litestream takes two approaches:
 - **Not a transparent VFS** — the backup mode requires running Litestream as a sidecar process.
 - The writable VFS is relatively new and less battle-tested.
 
-### Lessons for azqlite
+### Lessons for sqlite-objs
 
 - **The hybrid local-buffer + cloud-sync pattern is powerful** but introduces a durability gap. We need to decide: are we willing to accept eventual durability, or do we require synchronous cloud writes?
 - **Background hydration is a pattern worth stealing** for our MVP 2 (in-memory read cache).
@@ -212,7 +212,7 @@ Litestream takes two approaches:
 - **No split-brain protection built-in** — depends on external lease/Consul.
 - **Coupled to Fly.io's infrastructure** in practice.
 
-### Lessons for azqlite
+### Lessons for sqlite-objs
 
 - **The FUSE approach is too platform-dependent for us.** Our C VFS approach is more portable.
 - **The LTX transaction-shipping pattern is interesting** for our MVP 3/4 (multi-machine reads/writes).
@@ -259,7 +259,7 @@ The most ambitious project in this space. mvsqlite replaces SQLite's entire stor
 - **Single-writer per DB** — the fundamental SQLite constraint persists.
 - **Heavy conflict rate** under concurrent write load to a single DB.
 
-### Lessons for azqlite
+### Lessons for sqlite-objs
 
 - **Page-level versioning is powerful** but probably overkill for MVP. Consider for future.
 - **Content-addressed page storage** is an interesting optimization for deduplication.
@@ -300,7 +300,7 @@ The most ambitious project in this space. mvsqlite replaces SQLite's entire stor
 - **Write throughput limited by Raft** — every write requires majority acknowledgment.
 - **No sharding** — single Raft group bottleneck.
 
-### Lessons for azqlite
+### Lessons for sqlite-objs
 
 - **Different problem space.** rqlite solves distributed consensus; we solve durable remote storage.
 - **The HTTP API approach would break our "drop-in replacement" requirement.**
@@ -324,7 +324,7 @@ The most ambitious project in this space. mvsqlite replaces SQLite's entire stor
 - Direct C API (not HTTP), closer to SQLite's native interface.
 - Leader-serialized writes, Raft-replicated.
 
-### Lessons for azqlite
+### Lessons for sqlite-objs
 
 - **LGPL license is problematic** for our MIT project — can't statically link.
 - **Interesting C Raft implementation** but again solves a different problem (consensus vs. storage).
@@ -360,7 +360,7 @@ The most ambitious project in this space. mvsqlite replaces SQLite's entire stor
 - **Requires forking SQLite** — they maintain their own SQLite fork, which is a significant ongoing burden.
 - **Not a pure VFS approach** — modifications to SQLite internals.
 
-### Lessons for azqlite
+### Lessons for sqlite-objs
 
 - **We explicitly chose NOT to fork SQLite** (project constraint: `sqlite-autoconf-3520000/` — do not modify unless absolutely necessary). This is the right call — maintaining a fork is expensive.
 - **The block + manifest pattern appears independently in CBS and Turso** — it's a strong convergent design.
@@ -384,7 +384,7 @@ The most ambitious project in this space. mvsqlite replaces SQLite's entire stor
 - Accessed via Workers API, not as a library.
 - Point-in-time recovery ("Time Travel") via WAL-based snapshotting.
 
-### Lessons for azqlite
+### Lessons for sqlite-objs
 
 - **Closed-source, so limited direct learning.** But confirms that SQLite + cloud storage is a viable and growing market.
 - **10GB per-database limit** suggests they hit scalability challenges.
@@ -423,7 +423,7 @@ The most ambitious project in this space. mvsqlite replaces SQLite's entire stor
 - **Python-only** — not usable from C applications.
 - **No caching** — every read is an S3 round-trip.
 
-### Lessons for azqlite
+### Lessons for sqlite-objs
 
 - **Page-per-object is too granular for object storage.** The overhead of one HTTP request per 4KB page is crippling. CBS's 4MB block approach is better.
 - **However, Azure Page Blobs give us sub-object random writes** — we don't need one-object-per-page. We can store the entire DB as a single page blob and do 512-byte aligned reads/writes. This is a significant advantage over S3-based approaches.
@@ -447,7 +447,7 @@ The most ambitious project in this space. mvsqlite replaces SQLite's entire stor
 - Uses HTTP range requests to fetch only needed pages.
 - Repeatable-read semantics via S3 object versioning.
 
-### Lessons for azqlite
+### Lessons for sqlite-objs
 
 - **HTTP range requests are the right primitive for read-only access** — we should use Azure Blob range reads similarly.
 - **Repeatable-read via object versioning** is a useful pattern for snapshot isolation.
@@ -471,7 +471,7 @@ The most ambitious project in this space. mvsqlite replaces SQLite's entire stor
 - Implements a VFS that fetches pages via HTTP range requests from any static file host.
 - Read-only.
 
-### Lessons for azqlite
+### Lessons for sqlite-objs
 
 - Proves HTTP range requests work well for random-access reads of SQLite pages.
 - Interesting "virtual read head" optimization for sequential access patterns.
@@ -495,7 +495,7 @@ The most ambitious project in this space. mvsqlite replaces SQLite's entire stor
 - Can query remote databases hosted on S3, CDNs, or any HTTP server supporting range requests.
 - Can be compiled as a loadable SQLite extension.
 
-### Lessons for azqlite
+### Lessons for sqlite-objs
 
 - Clean, minimal implementation. Good reference for how a VFS translates reads to HTTP range requests.
 - Read-only only.
@@ -531,10 +531,10 @@ The most ambitious project in this space. mvsqlite replaces SQLite's entire stor
 - **Limited data types** for CRDT support.
 - **Not a storage backend** — still needs a local SQLite file.
 
-### Lessons for azqlite
+### Lessons for sqlite-objs
 
 - **CRDTs are the only approach that truly solves multi-writer.** Everything else (Raft, leases, locks) serializes writes.
-- **But CRDTs are a layer above our VFS** — they could potentially be combined with azqlite for MVP 4.
+- **But CRDTs are a layer above our VFS** — they could potentially be combined with sqlite-objs for MVP 4.
 - **The 2.5x write overhead is non-trivial** and might not be acceptable for all workloads.
 
 ---
@@ -556,7 +556,7 @@ The most ambitious project in this space. mvsqlite replaces SQLite's entire stor
 - No central leader — fully decentralized.
 - Eventual consistency via CRDTs.
 
-### Lessons for azqlite
+### Lessons for sqlite-objs
 
 - **Shows the cr-sqlite + gossip approach at production scale** (800+ nodes at Fly.io).
 - **Different problem** — service discovery / state sync, not durable storage.
@@ -581,7 +581,7 @@ The most ambitious project in this space. mvsqlite replaces SQLite's entire stor
 - Sync service mediates via Postgres logical replication + WebSocket protocol.
 - CRDTs for conflict resolution.
 
-### Lessons for azqlite
+### Lessons for sqlite-objs
 
 - **Different architecture** — sync between two database engines, not a VFS.
 - **The "local-first" pattern** (fast local reads, async sync) is philosophically aligned with our MVP 2 cache.
@@ -605,7 +605,7 @@ The most ambitious project in this space. mvsqlite replaces SQLite's entire stor
 - A server implements the actual storage backend; clients use a VFS that forwards I/O over gRPC.
 - Backend-agnostic — could be backed by any storage.
 
-### Lessons for azqlite
+### Lessons for sqlite-objs
 
 - **Interesting abstraction** but adds a network hop (gRPC) on top of the storage hop.
 - **We don't need the intermediary** — our VFS talks directly to Azure REST API.
@@ -629,7 +629,7 @@ The most ambitious project in this space. mvsqlite replaces SQLite's entire stor
 - Supports both Azure and GCS.
 - Same block-based architecture as CBS.
 
-### Lessons for azqlite
+### Lessons for sqlite-objs
 
 - Confirms CBS's Azure support is real and usable.
 - Go-only, but validates the CBS approach in a different language ecosystem.
@@ -653,7 +653,7 @@ The most ambitious project in this space. mvsqlite replaces SQLite's entire stor
 - Includes `memdb` and `readervfs` sample implementations.
 - Integrates with Go's `io/fs.FS` interface.
 
-### Lessons for azqlite
+### Lessons for sqlite-objs
 
 - **Good reference for VFS interface design** — clean Go abstractions.
 - Shows how VFS methods map to custom backends.
@@ -667,7 +667,7 @@ The most ambitious project in this space. mvsqlite replaces SQLite's entire stor
 
 | Category | Projects | Description |
 |----------|----------|-------------|
-| **VFS (read/write)** | CBS, Litestream VFS, mvsqlite, sqlite-s3vfs, azqlite (us) | Custom VFS replaces file I/O with cloud storage calls |
+| **VFS (read/write)** | CBS, Litestream VFS, mvsqlite, sqlite-s3vfs, sqlite-objs (us) | Custom VFS replaces file I/O with cloud storage calls |
 | **VFS (read-only)** | sql.js-httpvfs, sqlite3vfshttp, sqlite-s3-query | VFS for read-only access via HTTP range requests |
 | **FUSE filesystem** | LiteFS | OS-level filesystem intercept |
 | **Replication/sync** | Litestream (backup), ElectricSQL, cr-sqlite, Corrosion | Database remains local; changes replicated to cloud/peers |
@@ -690,11 +690,11 @@ The most ambitious project in this space. mvsqlite replaces SQLite's entire stor
 | **sqlite-s3-query** | ✅ | No | Readers only | N/A | None | MIT | No |
 | **sql.js-httpvfs** | ✅ | No | Readers only | N/A | Browser cache | MIT | No |
 | **cr-sqlite** | No | ✅ | ✅ (CRDT) | None needed | Local SQLite | Apache 2.0 | No |
-| **azqlite (planned)** | ✅ | ✅ | MVP 3/4 | Azure Blob Lease | MVP 2: page cache | MIT | ✅ |
+| **sqlite-objs (planned)** | ✅ | ✅ | MVP 3/4 | Azure Blob Lease | MVP 2: page cache | MIT | ✅ |
 
 ---
 
-## 21. Key Lessons for azqlite
+## 21. Key Lessons for sqlite-objs
 
 ### Lesson 1: The VFS Approach Is Validated
 
@@ -773,7 +773,7 @@ If every `xWrite` call in the VFS synchronously writes to cloud storage, a simpl
 
 ## 23. Architectural Recommendations
 
-Based on this survey, here are my recommendations for azqlite's design:
+Based on this survey, here are my recommendations for sqlite-objs's design:
 
 ### MVP 1: Single Machine, Remote Storage
 

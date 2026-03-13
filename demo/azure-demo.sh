@@ -1,6 +1,6 @@
 #!/bin/bash
 #
-# azure-demo.sh — Simple demonstration of azqlite connecting to Azure Blob Storage
+# azure-demo.sh — Simple demonstration of sqlite-objs connecting to Azure Blob Storage
 #
 # PREREQUISITES:
 #   1. Set environment variables with your Azure credentials:
@@ -18,7 +18,7 @@
 #      ./demo/azure-demo.sh
 #
 # This script will:
-#   - Build azqlite-shell with production Azure client
+#   - Build sqlite-objs-shell with production Azure client
 #   - Open a database in Azure Blob Storage
 #   - Create a table, insert data, query it
 #   - Clean up
@@ -32,7 +32,7 @@ YELLOW='\033[1;33m'
 RED='\033[0;31m'
 NC='\033[0m' # No Color
 
-echo -e "${GREEN}=== azqlite Azure Blob Storage Demo ===${NC}"
+echo -e "${GREEN}=== sqlite-objs Azure Blob Storage Demo ===${NC}"
 echo
 
 # Check environment variables
@@ -69,7 +69,7 @@ fi
 echo
 
 # Build the production shell
-echo -e "${YELLOW}Building azqlite-shell with production Azure client...${NC}"
+echo -e "${YELLOW}Building sqlite-objs-shell with production Azure client...${NC}"
 make clean > /dev/null 2>&1
 if ! make all-production > /dev/null 2>&1; then
     echo -e "${RED}ERROR: Build failed. Check that libcurl and OpenSSL are installed.${NC}"
@@ -114,8 +114,8 @@ SELECT '  Alice email: ' || email AS result FROM users WHERE name = 'Alice';
 EOF
 )
 
-# Run the SQL commands through azqlite-shell
-echo "$SQL_SCRIPT" | ./azqlite-shell "$DB_NAME" 2>&1 | grep -E "^(Inserted|User|---| |After)"
+# Run the SQL commands through sqlite-objs-shell
+echo "$SQL_SCRIPT" | ./sqlite-objs-shell "$DB_NAME" 2>&1 | grep -E "^(Inserted|User|---| |After)"
 
 echo
 echo -e "${GREEN}=== Demo completed successfully! ===${NC}"

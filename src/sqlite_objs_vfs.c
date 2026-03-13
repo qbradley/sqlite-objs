@@ -1,7 +1,7 @@
 /*
-** azqlite_vfs.c — VFS implementation for Azure Blob Storage
+** sqlite_objs_vfs.c — VFS implementation for Azure Blob Storage
 **
-** This is the core of azqlite.  It implements sqlite3_vfs and
+** This is the core of sqliteObjs.  It implements sqlite3_vfs and
 ** sqlite3_io_methods v2, routing MAIN_DB operations through Azure
 ** Page Blobs, MAIN_JOURNAL through Block Blobs, and delegating
 ** all temporary/transient files to the platform's default VFS.
@@ -15,7 +15,7 @@
 **   - Journal files buffered in memory, uploaded on xSync as block blob
 */
 
-#include "azqlite.h"
+#include "sqlite_objs.h"
 #include "azure_client.h"
 #include "sqlite3.h"
 
@@ -27,20 +27,20 @@
 #include <assert.h>
 
 /* ===================================================================
-** Debug timing — opt-in via AZQLITE_DEBUG_TIMING=1 environment variable
+** Debug timing — opt-in via SQLITE_OBJS_DEBUG_TIMING=1 environment variable
 ** =================================================================== */
 
 static int g_debug_timing = -1; /* -1 = unchecked, 0 = off, 1 = on */
 
-static int azqlite_debug_timing(void) {
+static int sqlite_objs_debug_timing(void) {
     if (g_debug_timing < 0) {
-        const char *val = getenv("AZQLITE_DEBUG_TIMING");
+        const char *val = getenv("SQLITE_OBJS_DEBUG_TIMING");
         g_debug_timing = (val && val[0] == '1') ? 1 : 0;
     }
     return g_debug_timing;
 }
 
-static double azqlite_time_ms(void) {
+static double sqlite_objs_time_ms(void) {
     struct timeval tv;
     gettimeofday(&tv, NULL);
     return tv.tv_sec * 1000.0 + tv.tv_usec / 1000.0;
@@ -52,61 +52,61 @@ static int g_xread_journal_count = 0;
 
 /* ---------- Forward declarations ---------- */
 
-static int azqliteOpen(sqlite3_vfs*, sqlite3_filename, sqlite3_file*, int, int*);
-static int azqliteDelete(sqlite3_vfs*, const char*, int);
-static int azqliteAccess(sqlite3_vfs*, const char*, int, int*);
-static int azqliteFullPathname(sqlite3_vfs*, const char*, int, char*);
-static void *azqliteDlOpen(sqlite3_vfs*, const char*);
-static void azqliteDlError(sqlite3_vfs*, int, char*);
-static void (*azqliteDlSym(sqlite3_vfs*, void*, const char*))(void);
-static void azqliteDlClose(sqlite3_vfs*, void*);
-static int azqliteRandomness(sqlite3_vfs*, int, char*);
-static int azqliteSleep(sqlite3_vfs*, int);
-static int azqliteCurrentTime(sqlite3_vfs*, double*);
-static int azqliteGetLastError(sqlite3_vfs*, int, char*);
-static int azqliteCurrentTimeInt64(sqlite3_vfs*, sqlite3_int64*);
+static int sqliteObjsOpen(sqlite3_vfs*, sqlite3_filename, sqlite3_file*, int, int*);
+static int sqliteObjsDelete(sqlite3_vfs*, const char*, int);
+static int sqliteObjsAccess(sqlite3_vfs*, const char*, int, int*);
+static int sqliteObjsFullPathname(sqlite3_vfs*, const char*, int, char*);
+static void *sqliteObjsDlOpen(sqlite3_vfs*, const char*);
+static void sqliteObjsDlError(sqlite3_vfs*, int, char*);
+static void (*sqliteObjsDlSym(sqlite3_vfs*, void*, const char*))(void);
+static void sqliteObjsDlClose(sqlite3_vfs*, void*);
+static int sqliteObjsRandomness(sqlite3_vfs*, int, char*);
+static int sqliteObjsSleep(sqlite3_vfs*, int);
+static int sqliteObjsCurrentTime(sqlite3_vfs*, double*);
+static int sqliteObjsGetLastError(sqlite3_vfs*, int, char*);
+static int sqliteObjsCurrentTimeInt64(sqlite3_vfs*, sqlite3_int64*);
 
 /* io_methods */
-static int azqliteClose(sqlite3_file*);
-static int azqliteRead(sqlite3_file*, void*, int, sqlite3_int64);
-static int azqliteWrite(sqlite3_file*, const void*, int, sqlite3_int64);
-static int azqliteTruncate(sqlite3_file*, sqlite3_int64);
-static int azqliteSync(sqlite3_file*, int);
-static int azqliteFileSize(sqlite3_file*, sqlite3_int64*);
-static int azqliteLock(sqlite3_file*, int);
-static int azqliteUnlock(sqlite3_file*, int);
-static int azqliteCheckReservedLock(sqlite3_file*, int*);
-static int azqliteFileControl(sqlite3_file*, int, void*);
-static int azqliteSectorSize(sqlite3_file*);
-static int azqliteDeviceCharacteristics(sqlite3_file*);
+static int sqliteObjsClose(sqlite3_file*);
+static int sqliteObjsRead(sqlite3_file*, void*, int, sqlite3_int64);
+static int sqliteObjsWrite(sqlite3_file*, const void*, int, sqlite3_int64);
+static int sqliteObjsTruncate(sqlite3_file*, sqlite3_int64);
+static int sqliteObjsSync(sqlite3_file*, int);
+static int sqliteObjsFileSize(sqlite3_file*, sqlite3_int64*);
+static int sqliteObjsLock(sqlite3_file*, int);
+static int sqliteObjsUnlock(sqlite3_file*, int);
+static int sqliteObjsCheckReservedLock(sqlite3_file*, int*);
+static int sqliteObjsFileControl(sqlite3_file*, int, void*);
+static int sqliteObjsSectorSize(sqlite3_file*);
+static int sqliteObjsDeviceCharacteristics(sqlite3_file*);
 
 /* io_methods v2 — shared memory stubs for WAL exclusive mode */
-static int azqliteShmMap(sqlite3_file*, int, int, int, void volatile**);
-static int azqliteShmLock(sqlite3_file*, int, int, int);
-static void azqliteShmBarrier(sqlite3_file*);
-static int azqliteShmUnmap(sqlite3_file*, int);
+static int sqliteObjsShmMap(sqlite3_file*, int, int, int, void volatile**);
+static int sqliteObjsShmLock(sqlite3_file*, int, int, int);
+static void sqliteObjsShmBarrier(sqlite3_file*);
+static int sqliteObjsShmUnmap(sqlite3_file*, int);
 
 /* ---------- Constants ---------- */
 
-#define AZQLITE_DEFAULT_PAGE_SIZE  4096
-#define AZQLITE_LEASE_DURATION     30      /* default lease duration (seconds) */
-#define AZQLITE_LEASE_DURATION_LONG 60     /* extended lease for large flushes */
-#define AZQLITE_LEASE_RENEW_AFTER  15      /* default renew threshold (unused — see leaseDuration) */
-#define AZQLITE_DIRTY_PAGE_THRESHOLD 100   /* dirty pages triggering extended lease */
-#define AZQLITE_MAX_PATHNAME       512
-#define AZQLITE_INITIAL_ALLOC      (64*1024)  /* 64 KiB initial buffer */
+#define SQLITE_OBJS_DEFAULT_PAGE_SIZE  4096
+#define SQLITE_OBJS_LEASE_DURATION     30      /* default lease duration (seconds) */
+#define SQLITE_OBJS_LEASE_DURATION_LONG 60     /* extended lease for large flushes */
+#define SQLITE_OBJS_LEASE_RENEW_AFTER  15      /* default renew threshold (unused — see leaseDuration) */
+#define SQLITE_OBJS_DIRTY_PAGE_THRESHOLD 100   /* dirty pages triggering extended lease */
+#define SQLITE_OBJS_MAX_PATHNAME       512
+#define SQLITE_OBJS_INITIAL_ALLOC      (64*1024)  /* 64 KiB initial buffer */
 
 /* ---------- Types ---------- */
 
-/* Forward declaration for back-pointer in azqliteFile */
-typedef struct azqliteVfsData azqliteVfsData;
+/* Forward declaration for back-pointer in sqliteObjsFile */
+typedef struct sqliteObjsVfsData sqliteObjsVfsData;
 
 /*
 ** Per-file state for Azure-backed files.
 ** The first member MUST be pMethod (sqlite3_io_methods*) to satisfy
 ** the sqlite3_file subclass contract.
 */
-typedef struct azqliteFile {
+typedef struct sqliteObjsFile {
     const sqlite3_io_methods *pMethod;  /* MUST be first */
 
     /* Azure connection */
@@ -142,7 +142,7 @@ typedef struct azqliteFile {
     int eFileType;                      /* SQLITE_OPEN_MAIN_DB, etc. */
 
     /* Back-pointer to VFS-level shared state */
-    azqliteVfsData *pVfsData;           /* VFS global data (for cache access) */
+    sqliteObjsVfsData *pVfsData;           /* VFS global data (for cache access) */
 
     /* For journal files (block blob) */
     unsigned char *aJrnlData;           /* Journal buffer */
@@ -158,24 +158,24 @@ typedef struct azqliteFile {
 
     /* Per-file Azure client (NULL = using global VFS client) */
     azure_client_t *ownClient;
-} azqliteFile;
+} sqliteObjsFile;
 
 /*
 ** Per-journal blob existence cache entry.
 ** Each open database has its own journal blob with independent state.
 **   -1 = unknown (do real HEAD), 0 = does not exist, 1 = exists
 */
-#define AZQLITE_MAX_JOURNAL_CACHE 16
+#define SQLITE_OBJS_MAX_JOURNAL_CACHE 16
 
-typedef struct azqliteJournalCacheEntry {
+typedef struct sqliteObjsJournalCacheEntry {
     int state;
     char zBlobName[512];
-} azqliteJournalCacheEntry;
+} sqliteObjsJournalCacheEntry;
 
 /*
 ** Global VFS state — stored in sqlite3_vfs.pAppData.
 */
-struct azqliteVfsData {
+struct sqliteObjsVfsData {
     sqlite3_vfs *pDefaultVfs;           /* The platform default VFS */
     azure_ops_t *ops;                   /* Azure operations vtable */
     void *ops_ctx;                      /* Context for ops */
@@ -186,7 +186,7 @@ struct azqliteVfsData {
     ** Since we are the single writer, we know when a journal blob exists
     ** because we created (xSync) or deleted (xDelete) it ourselves.
     ** This eliminates ~4 HEAD requests per transaction (~110ms saved). */
-    azqliteJournalCacheEntry journalCache[AZQLITE_MAX_JOURNAL_CACHE];
+    sqliteObjsJournalCacheEntry journalCache[SQLITE_OBJS_MAX_JOURNAL_CACHE];
     int nJournalCache;
 };
 
@@ -197,7 +197,7 @@ struct azqliteVfsData {
 ** =================================================================== */
 
 /* Find a journal cache entry by blob name. Returns pointer or NULL. */
-static azqliteJournalCacheEntry *journalCacheFind(azqliteVfsData *pData,
+static sqliteObjsJournalCacheEntry *journalCacheFind(sqliteObjsVfsData *pData,
                                                    const char *zName) {
     for (int i = 0; i < pData->nJournalCache; i++) {
         if (strcmp(pData->journalCache[i].zBlobName, zName) == 0) {
@@ -209,11 +209,11 @@ static azqliteJournalCacheEntry *journalCacheFind(azqliteVfsData *pData,
 
 /* Find or create a journal cache entry. Returns pointer or NULL if full
 ** or name too long. New entries start with state = -1 (unknown). */
-static azqliteJournalCacheEntry *journalCacheGetOrCreate(azqliteVfsData *pData,
+static sqliteObjsJournalCacheEntry *journalCacheGetOrCreate(sqliteObjsVfsData *pData,
                                                           const char *zName) {
-    azqliteJournalCacheEntry *e = journalCacheFind(pData, zName);
+    sqliteObjsJournalCacheEntry *e = journalCacheFind(pData, zName);
     if (e) return e;
-    if (pData->nJournalCache >= AZQLITE_MAX_JOURNAL_CACHE) return NULL;
+    if (pData->nJournalCache >= SQLITE_OBJS_MAX_JOURNAL_CACHE) return NULL;
     size_t n = strlen(zName);
     if (n >= sizeof(pData->journalCache[0].zBlobName)) return NULL;
     e = &pData->journalCache[pData->nJournalCache++];
@@ -222,25 +222,25 @@ static azqliteJournalCacheEntry *journalCacheGetOrCreate(azqliteVfsData *pData,
     return e;
 }
 
-static const sqlite3_io_methods azqliteIoMethods = {
+static const sqlite3_io_methods sqliteObjsIoMethods = {
     2,                              /* iVersion = 2 (WAL via exclusive locking) */
-    azqliteClose,
-    azqliteRead,
-    azqliteWrite,
-    azqliteTruncate,
-    azqliteSync,
-    azqliteFileSize,
-    azqliteLock,
-    azqliteUnlock,
-    azqliteCheckReservedLock,
-    azqliteFileControl,
-    azqliteSectorSize,
-    azqliteDeviceCharacteristics,
+    sqliteObjsClose,
+    sqliteObjsRead,
+    sqliteObjsWrite,
+    sqliteObjsTruncate,
+    sqliteObjsSync,
+    sqliteObjsFileSize,
+    sqliteObjsLock,
+    sqliteObjsUnlock,
+    sqliteObjsCheckReservedLock,
+    sqliteObjsFileControl,
+    sqliteObjsSectorSize,
+    sqliteObjsDeviceCharacteristics,
     /* v2 methods (WAL shared memory stubs — exclusive mode only) */
-    azqliteShmMap,
-    azqliteShmLock,
-    azqliteShmBarrier,
-    azqliteShmUnmap,
+    sqliteObjsShmMap,
+    sqliteObjsShmLock,
+    sqliteObjsShmBarrier,
+    sqliteObjsShmUnmap,
     /* v3 methods (mmap) — omitted */
     0, 0
 };
@@ -256,7 +256,7 @@ static int dirtyBitmapSize(sqlite3_int64 fileSize, int pageSize) {
     return (nPages + 7) / 8;  /* bytes needed for bitmap */
 }
 
-static void dirtyMarkPage(azqliteFile *p, sqlite3_int64 offset) {
+static void dirtyMarkPage(sqliteObjsFile *p, sqlite3_int64 offset) {
     if (!p->aDirty || p->pageSize <= 0) return;
     int pageIdx = (int)(offset / p->pageSize);
     int byteIdx = pageIdx / 8;
@@ -268,7 +268,7 @@ static void dirtyMarkPage(azqliteFile *p, sqlite3_int64 offset) {
     }
 }
 
-static int dirtyIsPageDirty(azqliteFile *p, int pageIdx) {
+static int dirtyIsPageDirty(sqliteObjsFile *p, int pageIdx) {
     if (!p->aDirty) return 0;
     int byteIdx = pageIdx / 8;
     int bitIdx = pageIdx % 8;
@@ -276,7 +276,7 @@ static int dirtyIsPageDirty(azqliteFile *p, int pageIdx) {
     return (p->aDirty[byteIdx] & (1 << bitIdx)) != 0;
 }
 
-static void dirtyClearAll(azqliteFile *p) {
+static void dirtyClearAll(sqliteObjsFile *p) {
     if (p->aDirty) {
         int nBytes = dirtyBitmapSize(p->nAlloc, p->pageSize);
         memset(p->aDirty, 0, nBytes);
@@ -288,7 +288,7 @@ static void dirtyClearAll(azqliteFile *p) {
 ** Ensure the dirty bitmap is large enough for the current allocation.
 ** Returns SQLITE_OK or SQLITE_NOMEM.
 */
-static int dirtyEnsureCapacity(azqliteFile *p) {
+static int dirtyEnsureCapacity(sqliteObjsFile *p) {
     int needed = dirtyBitmapSize(p->nAlloc, p->pageSize);
     if (needed <= 0) return SQLITE_OK;
     if (needed <= p->nDirtyAlloc) return SQLITE_OK;
@@ -310,10 +310,10 @@ static int dirtyEnsureCapacity(azqliteFile *p) {
 ** Ensure aData has room for at least newSize bytes.
 ** Grows geometrically.  Returns SQLITE_OK or SQLITE_NOMEM.
 */
-static int bufferEnsure(azqliteFile *p, sqlite3_int64 newSize) {
+static int bufferEnsure(sqliteObjsFile *p, sqlite3_int64 newSize) {
     if (newSize <= p->nAlloc) return SQLITE_OK;
     sqlite3_int64 alloc = p->nAlloc;
-    if (alloc == 0) alloc = AZQLITE_INITIAL_ALLOC;
+    if (alloc == 0) alloc = SQLITE_OBJS_INITIAL_ALLOC;
     while (alloc < newSize) {
         alloc *= 2;
         if (alloc < 0) return SQLITE_NOMEM; /* overflow */
@@ -330,10 +330,10 @@ static int bufferEnsure(azqliteFile *p, sqlite3_int64 newSize) {
 /*
 ** Ensure journal buffer has room for at least newSize bytes.
 */
-static int jrnlBufferEnsure(azqliteFile *p, sqlite3_int64 newSize) {
+static int jrnlBufferEnsure(sqliteObjsFile *p, sqlite3_int64 newSize) {
     if (newSize <= p->nJrnlAlloc) return SQLITE_OK;
     sqlite3_int64 alloc = p->nJrnlAlloc;
-    if (alloc == 0) alloc = AZQLITE_INITIAL_ALLOC;
+    if (alloc == 0) alloc = SQLITE_OBJS_INITIAL_ALLOC;
     while (alloc < newSize) {
         alloc *= 2;
         if (alloc < 0) return SQLITE_NOMEM;
@@ -349,10 +349,10 @@ static int jrnlBufferEnsure(azqliteFile *p, sqlite3_int64 newSize) {
 /*
 ** Ensure WAL buffer has room for at least newSize bytes.
 */
-static int walBufferEnsure(azqliteFile *p, sqlite3_int64 newSize) {
+static int walBufferEnsure(sqliteObjsFile *p, sqlite3_int64 newSize) {
     if (newSize <= p->nWalAlloc) return SQLITE_OK;
     sqlite3_int64 alloc = p->nWalAlloc;
-    if (alloc == 0) alloc = AZQLITE_INITIAL_ALLOC;
+    if (alloc == 0) alloc = SQLITE_OBJS_INITIAL_ALLOC;
     while (alloc < newSize) {
         alloc *= 2;
         if (alloc < 0) return SQLITE_NOMEM;
@@ -370,7 +370,7 @@ static int walBufferEnsure(azqliteFile *p, sqlite3_int64 newSize) {
 ** Helper: lease management
 ** =================================================================== */
 
-static int hasLease(azqliteFile *p) {
+static int hasLease(sqliteObjsFile *p) {
     return p->leaseId[0] != '\0';
 }
 
@@ -378,10 +378,10 @@ static int hasLease(azqliteFile *p) {
 ** Attempt to renew the lease if it's older than half the lease duration.
 ** Returns SQLITE_OK or SQLITE_IOERR_LOCK.
 */
-static int leaseRenewIfNeeded(azqliteFile *p) {
+static int leaseRenewIfNeeded(sqliteObjsFile *p) {
     if (!hasLease(p)) return SQLITE_OK;
     int renewAfter = p->leaseDuration > 0 ? p->leaseDuration / 2
-                                          : AZQLITE_LEASE_DURATION / 2;
+                                          : SQLITE_OBJS_LEASE_DURATION / 2;
     time_t now = time(NULL);
     if (difftime(now, p->leaseAcquiredAt) < renewAfter) {
         return SQLITE_OK;
@@ -405,7 +405,7 @@ static int leaseRenewIfNeeded(azqliteFile *p) {
 ** are NULL. For journal/WAL filenames we can recover the per-file ops from
 ** the main database file via sqlite3_database_file_object().
 */
-static int resolveOps(azqliteVfsData *pVfsData, const char *zName,
+static int resolveOps(sqliteObjsVfsData *pVfsData, const char *zName,
                       const azure_ops_t **ppOps, void **ppCtx) {
     if (pVfsData->ops) {
         *ppOps = pVfsData->ops;
@@ -422,7 +422,7 @@ static int resolveOps(azqliteVfsData *pVfsData, const char *zName,
         if (isJournalOrWal) {
             sqlite3_file *pDbFile = sqlite3_database_file_object(zName);
             if (pDbFile) {
-                azqliteFile *pMain = (azqliteFile *)pDbFile;
+                sqliteObjsFile *pMain = (sqliteObjsFile *)pDbFile;
                 if (pMain->ops) {
                     *ppOps = pMain->ops;
                     *ppCtx = pMain->ops_ctx;
@@ -475,16 +475,16 @@ static int detectPageSize(const unsigned char *aData, sqlite3_int64 nData) {
 /*
 ** xClose — Release all resources.
 */
-static int azqliteClose(sqlite3_file *pFile) {
-    azqliteFile *p = (azqliteFile *)pFile;
+static int sqliteObjsClose(sqlite3_file *pFile) {
+    sqliteObjsFile *p = (sqliteObjsFile *)pFile;
     int rc = SQLITE_OK;
 
     /* Flush any remaining dirty data before closing */
     if (p->nDirtyPages > 0 && p->ops && p->ops->page_blob_write) {
-        rc = azqliteSync(pFile, 0);
+        rc = sqliteObjsSync(pFile, 0);
     } else if (p->eFileType == SQLITE_OPEN_WAL &&
                p->nWalData > p->nWalSynced && p->ops) {
-        rc = azqliteSync(pFile, 0);
+        rc = sqliteObjsSync(pFile, 0);
     }
 
     /* Release lease if held.  Best-effort: lease auto-expires so we log
@@ -495,7 +495,7 @@ static int azqliteClose(sqlite3_file *pFile) {
         azure_err_t larc = p->ops->lease_release(
             p->ops_ctx, p->zBlobName, p->leaseId, &aerr);
         if (larc != AZURE_OK) {
-            fprintf(stderr, "azqlite: lease_release failed (code=%d, blob=%s): %s\n",
+            fprintf(stderr, "sqliteObjs: lease_release failed (code=%d, blob=%s): %s\n",
                     larc, p->zBlobName ? p->zBlobName : "(null)",
                     aerr.error_message);
         }
@@ -529,9 +529,9 @@ static int azqliteClose(sqlite3_file *pFile) {
 ** For MAIN_JOURNAL: read from aJrnlData.
 ** Must zero-fill on short read (SQLITE_IOERR_SHORT_READ).
 */
-static int azqliteRead(sqlite3_file *pFile, void *pBuf, int iAmt,
+static int sqliteObjsRead(sqlite3_file *pFile, void *pBuf, int iAmt,
                         sqlite3_int64 iOfst) {
-    azqliteFile *p = (azqliteFile *)pFile;
+    sqliteObjsFile *p = (sqliteObjsFile *)pFile;
     unsigned char *src;
     sqlite3_int64 srcLen;
 
@@ -576,9 +576,9 @@ static int azqliteRead(sqlite3_file *pFile, void *pBuf, int iAmt,
 ** For MAIN_DB: write to aData, mark dirty bitmap.
 ** For MAIN_JOURNAL: append/write to aJrnlData.
 */
-static int azqliteWrite(sqlite3_file *pFile, const void *pBuf, int iAmt,
+static int sqliteObjsWrite(sqlite3_file *pFile, const void *pBuf, int iAmt,
                          sqlite3_int64 iOfst) {
-    azqliteFile *p = (azqliteFile *)pFile;
+    sqliteObjsFile *p = (sqliteObjsFile *)pFile;
     int rc;
 
     if (p->eFileType == SQLITE_OPEN_WAL) {
@@ -634,8 +634,8 @@ static int azqliteWrite(sqlite3_file *pFile, const void *pBuf, int iAmt,
 /*
 ** xTruncate — Resize the file.
 */
-static int azqliteTruncate(sqlite3_file *pFile, sqlite3_int64 size) {
-    azqliteFile *p = (azqliteFile *)pFile;
+static int sqliteObjsTruncate(sqlite3_file *pFile, sqlite3_int64 size) {
+    sqliteObjsFile *p = (sqliteObjsFile *)pFile;
 
     if (p->eFileType == SQLITE_OPEN_WAL) {
         /* WAL truncate — delete and recreate append blob */
@@ -708,7 +708,7 @@ static int azqliteTruncate(sqlite3_file *pFile, sqlite3_int64 size) {
 }
 
 /* Maximum bytes per Azure Put Page request (4 MiB) */
-#define AZQLITE_MAX_PUT_PAGE  (4 * 1024 * 1024)
+#define SQLITE_OBJS_MAX_PUT_PAGE  (4 * 1024 * 1024)
 
 /*
 ** coalesceDirtyRanges — Scan the dirty bitmap and merge contiguous dirty
@@ -719,7 +719,7 @@ static int azqliteTruncate(sqlite3_file *pFile, sqlite3_int64 size) {
 ** is too small to hold all the coalesced ranges.
 */
 static int coalesceDirtyRanges(
-    azqliteFile *p,
+    sqliteObjsFile *p,
     azure_page_range_t *ranges,
     int maxRanges
 ){
@@ -741,13 +741,13 @@ static int coalesceDirtyRanges(
         while (i < nPages && dirtyIsPageDirty(p, i)) {
             runPages++;
             int64_t runBytes = (int64_t)runPages * p->pageSize;
-            if (runBytes >= AZQLITE_MAX_PUT_PAGE) break;
+            if (runBytes >= SQLITE_OBJS_MAX_PUT_PAGE) break;
             i++;
         }
 
         /* If we stopped because of the 4 MiB cap, advance past this page */
         if (i < nPages && dirtyIsPageDirty(p, i)
-            && (int64_t)runPages * p->pageSize >= AZQLITE_MAX_PUT_PAGE) {
+            && (int64_t)runPages * p->pageSize >= SQLITE_OBJS_MAX_PUT_PAGE) {
             i++;
         }
 
@@ -771,7 +771,7 @@ static int coalesceDirtyRanges(
 }
 
 /* Stack-allocated range threshold (avoid heap for small flushes) */
-#define AZQLITE_STACK_RANGES 64
+#define SQLITE_OBJS_STACK_RANGES 64
 
 /*
 ** xSync — Flush dirty pages to Azure.
@@ -779,8 +779,8 @@ static int coalesceDirtyRanges(
 ** For MAIN_JOURNAL: upload entire journal via block_blob_upload.
 ** For WAL: append new data to Azure append blob.
 */
-static int azqliteSync(sqlite3_file *pFile, int flags) {
-    azqliteFile *p = (azqliteFile *)pFile;
+static int sqliteObjsSync(sqlite3_file *pFile, int flags) {
+    sqliteObjsFile *p = (sqliteObjsFile *)pFile;
     azure_error_t aerr;
     (void)flags;
 
@@ -890,15 +890,15 @@ static int azqliteSync(sqlite3_file *pFile, int flags) {
         /* Upload journal as block blob */
         if (p->nJrnlData > 0 && p->ops && p->ops->block_blob_upload) {
             double t0 = 0;
-            if (azqlite_debug_timing()) t0 = azqlite_time_ms();
+            if (sqlite_objs_debug_timing()) t0 = sqlite_objs_time_ms();
 
             azure_error_init(&aerr);
             azure_err_t arc = p->ops->block_blob_upload(
                 p->ops_ctx, p->zBlobName,
                 p->aJrnlData, (size_t)p->nJrnlData, &aerr);
 
-            if (azqlite_debug_timing()) {
-                double elapsed = azqlite_time_ms() - t0;
+            if (sqlite_objs_debug_timing()) {
+                double elapsed = sqlite_objs_time_ms() - t0;
                 fprintf(stderr, "[TIMING] xSync(journal): %.1fms (%lld bytes, blob=%s)\n",
                         elapsed, (long long)p->nJrnlData, p->zBlobName);
             }
@@ -909,7 +909,7 @@ static int azqliteSync(sqlite3_file *pFile, int flags) {
 
             /* R1: Journal blob now exists in Azure */
             {
-                azqliteJournalCacheEntry *jce =
+                sqliteObjsJournalCacheEntry *jce =
                     journalCacheGetOrCreate(p->pVfsData, p->zBlobName);
                 if (jce) jce->state = 1;
             }
@@ -922,7 +922,7 @@ static int azqliteSync(sqlite3_file *pFile, int flags) {
     if (!p->ops || !p->ops->page_blob_write) return SQLITE_IOERR_FSYNC;
 
     double sync_t0 = 0;
-    if (azqlite_debug_timing()) sync_t0 = azqlite_time_ms();
+    if (sqlite_objs_debug_timing()) sync_t0 = sqlite_objs_time_ms();
 
     /* Record dirty page count for lease duration heuristic */
     int dirtyCountBeforeSync = p->nDirtyPages;
@@ -938,14 +938,14 @@ static int azqliteSync(sqlite3_file *pFile, int flags) {
     if (p->nData > p->lastSyncedSize && p->ops->page_blob_resize) {
         sqlite3_int64 alignedSize = (p->nData + 511) & ~(sqlite3_int64)511;
         double rt0 = 0;
-        if (azqlite_debug_timing()) rt0 = azqlite_time_ms();
+        if (sqlite_objs_debug_timing()) rt0 = sqlite_objs_time_ms();
 
         azure_error_init(&aerr);
         azure_err_t arc = p->ops->page_blob_resize(p->ops_ctx, p->zBlobName,
                                                      alignedSize,
                                                      hasLease(p) ? p->leaseId : NULL,
                                                      &aerr);
-        if (azqlite_debug_timing()) resize_ms = azqlite_time_ms() - rt0;
+        if (sqlite_objs_debug_timing()) resize_ms = sqlite_objs_time_ms() - rt0;
 
         if (arc != AZURE_OK) {
             return SQLITE_IOERR_FSYNC;
@@ -955,11 +955,11 @@ static int azqliteSync(sqlite3_file *pFile, int flags) {
 
     /* Coalesce dirty pages into contiguous ranges */
     double coalesce_t0 = 0;
-    if (azqlite_debug_timing()) coalesce_t0 = azqlite_time_ms();
+    if (sqlite_objs_debug_timing()) coalesce_t0 = sqlite_objs_time_ms();
 
-    azure_page_range_t stackRanges[AZQLITE_STACK_RANGES];
+    azure_page_range_t stackRanges[SQLITE_OBJS_STACK_RANGES];
     azure_page_range_t *ranges = stackRanges;
-    int maxRanges = AZQLITE_STACK_RANGES;
+    int maxRanges = SQLITE_OBJS_STACK_RANGES;
 
     int nRanges = coalesceDirtyRanges(p, ranges, maxRanges);
     if (nRanges < 0) {
@@ -975,12 +975,12 @@ static int azqliteSync(sqlite3_file *pFile, int flags) {
     }
 
     double coalesce_ms = 0;
-    if (azqlite_debug_timing()) coalesce_ms = azqlite_time_ms() - coalesce_t0;
+    if (sqlite_objs_debug_timing()) coalesce_ms = sqlite_objs_time_ms() - coalesce_t0;
 
     /* Try batch write if available (Phase 2 — will be non-NULL with curl_multi) */
     if (p->ops->page_blob_write_batch) {
         double wt0 = 0;
-        if (azqlite_debug_timing()) wt0 = azqlite_time_ms();
+        if (sqlite_objs_debug_timing()) wt0 = sqlite_objs_time_ms();
 
         azure_error_init(&aerr);
         azure_err_t arc = p->ops->page_blob_write_batch(
@@ -988,9 +988,9 @@ static int azqliteSync(sqlite3_file *pFile, int flags) {
             ranges, nRanges,
             hasLease(p) ? p->leaseId : NULL, &aerr);
 
-        if (azqlite_debug_timing()) {
-            double write_ms = azqlite_time_ms() - wt0;
-            double total_ms = azqlite_time_ms() - sync_t0;
+        if (sqlite_objs_debug_timing()) {
+            double write_ms = sqlite_objs_time_ms() - wt0;
+            double total_ms = sqlite_objs_time_ms() - sync_t0;
             size_t total_bytes = 0;
             for (int i = 0; i < nRanges; i++) total_bytes += ranges[i].len;
             fprintf(stderr, "[TIMING] xSync(db): total=%.1fms | resize=%.1fms coalesce=%.1fms "
@@ -1015,7 +1015,7 @@ static int azqliteSync(sqlite3_file *pFile, int flags) {
 
     /* Sequential fallback — write each coalesced range */
     double write_t0 = 0;
-    if (azqlite_debug_timing()) write_t0 = azqlite_time_ms();
+    if (sqlite_objs_debug_timing()) write_t0 = sqlite_objs_time_ms();
 
     for (int i = 0; i < nRanges; i++) {
         /* Renew lease periodically during large flushes */
@@ -1038,8 +1038,8 @@ static int azqliteSync(sqlite3_file *pFile, int flags) {
             return SQLITE_IOERR_FSYNC;
         }
     } {
-        double write_ms = azqlite_time_ms() - write_t0;
-        double total_ms = azqlite_time_ms() - sync_t0;
+        double write_ms = sqlite_objs_time_ms() - write_t0;
+        double total_ms = sqlite_objs_time_ms() - sync_t0;
         size_t total_bytes = 0;
         for (int i = 0; i < nRanges; i++) total_bytes += ranges[i].len;
         fprintf(stderr, "[TIMING] xSync(db): total=%.1fms | resize=%.1fms coalesce=%.1fms "
@@ -1066,8 +1066,8 @@ static int azqliteSync(sqlite3_file *pFile, int flags) {
 /*
 ** xFileSize — Return the current logical file size.
 */
-static int azqliteFileSize(sqlite3_file *pFile, sqlite3_int64 *pSize) {
-    azqliteFile *p = (azqliteFile *)pFile;
+static int sqliteObjsFileSize(sqlite3_file *pFile, sqlite3_int64 *pSize) {
+    sqliteObjsFile *p = (sqliteObjsFile *)pFile;
     if (p->eFileType == SQLITE_OPEN_WAL) {
         *pSize = p->nWalData;
     } else if (p->eFileType & SQLITE_OPEN_MAIN_JOURNAL) {
@@ -1084,8 +1084,8 @@ static int azqliteFileSize(sqlite3_file *pFile, sqlite3_int64 *pSize) {
 **   SHARED: no-op (reads don't need a lease)
 **   RESERVED/PENDING/EXCLUSIVE: acquire 30s lease
 */
-static int azqliteLock(sqlite3_file *pFile, int eLock) {
-    azqliteFile *p = (azqliteFile *)pFile;
+static int sqliteObjsLock(sqlite3_file *pFile, int eLock) {
+    sqliteObjsFile *p = (sqliteObjsFile *)pFile;
 
     /* Already at or above requested level */
     if (p->eLock >= eLock) return SQLITE_OK;
@@ -1105,12 +1105,12 @@ static int azqliteLock(sqlite3_file *pFile, int eLock) {
         }
 
         /* Choose lease duration based on last sync workload */
-        int duration = (p->lastSyncDirtyCount > AZQLITE_DIRTY_PAGE_THRESHOLD)
-                       ? AZQLITE_LEASE_DURATION_LONG
-                       : AZQLITE_LEASE_DURATION;
+        int duration = (p->lastSyncDirtyCount > SQLITE_OBJS_DIRTY_PAGE_THRESHOLD)
+                       ? SQLITE_OBJS_LEASE_DURATION_LONG
+                       : SQLITE_OBJS_LEASE_DURATION;
 
         double t0 = 0;
-        if (azqlite_debug_timing()) t0 = azqlite_time_ms();
+        if (sqlite_objs_debug_timing()) t0 = sqlite_objs_time_ms();
 
         azure_error_t aerr;
         azure_error_init(&aerr);
@@ -1119,8 +1119,8 @@ static int azqliteLock(sqlite3_file *pFile, int eLock) {
             duration,
             p->leaseId, sizeof(p->leaseId), &aerr);
 
-        if (azqlite_debug_timing()) {
-            double elapsed = azqlite_time_ms() - t0;
+        if (sqlite_objs_debug_timing()) {
+            double elapsed = sqlite_objs_time_ms() - t0;
             fprintf(stderr, "[TIMING] lease_acquire: %.1fms (lock=%d, blob=%s)\n",
                     elapsed, eLock, p->zBlobName);
         }
@@ -1143,8 +1143,8 @@ static int azqliteLock(sqlite3_file *pFile, int eLock) {
 ** xUnlock — Downgrade the lock level.
 ** Release lease when going to SHARED or NONE.
 */
-static int azqliteUnlock(sqlite3_file *pFile, int eLock) {
-    azqliteFile *p = (azqliteFile *)pFile;
+static int sqliteObjsUnlock(sqlite3_file *pFile, int eLock) {
+    sqliteObjsFile *p = (sqliteObjsFile *)pFile;
 
     if (p->eLock <= eLock) return SQLITE_OK;
 
@@ -1152,15 +1152,15 @@ static int azqliteUnlock(sqlite3_file *pFile, int eLock) {
     if (eLock <= SQLITE_LOCK_SHARED && hasLease(p)) {
         if (p->ops && p->ops->lease_release) {
             double t0 = 0;
-            if (azqlite_debug_timing()) t0 = azqlite_time_ms();
+            if (sqlite_objs_debug_timing()) t0 = sqlite_objs_time_ms();
 
             azure_error_t aerr;
             azure_error_init(&aerr);
             p->ops->lease_release(p->ops_ctx, p->zBlobName,
                                    p->leaseId, &aerr);
 
-            if (azqlite_debug_timing()) {
-                double elapsed = azqlite_time_ms() - t0;
+            if (sqlite_objs_debug_timing()) {
+                double elapsed = sqlite_objs_time_ms() - t0;
                 fprintf(stderr, "[TIMING] lease_release: %.1fms (blob=%s)\n",
                         elapsed, p->zBlobName);
             }
@@ -1178,8 +1178,8 @@ static int azqliteUnlock(sqlite3_file *pFile, int eLock) {
 ** xCheckReservedLock — Check if any connection holds RESERVED or higher.
 ** Uses HEAD request to check blob lease state.
 */
-static int azqliteCheckReservedLock(sqlite3_file *pFile, int *pResOut) {
-    azqliteFile *p = (azqliteFile *)pFile;
+static int sqliteObjsCheckReservedLock(sqlite3_file *pFile, int *pResOut) {
+    sqliteObjsFile *p = (sqliteObjsFile *)pFile;
 
     /* If we hold the lock ourselves, report it */
     if (p->eLock >= SQLITE_LOCK_RESERVED) {
@@ -1212,7 +1212,7 @@ static int azqliteCheckReservedLock(sqlite3_file *pFile, int *pResOut) {
 /*
 ** xFileControl — Handle pragmas and other file control operations.
 */
-static int azqliteFileControl(sqlite3_file *pFile, int op, void *pArg) {
+static int sqliteObjsFileControl(sqlite3_file *pFile, int op, void *pArg) {
 
     switch (op) {
         case SQLITE_FCNTL_PRAGMA: {
@@ -1226,7 +1226,7 @@ static int azqliteFileControl(sqlite3_file *pFile, int op, void *pArg) {
                 if (aArg[2] && sqlite3_stricmp(aArg[2], "wal") == 0) {
                     /* WAL mode requires append blob operations.
                     ** If unavailable, reject and force "delete" mode. */
-                    azqliteFile *p = (azqliteFile *)pFile;
+                    sqliteObjsFile *p = (sqliteObjsFile *)pFile;
                     if (!p->ops || !p->ops->append_blob_create ||
                         !p->ops->append_blob_append ||
                         !p->ops->append_blob_delete) {
@@ -1242,7 +1242,7 @@ static int azqliteFileControl(sqlite3_file *pFile, int op, void *pArg) {
             return SQLITE_NOTFOUND;
         }
         case SQLITE_FCNTL_VFSNAME: {
-            *(char **)pArg = sqlite3_mprintf("azqlite");
+            *(char **)pArg = sqlite3_mprintf("sqlite-objs");
             return SQLITE_OK;
         }
         default:
@@ -1255,7 +1255,7 @@ static int azqliteFileControl(sqlite3_file *pFile, int op, void *pArg) {
 ** xSectorSize — Return the minimum write granularity.
 ** 512 matches Azure Page Blob's 512-byte page alignment.
 */
-static int azqliteSectorSize(sqlite3_file *pFile) {
+static int sqliteObjsSectorSize(sqlite3_file *pFile) {
     (void)pFile;
     return 512;
 }
@@ -1274,7 +1274,7 @@ static int azqliteSectorSize(sqlite3_file *pFile) {
 **   Claiming SEQUENTIAL would cause SQLite to skip xSync on the journal
 **   file, which is where our VFS uploads the journal to Azure.
 */
-static int azqliteDeviceCharacteristics(sqlite3_file *pFile) {
+static int sqliteObjsDeviceCharacteristics(sqlite3_file *pFile) {
     (void)pFile;
     return SQLITE_IOCAP_POWERSAFE_OVERWRITE | SQLITE_IOCAP_SUBPAGE_READ;
 }
@@ -1289,28 +1289,28 @@ static int azqliteDeviceCharacteristics(sqlite3_file *pFile) {
 ** SQLITE_IOERR to prevent unsafe operation.
 ** =================================================================== */
 
-static int azqliteShmMap(sqlite3_file *pFile, int iRegion, int szRegion,
+static int sqliteObjsShmMap(sqlite3_file *pFile, int iRegion, int szRegion,
                           int bExtend, void volatile **pp) {
     (void)pFile; (void)iRegion; (void)szRegion; (void)bExtend;
     *pp = NULL;
     /* Never called in exclusive mode. Return SQLITE_IOERR to fail safely
     ** if the user forgot PRAGMA locking_mode=EXCLUSIVE. */
     fprintf(stderr,
-        "azqlite: ERROR — xShmMap called, but azqlite WAL requires "
+        "sqliteObjs: ERROR — xShmMap called, but sqliteObjs WAL requires "
         "PRAGMA locking_mode=EXCLUSIVE. Shared-memory WAL is not supported.\n");
     return SQLITE_IOERR;
 }
 
-static int azqliteShmLock(sqlite3_file *pFile, int offset, int n, int flags) {
+static int sqliteObjsShmLock(sqlite3_file *pFile, int offset, int n, int flags) {
     (void)pFile; (void)offset; (void)n; (void)flags;
     return SQLITE_OK;
 }
 
-static void azqliteShmBarrier(sqlite3_file *pFile) {
+static void sqliteObjsShmBarrier(sqlite3_file *pFile) {
     (void)pFile;
 }
 
-static int azqliteShmUnmap(sqlite3_file *pFile, int deleteFlag) {
+static int sqliteObjsShmUnmap(sqlite3_file *pFile, int deleteFlag) {
     (void)pFile; (void)deleteFlag;
     return SQLITE_OK;
 }
@@ -1324,7 +1324,7 @@ static int azqliteShmUnmap(sqlite3_file *pFile, int deleteFlag) {
 ** Parse Azure URI parameters from a sqlite3_filename.
 ** Returns 1 if azure_account is present (config populated), 0 otherwise.
 */
-static int azqlite_parse_uri_config(sqlite3_filename zName,
+static int sqlite_objs_parse_uri_config(sqlite3_filename zName,
                                     azure_client_config_t *cfg) {
     const char *account = sqlite3_uri_parameter(zName, "azure_account");
     if (!account) return 0;
@@ -1344,16 +1344,16 @@ static int azqlite_parse_uri_config(sqlite3_filename zName,
 **   MAIN_JOURNAL  → Azure block blob
 **   Everything else → delegate to default VFS
 */
-static int azqliteOpen(sqlite3_vfs *pVfs, sqlite3_filename zName,
+static int sqliteObjsOpen(sqlite3_vfs *pVfs, sqlite3_filename zName,
                         sqlite3_file *pFile, int flags, int *pOutFlags) {
-    azqliteVfsData *pVfsData = (azqliteVfsData *)pVfs->pAppData;
-    azqliteFile *p = (azqliteFile *)pFile;
+    sqliteObjsVfsData *pVfsData = (sqliteObjsVfsData *)pVfs->pAppData;
+    sqliteObjsFile *p = (sqliteObjsFile *)pFile;
     int isMainDb = (flags & SQLITE_OPEN_MAIN_DB) != 0;
     int isMainJournal = (flags & SQLITE_OPEN_MAIN_JOURNAL) != 0;
     int isWal = (flags & SQLITE_OPEN_WAL) != 0;
 
     /* Initialize pMethod to NULL — prevents xClose call on failure */
-    memset(p, 0, sizeof(azqliteFile));
+    memset(p, 0, sizeof(sqliteObjsFile));
 
     /* Temp files, sub-journals, etc. → delegate to default VFS */
     if (!isMainDb && !isMainJournal && !isWal) {
@@ -1373,7 +1373,7 @@ static int azqliteOpen(sqlite3_vfs *pVfs, sqlite3_filename zName,
     /* Try URI parameters for per-file Azure client */
     p->ownClient = NULL;
     azure_client_config_t uriCfg;
-    if (azqlite_parse_uri_config(zName, &uriCfg)) {
+    if (sqlite_objs_parse_uri_config(zName, &uriCfg)) {
         azure_error_t aerr;
         azure_error_init(&aerr);
         azure_err_t arc = azure_client_create(&uriCfg, &p->ownClient, &aerr);
@@ -1403,10 +1403,10 @@ static int azqliteOpen(sqlite3_vfs *pVfs, sqlite3_filename zName,
     else p->eFileType = SQLITE_OPEN_MAIN_DB;
     p->eLock = SQLITE_LOCK_NONE;
     p->leaseId[0] = '\0';
-    p->leaseDuration = AZQLITE_LEASE_DURATION;
+    p->leaseDuration = SQLITE_OBJS_LEASE_DURATION;
     p->lastSyncDirtyCount = 0;
     p->etag[0] = '\0';
-    p->pageSize = AZQLITE_DEFAULT_PAGE_SIZE;
+    p->pageSize = SQLITE_OBJS_DEFAULT_PAGE_SIZE;
 
     if (isMainDb) {
         /* MAIN_DB → Azure page blob */
@@ -1500,7 +1500,7 @@ static int azqliteOpen(sqlite3_vfs *pVfs, sqlite3_filename zName,
             }
             p->nData = 0;
             /* Allocate initial buffer */
-            int rc = bufferEnsure(p, AZQLITE_INITIAL_ALLOC);
+            int rc = bufferEnsure(p, SQLITE_OBJS_INITIAL_ALLOC);
             if (rc != SQLITE_OK) {
                 sqlite3_free(p->zBlobName);
                 p->zBlobName = NULL;
@@ -1521,7 +1521,7 @@ static int azqliteOpen(sqlite3_vfs *pVfs, sqlite3_filename zName,
         p->aJrnlData = NULL;
 
         /* R1: Track journal blob name and seed the cache from blob_exists check */
-        azqliteJournalCacheEntry *jce =
+        sqliteObjsJournalCacheEntry *jce =
             journalCacheGetOrCreate(pVfsData, zName);
 
         /* R1: If cache says journal doesn't exist, skip the HEAD request.
@@ -1638,7 +1638,7 @@ static int azqliteOpen(sqlite3_vfs *pVfs, sqlite3_filename zName,
     }
 
     /* Set pMethod last — this tells SQLite to call xClose */
-    p->pMethod = &azqliteIoMethods;
+    p->pMethod = &sqliteObjsIoMethods;
     if (pOutFlags) {
         *pOutFlags = flags;
     }
@@ -1651,7 +1651,7 @@ static int azqliteOpen(sqlite3_vfs *pVfs, sqlite3_filename zName,
 ** Absolute paths (starting with '/') are local filesystem paths
 ** (temp files, sub-journals, etc.) and should go to the default VFS.
 */
-static int azqliteIsAzurePath(const char *zPath) {
+static int sqliteObjsIsAzurePath(const char *zPath) {
     if (!zPath || zPath[0] == '\0') return 0;
     /* Absolute filesystem paths go to the default VFS */
     if (zPath[0] == '/') return 0;
@@ -1662,13 +1662,13 @@ static int azqliteIsAzurePath(const char *zPath) {
 /*
 ** xDelete — Delete a blob from Azure (or delegate for temp files).
 */
-static int azqliteDelete(sqlite3_vfs *pVfs, const char *zName, int syncDir) {
-    azqliteVfsData *pVfsData = (azqliteVfsData *)pVfs->pAppData;
+static int sqliteObjsDelete(sqlite3_vfs *pVfs, const char *zName, int syncDir) {
+    sqliteObjsVfsData *pVfsData = (sqliteObjsVfsData *)pVfs->pAppData;
 
     if (!zName) return SQLITE_OK;
 
     /* Delegate non-Azure paths (absolute filesystem paths) to default VFS */
-    if (!azqliteIsAzurePath(zName)) {
+    if (!sqliteObjsIsAzurePath(zName)) {
         return pVfsData->pDefaultVfs->xDelete(pVfsData->pDefaultVfs, zName, syncDir);
     }
 
@@ -1680,7 +1680,7 @@ static int azqliteDelete(sqlite3_vfs *pVfs, const char *zName, int syncDir) {
         azure_err_t arc = ops->blob_delete(ops_ctx, zName, &aerr);
         if (arc == AZURE_ERR_NOT_FOUND) {
             /* R1: We know it doesn't exist now */
-            azqliteJournalCacheEntry *jce = journalCacheFind(pVfsData, zName);
+            sqliteObjsJournalCacheEntry *jce = journalCacheFind(pVfsData, zName);
             if (jce) jce->state = 0;
             return SQLITE_OK;  /* Already gone — not an error */
         }
@@ -1690,7 +1690,7 @@ static int azqliteDelete(sqlite3_vfs *pVfs, const char *zName, int syncDir) {
 
         /* R1: After successful delete, update journal cache */
         {
-            azqliteJournalCacheEntry *jce = journalCacheFind(pVfsData, zName);
+            sqliteObjsJournalCacheEntry *jce = journalCacheFind(pVfsData, zName);
             if (jce) jce->state = 0;
         }
         return SQLITE_OK;
@@ -1708,12 +1708,12 @@ static int azqliteDelete(sqlite3_vfs *pVfs, const char *zName, int syncDir) {
 ** or doesn't exist (we deleted it in xDelete). This eliminates ~4 HEAD
 ** requests per transaction (~110ms saved).
 */
-static int azqliteAccess(sqlite3_vfs *pVfs, const char *zName,
+static int sqliteObjsAccess(sqlite3_vfs *pVfs, const char *zName,
                           int flags, int *pResOut) {
-    azqliteVfsData *pVfsData = (azqliteVfsData *)pVfs->pAppData;
+    sqliteObjsVfsData *pVfsData = (sqliteObjsVfsData *)pVfs->pAppData;
 
     /* Delegate non-Azure paths (absolute filesystem paths) to default VFS */
-    if (!azqliteIsAzurePath(zName)) {
+    if (!sqliteObjsIsAzurePath(zName)) {
         return pVfsData->pDefaultVfs->xAccess(pVfsData->pDefaultVfs, zName,
                                                flags, pResOut);
     }
@@ -1722,7 +1722,7 @@ static int azqliteAccess(sqlite3_vfs *pVfs, const char *zName,
     void *ops_ctx;
     if (resolveOps(pVfsData, zName, &ops, &ops_ctx) && ops->blob_exists) {
         /* R1: Use cached journal existence when available */
-        azqliteJournalCacheEntry *jce = journalCacheFind(pVfsData, zName);
+        sqliteObjsJournalCacheEntry *jce = journalCacheFind(pVfsData, zName);
         if (jce && jce->state >= 0) {
             switch (flags) {
                 case SQLITE_ACCESS_EXISTS:
@@ -1776,7 +1776,7 @@ static int azqliteAccess(sqlite3_vfs *pVfs, const char *zName,
 ** xFullPathname — Normalize the blob name.
 ** Strip leading slashes, reject paths with "..".
 */
-static int azqliteFullPathname(sqlite3_vfs *pVfs, const char *zName,
+static int sqliteObjsFullPathname(sqlite3_vfs *pVfs, const char *zName,
                                 int nOut, char *zOut) {
     (void)pVfs;
     if (!zName || zName[0] == '\0') {
@@ -1803,44 +1803,44 @@ static int azqliteFullPathname(sqlite3_vfs *pVfs, const char *zName,
 
 /* ---------- Delegated methods ---------- */
 
-static void *azqliteDlOpen(sqlite3_vfs *pVfs, const char *zFilename) {
-    azqliteVfsData *d = (azqliteVfsData *)pVfs->pAppData;
+static void *sqliteObjsDlOpen(sqlite3_vfs *pVfs, const char *zFilename) {
+    sqliteObjsVfsData *d = (sqliteObjsVfsData *)pVfs->pAppData;
     return d->pDefaultVfs->xDlOpen(d->pDefaultVfs, zFilename);
 }
 
-static void azqliteDlError(sqlite3_vfs *pVfs, int nByte, char *zErrMsg) {
-    azqliteVfsData *d = (azqliteVfsData *)pVfs->pAppData;
+static void sqliteObjsDlError(sqlite3_vfs *pVfs, int nByte, char *zErrMsg) {
+    sqliteObjsVfsData *d = (sqliteObjsVfsData *)pVfs->pAppData;
     d->pDefaultVfs->xDlError(d->pDefaultVfs, nByte, zErrMsg);
 }
 
-static void (*azqliteDlSym(sqlite3_vfs *pVfs, void *pH,
+static void (*sqliteObjsDlSym(sqlite3_vfs *pVfs, void *pH,
                              const char *zSym))(void) {
-    azqliteVfsData *d = (azqliteVfsData *)pVfs->pAppData;
+    sqliteObjsVfsData *d = (sqliteObjsVfsData *)pVfs->pAppData;
     return d->pDefaultVfs->xDlSym(d->pDefaultVfs, pH, zSym);
 }
 
-static void azqliteDlClose(sqlite3_vfs *pVfs, void *pHandle) {
-    azqliteVfsData *d = (azqliteVfsData *)pVfs->pAppData;
+static void sqliteObjsDlClose(sqlite3_vfs *pVfs, void *pHandle) {
+    sqliteObjsVfsData *d = (sqliteObjsVfsData *)pVfs->pAppData;
     d->pDefaultVfs->xDlClose(d->pDefaultVfs, pHandle);
 }
 
-static int azqliteRandomness(sqlite3_vfs *pVfs, int nByte, char *zOut) {
-    azqliteVfsData *d = (azqliteVfsData *)pVfs->pAppData;
+static int sqliteObjsRandomness(sqlite3_vfs *pVfs, int nByte, char *zOut) {
+    sqliteObjsVfsData *d = (sqliteObjsVfsData *)pVfs->pAppData;
     return d->pDefaultVfs->xRandomness(d->pDefaultVfs, nByte, zOut);
 }
 
-static int azqliteSleep(sqlite3_vfs *pVfs, int microseconds) {
-    azqliteVfsData *d = (azqliteVfsData *)pVfs->pAppData;
+static int sqliteObjsSleep(sqlite3_vfs *pVfs, int microseconds) {
+    sqliteObjsVfsData *d = (sqliteObjsVfsData *)pVfs->pAppData;
     return d->pDefaultVfs->xSleep(d->pDefaultVfs, microseconds);
 }
 
-static int azqliteCurrentTime(sqlite3_vfs *pVfs, double *pTimeOut) {
-    azqliteVfsData *d = (azqliteVfsData *)pVfs->pAppData;
+static int sqliteObjsCurrentTime(sqlite3_vfs *pVfs, double *pTimeOut) {
+    sqliteObjsVfsData *d = (sqliteObjsVfsData *)pVfs->pAppData;
     return d->pDefaultVfs->xCurrentTime(d->pDefaultVfs, pTimeOut);
 }
 
-static int azqliteGetLastError(sqlite3_vfs *pVfs, int nByte, char *zErrMsg) {
-    azqliteVfsData *d = (azqliteVfsData *)pVfs->pAppData;
+static int sqliteObjsGetLastError(sqlite3_vfs *pVfs, int nByte, char *zErrMsg) {
+    sqliteObjsVfsData *d = (sqliteObjsVfsData *)pVfs->pAppData;
     if (nByte > 0 && d->lastError[0]) {
         int len = (int)strlen(d->lastError);
         if (len >= nByte) len = nByte - 1;
@@ -1851,8 +1851,8 @@ static int azqliteGetLastError(sqlite3_vfs *pVfs, int nByte, char *zErrMsg) {
     return d->pDefaultVfs->xGetLastError(d->pDefaultVfs, nByte, zErrMsg);
 }
 
-static int azqliteCurrentTimeInt64(sqlite3_vfs *pVfs, sqlite3_int64 *pTimeOut) {
-    azqliteVfsData *d = (azqliteVfsData *)pVfs->pAppData;
+static int sqliteObjsCurrentTimeInt64(sqlite3_vfs *pVfs, sqlite3_int64 *pTimeOut) {
+    sqliteObjsVfsData *d = (sqliteObjsVfsData *)pVfs->pAppData;
     if (d->pDefaultVfs->iVersion >= 2 && d->pDefaultVfs->xCurrentTimeInt64) {
         return d->pDefaultVfs->xCurrentTimeInt64(d->pDefaultVfs, pTimeOut);
     }
@@ -1871,37 +1871,37 @@ static int azqliteCurrentTimeInt64(sqlite3_vfs *pVfs, sqlite3_int64 *pTimeOut) {
 ** =================================================================== */
 
 /* Static VFS data — one instance, set up at registration time */
-static azqliteVfsData g_vfsData;
+static sqliteObjsVfsData g_vfsData;
 
-static sqlite3_vfs g_azqliteVfs = {
+static sqlite3_vfs g_sqliteObjsVfs = {
     2,                          /* iVersion = 2 for xCurrentTimeInt64 */
     0,                          /* szOsFile — set at registration time */
-    AZQLITE_MAX_PATHNAME,       /* mxPathname */
+    SQLITE_OBJS_MAX_PATHNAME,       /* mxPathname */
     0,                          /* pNext (managed by SQLite) */
-    "azqlite",                  /* zName */
+    "sqlite-objs",                  /* zName */
     0,                          /* pAppData — set at registration time */
-    azqliteOpen,
-    azqliteDelete,
-    azqliteAccess,
-    azqliteFullPathname,
-    azqliteDlOpen,
-    azqliteDlError,
-    azqliteDlSym,
-    azqliteDlClose,
-    azqliteRandomness,
-    azqliteSleep,
-    azqliteCurrentTime,
-    azqliteGetLastError,
-    azqliteCurrentTimeInt64,
+    sqliteObjsOpen,
+    sqliteObjsDelete,
+    sqliteObjsAccess,
+    sqliteObjsFullPathname,
+    sqliteObjsDlOpen,
+    sqliteObjsDlError,
+    sqliteObjsDlSym,
+    sqliteObjsDlClose,
+    sqliteObjsRandomness,
+    sqliteObjsSleep,
+    sqliteObjsCurrentTime,
+    sqliteObjsGetLastError,
+    sqliteObjsCurrentTimeInt64,
     /* v3 methods — not implemented */
     0, 0, 0
 };
 
 
 /*
-** azqlite_vfs_register_with_config — Register with explicit config.
+** sqlite_objs_vfs_register_with_config — Register with explicit config.
 */
-int azqlite_vfs_register_with_config(const azqlite_config_t *config,
+int sqlite_objs_vfs_register_with_config(const sqlite_objs_config_t *config,
                                      int makeDefault) {
     sqlite3_vfs *pDefault = sqlite3_vfs_find(0);
     if (!pDefault) return SQLITE_ERROR;
@@ -1937,20 +1937,20 @@ int azqlite_vfs_register_with_config(const azqlite_config_t *config,
     }
 
     /* szOsFile must accommodate both our struct and the default VFS's struct */
-    int ourSize = (int)sizeof(azqliteFile);
+    int ourSize = (int)sizeof(sqliteObjsFile);
     int defaultSize = pDefault->szOsFile;
-    g_azqliteVfs.szOsFile = (ourSize > defaultSize) ? ourSize : defaultSize;
-    g_azqliteVfs.pAppData = &g_vfsData;
+    g_sqliteObjsVfs.szOsFile = (ourSize > defaultSize) ? ourSize : defaultSize;
+    g_sqliteObjsVfs.pAppData = &g_vfsData;
 
-    return sqlite3_vfs_register(&g_azqliteVfs, makeDefault);
+    return sqlite3_vfs_register(&g_sqliteObjsVfs, makeDefault);
 }
 
 
 /*
-** azqlite_vfs_register — Register reading config from environment.
+** sqlite_objs_vfs_register — Register reading config from environment.
 */
-int azqlite_vfs_register(int makeDefault) {
-    azqlite_config_t cfg;
+int sqlite_objs_vfs_register(int makeDefault) {
+    sqlite_objs_config_t cfg;
     memset(&cfg, 0, sizeof(cfg));
 
     cfg.account = getenv("AZURE_STORAGE_ACCOUNT");
@@ -1965,28 +1965,28 @@ int azqlite_vfs_register(int makeDefault) {
         return SQLITE_ERROR;
     }
 
-    return azqlite_vfs_register_with_config(&cfg, makeDefault);
+    return sqlite_objs_vfs_register_with_config(&cfg, makeDefault);
 }
 
 /*
-** azqlite_vfs_register_with_ops — Convenience for tests.
+** sqlite_objs_vfs_register_with_ops — Convenience for tests.
 ** Registers the VFS with an explicit ops vtable and context pointer.
 */
-int azqlite_vfs_register_with_ops(azure_ops_t *ops, void *ctx,
+int sqlite_objs_vfs_register_with_ops(azure_ops_t *ops, void *ctx,
                                   int makeDefault) {
-    azqlite_config_t cfg;
+    sqlite_objs_config_t cfg;
     memset(&cfg, 0, sizeof(cfg));
     cfg.ops = ops;
     cfg.ops_ctx = ctx;
-    return azqlite_vfs_register_with_config(&cfg, makeDefault);
+    return sqlite_objs_vfs_register_with_config(&cfg, makeDefault);
 }
 
 /*
-** azqlite_vfs_register_uri — Register VFS with no global Azure client.
+** sqlite_objs_vfs_register_uri — Register VFS with no global Azure client.
 ** All databases must provide Azure config via URI parameters, or
 ** xOpen returns SQLITE_CANTOPEN.
 */
-int azqlite_vfs_register_uri(int makeDefault) {
+int sqlite_objs_vfs_register_uri(int makeDefault) {
     sqlite3_vfs *pDefault = sqlite3_vfs_find(0);
     if (!pDefault) return SQLITE_ERROR;
 
@@ -1997,10 +1997,10 @@ int azqlite_vfs_register_uri(int makeDefault) {
     g_vfsData.client = NULL;
 
     /* szOsFile must accommodate both our struct and the default VFS's struct */
-    int ourSize = (int)sizeof(azqliteFile);
+    int ourSize = (int)sizeof(sqliteObjsFile);
     int defaultSize = pDefault->szOsFile;
-    g_azqliteVfs.szOsFile = (ourSize > defaultSize) ? ourSize : defaultSize;
-    g_azqliteVfs.pAppData = &g_vfsData;
+    g_sqliteObjsVfs.szOsFile = (ourSize > defaultSize) ? ourSize : defaultSize;
+    g_sqliteObjsVfs.pAppData = &g_vfsData;
 
-    return sqlite3_vfs_register(&g_azqliteVfs, makeDefault);
+    return sqlite3_vfs_register(&g_sqliteObjsVfs, makeDefault);
 }

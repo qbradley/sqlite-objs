@@ -11,8 +11,8 @@
 
 ## What I Own
 
-- Rust crate packaging for azqlite C code (FFI bindings)
-- `sqlite-vfs-azure-storage` crate — bundles azqlite C and exposes safe Rust registration API
+- Rust crate packaging for sqlite-objs C code (FFI bindings)
+- `sqlite-vfs-azure-storage` crate — bundles sqlite-objs C and exposes safe Rust registration API
 - Rust sample applications demonstrating rusqlite + azure VFS
 - Cargo workspace structure and crate metadata
 - Build scripts (build.rs) for compiling and linking the C code

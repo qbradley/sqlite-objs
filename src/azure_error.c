@@ -7,7 +7,7 @@
  *
  * Evolved from research/azure-poc/azure_error.c into production quality.
  *
- * Part of the azqlite project. License: MIT
+ * Part of the sqliteObjs project. License: MIT
  */
 
 #include "azure_client_impl.h"

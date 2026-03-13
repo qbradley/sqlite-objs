@@ -1,5 +1,5 @@
 /*
-** azure_client.h — Canonical Azure client interface for azqlite
+** azure_client.h — Canonical Azure client interface for sqliteObjs
 **
 ** This header defines the azure_ops_t vtable — the swappable interface
 ** between the VFS layer and the Azure Blob Storage client.  In production,
@@ -10,8 +10,8 @@
 ** Other headers (azure_client_impl.h, mock_azure_ops.h) must include
 ** this header rather than redefining types.
 */
-#ifndef AZQLITE_AZURE_CLIENT_H
-#define AZQLITE_AZURE_CLIENT_H
+#ifndef SQLITE_OBJS_AZURE_CLIENT_H
+#define SQLITE_OBJS_AZURE_CLIENT_H
 
 #include <stdint.h>
 #include <stddef.h>
@@ -125,8 +125,8 @@ typedef struct azure_page_range {
 /* Maximum bytes per append_blob_append call (Azure limit) */
 #define AZURE_MAX_APPEND_SIZE (4 * 1024 * 1024)
 
-#ifndef AZQLITE_MAX_PARALLEL_PUTS
-#define AZQLITE_MAX_PARALLEL_PUTS 32
+#ifndef SQLITE_OBJS_MAX_PARALLEL_PUTS
+#define SQLITE_OBJS_MAX_PARALLEL_PUTS 32
 #endif
 
 /* -----------------------------------------------------------------------
@@ -331,4 +331,4 @@ azure_err_t azure_container_create(azure_client_t *client,
 }
 #endif
 
-#endif /* AZQLITE_AZURE_CLIENT_H */
+#endif /* SQLITE_OBJS_AZURE_CLIENT_H */
