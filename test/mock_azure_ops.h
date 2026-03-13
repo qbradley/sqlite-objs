@@ -193,6 +193,9 @@ int64_t mock_get_append_size(mock_azure_ctx_t *ctx, const char *name);
 /* Clear append blob data (reset buffer to empty, keep blob alive). */
 void mock_reset_append_data(mock_azure_ctx_t *ctx, const char *name);
 
+/* Bump the ETag of a blob to simulate an external write. */
+void mock_bump_etag(mock_azure_ctx_t *ctx, const char *name);
+
 #ifdef __cplusplus
 }
 #endif

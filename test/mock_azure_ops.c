@@ -1056,3 +1056,10 @@ void mock_reset_append_data(mock_azure_ctx_t *ctx, const char *name) {
     if (!b || b->type != BLOB_TYPE_APPEND) return;
     b->size = 0;
 }
+
+void mock_bump_etag(mock_azure_ctx_t *ctx, const char *name) {
+    if (!ctx) return;
+    mock_blob_t *b = find_blob(ctx, name);
+    if (!b) return;
+    b->etag_version++;
+}

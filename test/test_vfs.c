@@ -24,11 +24,25 @@
 
 static mock_azure_ctx_t *g_ctx = NULL;
 static azure_ops_t      *g_ops = NULL;
+static char g_test_cache_dir[256];
+
+static void clean_test_cache_dir(void) {
+    /* Remove all files in the test cache dir */
+    char cmd[512];
+    snprintf(cmd, sizeof(cmd), "rm -rf %s", g_test_cache_dir);
+    system(cmd);
+}
 
 static void setup(void) {
     if (g_ctx) mock_reset(g_ctx);
     else       g_ctx = mock_azure_create();
     g_ops = mock_azure_get_ops();
+    /* Use a test-run-specific cache dir to avoid stale cache interference */
+    if (g_test_cache_dir[0] == '\0') {
+        snprintf(g_test_cache_dir, sizeof(g_test_cache_dir),
+                 "/tmp/azqlite-test-%d", getpid());
+    }
+    clean_test_cache_dir();
 }
 
 static void teardown(void) {
@@ -1328,8 +1342,10 @@ TEST(concurrent_page_and_block_blobs) {
 static sqlite3 *open_test_db(mock_azure_ctx_t *mctx) {
     sqlite3 *db = NULL;
     azqlite_vfs_register_with_ops(mock_azure_get_ops(), mctx, 0);
-    int rc = sqlite3_open_v2("test.db", &db,
-                              SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE,
+    char uri[512];
+    snprintf(uri, sizeof(uri), "file:test.db?cache_dir=%s", g_test_cache_dir);
+    int rc = sqlite3_open_v2(uri, &db,
+                              SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_URI,
                               "azqlite");
     return (rc == SQLITE_OK) ? db : NULL;
 }
@@ -1342,8 +1358,9 @@ static void close_test_db(sqlite3 *db) {
 static sqlite3 *open_test_db_uri(mock_azure_ctx_t *mctx, const char *params) {
     sqlite3 *db = NULL;
     azqlite_vfs_register_with_ops(mock_azure_get_ops(), mctx, 0);
-    char uri[256];
-    snprintf(uri, sizeof(uri), "file:test.db?%s", params);
+    char uri[512];
+    snprintf(uri, sizeof(uri), "file:test.db?cache_dir=%s&%s",
+             g_test_cache_dir, params);
     int rc = sqlite3_open_v2(uri, &db,
                               SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_URI,
                               "azqlite");
@@ -1355,8 +1372,9 @@ static sqlite3 *open_existing_test_db_uri(mock_azure_ctx_t *mctx,
                                            const char *params) {
     sqlite3 *db = NULL;
     azqlite_vfs_register_with_ops(mock_azure_get_ops(), mctx, 0);
-    char uri[256];
-    snprintf(uri, sizeof(uri), "file:%s?%s", name, params);
+    char uri[512];
+    snprintf(uri, sizeof(uri), "file:%s?cache_dir=%s&%s",
+             name, g_test_cache_dir, params);
     int rc = sqlite3_open_v2(uri, &db,
                               SQLITE_OPEN_READWRITE | SQLITE_OPEN_URI,
                               "azqlite");
@@ -2395,8 +2413,10 @@ static sqlite3 *open_existing_test_db(mock_azure_ctx_t *mctx,
                                        const char *name) {
     sqlite3 *db = NULL;
     azqlite_vfs_register_with_ops(mock_azure_get_ops(), mctx, 0);
-    int rc = sqlite3_open_v2(name, &db,
-                              SQLITE_OPEN_READWRITE,
+    char uri[512];
+    snprintf(uri, sizeof(uri), "file:%s?cache_dir=%s", name, g_test_cache_dir);
+    int rc = sqlite3_open_v2(uri, &db,
+                              SQLITE_OPEN_READWRITE | SQLITE_OPEN_URI,
                               "azqlite");
     return (rc == SQLITE_OK) ? db : NULL;
 }
@@ -2453,13 +2473,13 @@ TEST(demand_paging_cache_miss_fetches_page) {
     ASSERT_OK(rc);
     close_test_db(db);
 
-    /* Reopen — bulk prefetch loads entire small DB into cache */
+    /* Reopen — cache has all pages from prior session, ETag matches */
     mock_reset_call_counts(g_ctx);
     db = open_existing_test_db(g_ctx, "test.db");
     ASSERT_NOT_NULL(db);
 
-    /* Single page_blob_read call (bulk prefetch) */
-    ASSERT_EQ(mock_get_call_count(g_ctx, "page_blob_read"), 1);
+    /* ETag match: zero page_blob_read calls (served from disk cache) */
+    ASSERT_EQ(mock_get_call_count(g_ctx, "page_blob_read"), 0);
 
     /* First SELECT: all pages already cached from prefetch, no new reads */
     mock_reset_call_counts(g_ctx);
@@ -2898,6 +2918,226 @@ TEST(demand_paging_data_survives_reopen) {
     rc = sqlite3_step(stmt);
     ASSERT_EQ(rc, SQLITE_ROW);
     ASSERT_STR_EQ((const char *)sqlite3_column_text(stmt, 0), "row-99");
+    sqlite3_finalize(stmt);
+
+    close_test_db(db);
+}
+
+/* ══════════════════════════════════════════════════════════════════════
+** Mmap Disk Cache Tests
+** ══════════════════════════════════════════════════════════════════════ */
+
+/* Test: ETag-based cache reuse — reopen with same ETag skips download */
+TEST(disk_cache_etag_reuse_skips_download) {
+    setup();
+
+    /* Create a database with some data */
+    sqlite3 *db = open_test_db(g_ctx);
+    ASSERT_NOT_NULL(db);
+    int rc = sqlite3_exec(db,
+        "CREATE TABLE t(id INTEGER PRIMARY KEY, val TEXT);"
+        "INSERT INTO t VALUES(1, 'hello');"
+        "INSERT INTO t VALUES(2, 'world');",
+        NULL, NULL, NULL);
+    ASSERT_OK(rc);
+    close_test_db(db);
+
+    /* Reopen — cache should be warm with matching ETag, no downloads */
+    mock_reset_call_counts(g_ctx);
+    db = open_existing_test_db(g_ctx, "test.db");
+    ASSERT_NOT_NULL(db);
+
+    /* ETag matches — zero page reads needed */
+    ASSERT_EQ(mock_get_call_count(g_ctx, "page_blob_read"), 0);
+
+    /* Verify data is readable */
+    sqlite3_stmt *stmt;
+    rc = sqlite3_prepare_v2(db, "SELECT val FROM t WHERE id=1;", -1, &stmt, NULL);
+    ASSERT_OK(rc);
+    rc = sqlite3_step(stmt);
+    ASSERT_EQ(rc, SQLITE_ROW);
+    ASSERT_STR_EQ((const char *)sqlite3_column_text(stmt, 0), "hello");
+    sqlite3_finalize(stmt);
+    close_test_db(db);
+
+    /* Reopen again — ETag matches so cache is valid, fewer reads expected */
+    mock_reset_call_counts(g_ctx);
+    db = open_existing_test_db(g_ctx, "test.db");
+    ASSERT_NOT_NULL(db);
+    int second_reads = mock_get_call_count(g_ctx, "page_blob_read");
+
+    /* With ETag match, should do zero page reads (cache has all pages) */
+    ASSERT_EQ(second_reads, 0);
+
+    /* Data still accessible from cache */
+    rc = sqlite3_prepare_v2(db, "SELECT val FROM t WHERE id=2;", -1, &stmt, NULL);
+    ASSERT_OK(rc);
+    rc = sqlite3_step(stmt);
+    ASSERT_EQ(rc, SQLITE_ROW);
+    ASSERT_STR_EQ((const char *)sqlite3_column_text(stmt, 0), "world");
+    sqlite3_finalize(stmt);
+
+    close_test_db(db);
+}
+
+/* Test: ETag mismatch triggers re-download */
+TEST(disk_cache_etag_mismatch_redownloads) {
+    setup();
+
+    /* Create a database */
+    sqlite3 *db = open_test_db(g_ctx);
+    ASSERT_NOT_NULL(db);
+    int rc = sqlite3_exec(db,
+        "CREATE TABLE t(id INTEGER PRIMARY KEY, val TEXT);"
+        "INSERT INTO t VALUES(1, 'original');",
+        NULL, NULL, NULL);
+    ASSERT_OK(rc);
+    close_test_db(db);
+
+    /* Open once to populate cache */
+    db = open_existing_test_db(g_ctx, "test.db");
+    ASSERT_NOT_NULL(db);
+    close_test_db(db);
+
+    /* Simulate external write by bumping the mock ETag */
+    mock_bump_etag(g_ctx, "test.db");
+
+    /* Reopen — ETag mismatch should force re-download */
+    mock_reset_call_counts(g_ctx);
+    db = open_existing_test_db(g_ctx, "test.db");
+    ASSERT_NOT_NULL(db);
+    int reads = mock_get_call_count(g_ctx, "page_blob_read");
+    ASSERT_GT(reads, 0);  /* Had to re-download because ETag changed */
+
+    close_test_db(db);
+}
+
+/* Test: Large database grows cache on write */
+TEST(disk_cache_grows_on_write) {
+    setup();
+
+    /* Start with a small database */
+    sqlite3 *db = open_test_db(g_ctx);
+    ASSERT_NOT_NULL(db);
+    int rc = sqlite3_exec(db, "CREATE TABLE t(id INTEGER PRIMARY KEY, data TEXT);",
+                           NULL, NULL, NULL);
+    ASSERT_OK(rc);
+
+    /* Insert lots of data to force cache growth */
+    rc = sqlite3_exec(db, "BEGIN;", NULL, NULL, NULL);
+    ASSERT_OK(rc);
+    for (int i = 0; i < 500; i++) {
+        char sql[512];
+        snprintf(sql, sizeof(sql),
+                 "INSERT INTO t VALUES(%d, '%0400d');", i, i);
+        rc = sqlite3_exec(db, sql, NULL, NULL, NULL);
+        ASSERT_OK(rc);
+    }
+    rc = sqlite3_exec(db, "COMMIT;", NULL, NULL, NULL);
+    ASSERT_OK(rc);
+
+    /* Verify all data readable */
+    sqlite3_stmt *stmt;
+    rc = sqlite3_prepare_v2(db, "SELECT COUNT(*) FROM t;", -1, &stmt, NULL);
+    ASSERT_OK(rc);
+    rc = sqlite3_step(stmt);
+    ASSERT_EQ(rc, SQLITE_ROW);
+    ASSERT_EQ(sqlite3_column_int(stmt, 0), 500);
+    sqlite3_finalize(stmt);
+
+    /* Spot check */
+    rc = sqlite3_prepare_v2(db, "SELECT data FROM t WHERE id=499;", -1, &stmt, NULL);
+    ASSERT_OK(rc);
+    rc = sqlite3_step(stmt);
+    ASSERT_EQ(rc, SQLITE_ROW);
+    sqlite3_finalize(stmt);
+
+    close_test_db(db);
+}
+
+/* Test: Cache survives close/reopen and serves data without Azure reads */
+TEST(disk_cache_survives_reopen) {
+    setup();
+
+    /* Create and populate a database */
+    sqlite3 *db = open_test_db(g_ctx);
+    ASSERT_NOT_NULL(db);
+    int rc = sqlite3_exec(db,
+        "CREATE TABLE items(id INTEGER PRIMARY KEY, name TEXT);"
+        "INSERT INTO items VALUES(1, 'alpha');"
+        "INSERT INTO items VALUES(2, 'beta');"
+        "INSERT INTO items VALUES(3, 'gamma');",
+        NULL, NULL, NULL);
+    ASSERT_OK(rc);
+    close_test_db(db);
+
+    /* First reopen (populates cache from Azure) */
+    db = open_existing_test_db(g_ctx, "test.db");
+    ASSERT_NOT_NULL(db);
+    /* Read to ensure pages are in cache */
+    sqlite3_stmt *stmt;
+    rc = sqlite3_prepare_v2(db, "SELECT COUNT(*) FROM items;", -1, &stmt, NULL);
+    ASSERT_OK(rc);
+    sqlite3_step(stmt);
+    sqlite3_finalize(stmt);
+    close_test_db(db);
+
+    /* Second reopen (should use cached data, no Azure reads) */
+    mock_reset_call_counts(g_ctx);
+    db = open_existing_test_db(g_ctx, "test.db");
+    ASSERT_NOT_NULL(db);
+
+    /* Query the data — all from cache */
+    rc = sqlite3_prepare_v2(db, "SELECT name FROM items WHERE id=2;", -1, &stmt, NULL);
+    ASSERT_OK(rc);
+    rc = sqlite3_step(stmt);
+    ASSERT_EQ(rc, SQLITE_ROW);
+    ASSERT_STR_EQ((const char *)sqlite3_column_text(stmt, 0), "beta");
+    sqlite3_finalize(stmt);
+
+    /* Should have zero page reads (ETag matches, cache valid) */
+    ASSERT_EQ(mock_get_call_count(g_ctx, "page_blob_read"), 0);
+
+    close_test_db(db);
+}
+
+/* Test: Write through disk cache correctly persists to Azure */
+TEST(disk_cache_write_through) {
+    setup();
+
+    sqlite3 *db = open_test_db(g_ctx);
+    ASSERT_NOT_NULL(db);
+    int rc = sqlite3_exec(db,
+        "CREATE TABLE t(x INTEGER);"
+        "INSERT INTO t VALUES(42);",
+        NULL, NULL, NULL);
+    ASSERT_OK(rc);
+    close_test_db(db);
+
+    /* Reopen and verify data persists (via Azure, not just local cache) */
+    db = open_existing_test_db(g_ctx, "test.db");
+    ASSERT_NOT_NULL(db);
+    sqlite3_stmt *stmt;
+    rc = sqlite3_prepare_v2(db, "SELECT x FROM t;", -1, &stmt, NULL);
+    ASSERT_OK(rc);
+    rc = sqlite3_step(stmt);
+    ASSERT_EQ(rc, SQLITE_ROW);
+    ASSERT_EQ(sqlite3_column_int(stmt, 0), 42);
+    sqlite3_finalize(stmt);
+
+    /* Write more data */
+    rc = sqlite3_exec(db, "INSERT INTO t VALUES(99);", NULL, NULL, NULL);
+    ASSERT_OK(rc);
+    close_test_db(db);
+
+    /* Final reopen — both values should be present */
+    db = open_existing_test_db(g_ctx, "test.db");
+    ASSERT_NOT_NULL(db);
+    rc = sqlite3_prepare_v2(db, "SELECT COUNT(*) FROM t;", -1, &stmt, NULL);
+    ASSERT_OK(rc);
+    rc = sqlite3_step(stmt);
+    ASSERT_EQ(rc, SQLITE_ROW);
+    ASSERT_EQ(sqlite3_column_int(stmt, 0), 2);
     sqlite3_finalize(stmt);
 
     close_test_db(db);
@@ -3482,6 +3722,14 @@ void run_vfs_tests(void) {
     RUN_TEST(demand_paging_data_survives_reopen);
     TEST_SUITE_END();
 
+    TEST_SUITE_BEGIN("Mmap Disk Cache");
+    RUN_TEST(disk_cache_etag_reuse_skips_download);
+    RUN_TEST(disk_cache_etag_mismatch_redownloads);
+    RUN_TEST(disk_cache_grows_on_write);
+    RUN_TEST(disk_cache_survives_reopen);
+    RUN_TEST(disk_cache_write_through);
+    TEST_SUITE_END();
+
     TEST_SUITE_BEGIN("Adaptive Readahead");
     RUN_TEST(readahead_default_is_adaptive);
     RUN_TEST(readahead_sequential_grows_window);
@@ -3503,4 +3751,5 @@ void run_vfs_tests(void) {
         mock_azure_destroy(g_ctx);
         g_ctx = NULL;
     }
+    clean_test_cache_dir();
 }

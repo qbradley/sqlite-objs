@@ -177,10 +177,13 @@ static const char *default_cache_dir(void) {
 ** =================================================================== */
 
 azqlite_cache_t *azqlite_cache_open(const azqlite_cache_config_t *config) {
-    if (!config || !config->blob_identity || config->page_size <= 0 ||
+    if (!config || !config->blob_identity ||
         config->page_count < 0) {
         return NULL;
     }
+
+    /* page_size==0 means "adopt from existing cache header, or use 4096" */
+    int requested_page_size = config->page_size > 0 ? config->page_size : 4096;
 
     const char *dir = config->cache_dir ? config->cache_dir : default_cache_dir();
     if (ensure_directory(dir) != 0) return NULL;
@@ -192,7 +195,7 @@ azqlite_cache_t *azqlite_cache_open(const azqlite_cache_config_t *config) {
     azqlite_cache_t *c = (azqlite_cache_t *)calloc(1, sizeof(azqlite_cache_t));
     if (!c) return NULL;
 
-    c->page_size = config->page_size;
+    c->page_size = requested_page_size;
     c->page_count = config->page_count > 0 ? config->page_count : 1;
     c->checksums_enabled = config->checksums_enabled;
     c->meta_fd = -1;
@@ -232,7 +235,25 @@ azqlite_cache_t *azqlite_cache_open(const azqlite_cache_config_t *config) {
     if (memcmp(c->header->magic, AZQLITE_CACHE_MAGIC,
                AZQLITE_CACHE_MAGIC_LEN) == 0 &&
         c->header->version == AZQLITE_CACHE_VERSION &&
-        c->header->page_size == (uint32_t)c->page_size) {
+        c->header->page_size > 0) {
+
+        /* Adopt page_size from existing header if it differs */
+        if ((int)c->header->page_size != c->page_size) {
+            c->page_size = (int)c->header->page_size;
+            /* Recompute sizes with adopted page_size */
+            c->pages_size = (size_t)c->page_count * (size_t)c->page_size;
+            if (c->pages_size == 0) c->pages_size = (size_t)c->page_size;
+            /* Remap pages file with correct size */
+            munmap(c->pages_base, c->pages_size);
+            size_t new_pages_size = (size_t)c->page_count * (size_t)c->page_size;
+            if (new_pages_size == 0) new_pages_size = (size_t)c->page_size;
+            ftruncate(c->pages_fd, (off_t)new_pages_size);
+            c->pages_size = new_pages_size;
+            c->pages_base = (unsigned char *)mmap(NULL, c->pages_size,
+                PROT_READ | PROT_WRITE, MAP_SHARED, c->pages_fd, 0);
+            if (c->pages_base == MAP_FAILED) goto fail;
+        }
+
         /* Existing valid cache — check if previous session crashed */
         if (c->header->flags & AZQLITE_CACHE_FLAG_SESSION_ACTIVE) {
             /* Unclean shutdown — invalidate all pages */

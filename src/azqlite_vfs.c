@@ -1833,67 +1833,99 @@ static int azqliteOpen(sqlite3_vfs *pVfs, sqlite3_filename zName,
             p->blobSize = blobSize;
 
             if (blobSize > 0 && p->ops->page_blob_read) {
-            /* Determine how much to prefetch based on strategy.
-             * All strategies download in one large GET to minimize
-             * HTTP round-trips (~22ms per request to Azure). */
-            size_t fetchLen = 0;
-            size_t cacheMaxBytes = (size_t)p->cachePagesConfig * AZQLITE_DEFAULT_PAGE_SIZE;
-
-            if (p->prefetchPages == AZQLITE_PREFETCH_OFF) {
-                /* Off: just page 0 (header) for page-size detection */
-                fetchLen = AZQLITE_DEFAULT_PAGE_SIZE;
-            } else if (p->prefetchPages == AZQLITE_PREFETCH_ALL) {
-                /* All: download entire DB if it fits in cache */
-                if ((size_t)blobSize <= cacheMaxBytes) {
-                    fetchLen = (size_t)blobSize;
-                } else {
-                    /* DB doesn’t fit — fall back to default fixed prefetch */
-                    size_t fallback = (size_t)AZQLITE_DEFAULT_PREFETCH_PAGES * AZQLITE_DEFAULT_PAGE_SIZE;
-                    fetchLen = (fallback <= (size_t)blobSize) ? fallback : (size_t)blobSize;
-                }
-            } else if (p->prefetchPages == AZQLITE_PREFETCH_INDEX ||
-                       p->prefetchPages == AZQLITE_PREFETCH_WARM) {
-                /* Index/warm: not yet implemented — fall back to default */
-                size_t fallback = (size_t)AZQLITE_DEFAULT_PREFETCH_PAGES * AZQLITE_DEFAULT_PAGE_SIZE;
-                fetchLen = (fallback <= (size_t)blobSize) ? fallback : (size_t)blobSize;
-            } else {
-                /* Fixed page count */
-                int prefetchLimit = p->prefetchPages;
-                if (prefetchLimit > p->cachePagesConfig)
-                    prefetchLimit = p->cachePagesConfig;
-                size_t maxPrefetch = (size_t)prefetchLimit * AZQLITE_DEFAULT_PAGE_SIZE;
-                fetchLen = ((int64_t)maxPrefetch <= blobSize)
-                                  ? maxPrefetch : (size_t)blobSize;
+            /* Open disk cache first (page_size=0 adopts existing header's page_size) */
+            const char *cacheDir = sqlite3_uri_parameter(zName, "cache_dir");
+            int pageCount = (int)(blobSize / AZQLITE_DEFAULT_PAGE_SIZE) + 1;
+            {
+                azqlite_cache_config_t cfg;
+                memset(&cfg, 0, sizeof(cfg));
+                cfg.cache_dir = cacheDir;
+                cfg.blob_identity = p->zBlobName;
+                cfg.page_size = 0;  /* Adopt from existing cache, or 4096 */
+                cfg.page_count = pageCount;
+                p->diskCache = azqlite_cache_open(&cfg);
+            }
+            if (!p->diskCache) {
+                sqlite3_free(p->zBlobName);
+                p->zBlobName = NULL;
+                return SQLITE_NOMEM;
             }
 
-            /* Always fetch at least the header page */
-            if (fetchLen < AZQLITE_DEFAULT_PAGE_SIZE && blobSize > 0)
-                fetchLen = AZQLITE_DEFAULT_PAGE_SIZE;
-            if ((int64_t)fetchLen > blobSize) fetchLen = (size_t)blobSize;
+            /* ETag check: if cached ETag matches remote, skip all downloads */
+            int etagHit = 0;
+            if (p->etag[0] != '\0' &&
+                azqlite_cache_etag_matches(p->diskCache, p->etag)) {
+                etagHit = 1;
+                p->pageSize = azqlite_cache_page_size(p->diskCache);
+                /* Ensure cache covers the full blob */
+                int neededPages = (int)(blobSize / p->pageSize) + 1;
+                if (neededPages > azqlite_cache_page_count(p->diskCache)) {
+                    azqlite_cache_grow(p->diskCache, neededPages);
+                }
+            }
+
+            if (!etagHit) {
+                /* ETag mismatch or new cache — must download data */
+                azqlite_cache_invalidate_all(p->diskCache);
+
+                /* Determine how much to prefetch */
+                size_t fetchLen = 0;
+                size_t cacheMaxBytes = (size_t)p->cachePagesConfig * AZQLITE_DEFAULT_PAGE_SIZE;
+
+                if (p->prefetchPages == AZQLITE_PREFETCH_OFF) {
+                    fetchLen = AZQLITE_DEFAULT_PAGE_SIZE;
+                } else if (p->prefetchPages == AZQLITE_PREFETCH_ALL) {
+                    if ((size_t)blobSize <= cacheMaxBytes) {
+                        fetchLen = (size_t)blobSize;
+                    } else {
+                        size_t fallback = (size_t)AZQLITE_DEFAULT_PREFETCH_PAGES * AZQLITE_DEFAULT_PAGE_SIZE;
+                        fetchLen = (fallback <= (size_t)blobSize) ? fallback : (size_t)blobSize;
+                    }
+                } else if (p->prefetchPages == AZQLITE_PREFETCH_INDEX ||
+                           p->prefetchPages == AZQLITE_PREFETCH_WARM) {
+                    size_t fallback = (size_t)AZQLITE_DEFAULT_PREFETCH_PAGES * AZQLITE_DEFAULT_PAGE_SIZE;
+                    fetchLen = (fallback <= (size_t)blobSize) ? fallback : (size_t)blobSize;
+                } else {
+                    int prefetchLimit = p->prefetchPages;
+                    if (prefetchLimit > p->cachePagesConfig)
+                        prefetchLimit = p->cachePagesConfig;
+                    size_t maxPrefetch = (size_t)prefetchLimit * AZQLITE_DEFAULT_PAGE_SIZE;
+                    fetchLen = ((int64_t)maxPrefetch <= blobSize)
+                                      ? maxPrefetch : (size_t)blobSize;
+                }
+
+                if (fetchLen < AZQLITE_DEFAULT_PAGE_SIZE && blobSize > 0)
+                    fetchLen = AZQLITE_DEFAULT_PAGE_SIZE;
+                if ((int64_t)fetchLen > blobSize) fetchLen = (size_t)blobSize;
+
                 double prefetch_t0 = 0;
                 if (azqlite_debug_timing()) prefetch_t0 = azqlite_time_ms();
+
                 azure_buffer_t buf = {0};
                 azure_error_t aerr2;
                 azure_error_init(&aerr2);
                 azure_err_t rarc = p->ops->page_blob_read(p->ops_ctx, zName,
                                               0, fetchLen, &buf, &aerr2);
                 if (rarc != AZURE_OK) {
+                    azqlite_cache_close(p->diskCache);
+                    p->diskCache = NULL;
                     sqlite3_free(p->zBlobName);
                     p->zBlobName = NULL;
                     return azureErrToSqlite(rarc, SQLITE_CANTOPEN);
                 }
 
-                /* Detect page size from the downloaded header */
+                /* Detect page size from downloaded header */
                 int detectedPageSize = AZQLITE_DEFAULT_PAGE_SIZE;
                 if (buf.data && buf.size >= 100) {
                     int detected = detectPageSize(buf.data, (sqlite3_int64)buf.size);
                     if (detected > 0) detectedPageSize = detected;
                 }
+                p->pageSize = detectedPageSize;
 
-                /* Open disk cache with detected page size */
-                {
-                    const char *cacheDir = sqlite3_uri_parameter(zName, "cache_dir");
-                    int pageCount = (int)(blobSize / detectedPageSize) + 1;
+                /* If detected page size differs from cache's, close and reopen */
+                if (detectedPageSize != azqlite_cache_page_size(p->diskCache)) {
+                    azqlite_cache_close(p->diskCache);
+                    pageCount = (int)(blobSize / detectedPageSize) + 1;
                     azqlite_cache_config_t cfg;
                     memset(&cfg, 0, sizeof(cfg));
                     cfg.cache_dir = cacheDir;
@@ -1901,32 +1933,21 @@ static int azqliteOpen(sqlite3_vfs *pVfs, sqlite3_filename zName,
                     cfg.page_size = detectedPageSize;
                     cfg.page_count = pageCount;
                     p->diskCache = azqlite_cache_open(&cfg);
-                }
-                if (!p->diskCache) {
-                    free(buf.data);
-                    sqlite3_free(p->zBlobName);
-                    p->zBlobName = NULL;
-                    return SQLITE_NOMEM;
-                }
-                p->pageSize = detectedPageSize;
-
-                /* ETag check: if cached ETag matches, skip re-downloading */
-                int etagHit = 0;
-                if (p->etag[0] != '\0' &&
-                    azqlite_cache_etag_matches(p->diskCache, p->etag)) {
-                    etagHit = 1;
-                } else {
-                    /* ETag mismatch or no cached ETag — invalidate stale pages */
+                    if (!p->diskCache) {
+                        free(buf.data);
+                        sqlite3_free(p->zBlobName);
+                        p->zBlobName = NULL;
+                        return SQLITE_NOMEM;
+                    }
                     azqlite_cache_invalidate_all(p->diskCache);
                 }
 
                 /* Insert fetched pages into cache */
                 int pagesLoaded = 0;
-                if (!etagHit && buf.data && buf.size > 0) {
+                if (buf.data && buf.size > 0) {
                     size_t off = 0;
                     int pageNo = 0;
                     while (off < buf.size) {
-                        /* Grow cache if needed */
                         if (pageNo >= azqlite_cache_page_count(p->diskCache)) {
                             azqlite_cache_grow(p->diskCache, pageNo + 64);
                         }
@@ -1939,11 +1960,6 @@ static int azqliteOpen(sqlite3_vfs *pVfs, sqlite3_filename zName,
                 }
                 free(buf.data);
 
-                /* Store ETag in cache for future sessions */
-                if (p->etag[0] != '\0') {
-                    azqlite_cache_set_etag(p->diskCache, p->etag);
-                }
-
                 if (azqlite_debug_timing()) {
                     double prefetch_ms = azqlite_time_ms() - prefetch_t0;
                     const char *stratName =
@@ -1952,16 +1968,22 @@ static int azqliteOpen(sqlite3_vfs *pVfs, sqlite3_filename zName,
                         (p->prefetchPages == AZQLITE_PREFETCH_INDEX) ? "index" :
                         (p->prefetchPages == AZQLITE_PREFETCH_WARM) ? "warm" : "fixed";
                     fprintf(stderr, "[PREFETCH] strategy=%s fetched=%d pages (%.1fMB) "
-                            "of %lld total (%.1fMB) in %.1fms etag_hit=%d\n",
+                            "of %lld total (%.1fMB) in %.1fms\n",
                             stratName, pagesLoaded,
                             (double)fetchLen / (1024.0 * 1024.0),
                             (long long)blobSize,
                             (double)blobSize / (1024.0 * 1024.0),
-                            prefetch_ms, etagHit);
+                            prefetch_ms);
                 }
+            }
 
-                /* R2: Record initial Azure blob size to skip redundant resizes */
-                p->lastSyncedSize = blobSize;
+            /* Store ETag in cache for future sessions */
+            if (p->etag[0] != '\0') {
+                azqlite_cache_set_etag(p->diskCache, p->etag);
+            }
+
+            /* R2: Record initial Azure blob size to skip redundant resizes */
+            p->lastSyncedSize = blobSize;
             } else {
                 /* Empty blob or no read ops — open cache with default page size */
                 const char *cacheDir = sqlite3_uri_parameter(zName, "cache_dir");
