@@ -330,6 +330,41 @@ Use claude-opus-4.6 for all agents during performance optimization implementatio
 
 ---
 
+### D21: Disk-Backed Cache for MAIN_DB
+**Date:** 2026-03-14 | **From:** Aragorn (SQLite/C Dev)
+
+Replaced in-memory `aData` buffer with local disk cache file via `pread()`/`pwrite()` I/O. Cache file created via `mktemp()`, journal/WAL remain in-memory. Memory footprint reduced from database-size to ~8MB (SQLite's page cache). Dirty bitmap tracking preserved. All 242 tests passing after fixing 3 critical bugs: dirty bitmap nData sequencing, 512-byte alignment in pread, dirtyClearAll allocation mismatch.
+
+---
+
+### D22: URI Builder for Rust sqlite-objs Crate
+**Date:** 2026-03-14 | **From:** Gimli (Rust Dev)
+
+Added `UriBuilder` fluent API to `rust/sqlite-objs/src/lib.rs` for safe SQLite URI construction with Azure credentials. Implements inline RFC 3986 percent-encoding (no external dependencies) to handle special characters in SAS tokens (`&`, `=`, `%`, `:`). 11 unit + 4 doc tests passing. Eliminates manual URI encoding errors common in user code.
+
+---
+
+### UD6: User Directive — 1GB Default Cache Size
+**Date:** 2026-03-13 | **From:** Quetzal Bradley (via Copilot)
+
+Increase default cache size from 4MB to 1GB. Users experiencing 85× performance regression with current default; optimize for performance by default and let memory-conscious users tune down. Recommended approach: expose via PRAGMA or URI parameter.
+
+---
+
+### UD7: User Directive — No Environment Variables in Library Code
+**Date:** 2026-03-13 | **From:** Quetzal Bradley (via Copilot)
+
+Remove all environment variable configuration from library code. Library configuration must use URI parameters or sqlite3_file_control (matching existing credential pattern). Affected env vars: SQLITE_OBJS_CACHE_PAGES, SQLITE_OBJS_READAHEAD_PAGES, SQLITE_OBJS_DEBUG_TIMING. Rationale: env vars are implicit, hard to discover, inappropriate for library configuration.
+
+---
+
+### UD8: User Directive — Return Code Handling
+**Date:** 2026-03-11 | **From:** Quetzal Bradley (via Copilot)
+
+In C code, never ignore return codes. Applies to both product and test code. Errors must be handled, propagated, or at least logged. Non-negotiable standard for codebase quality.
+
+---
+
 ## Governance
 
 - All meaningful changes require team consensus
