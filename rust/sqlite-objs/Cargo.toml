@@ -11,7 +11,17 @@ rust-version.workspace = true
 [dependencies]
 sqlite-objs-sys.workspace = true
 thiserror = "2.0"
+rusqlite = { version = "0.38", optional = true }
+dotenvy = { version = "0.15", optional = true }
+tracing-subscriber = { version = "0.3", features = ["env-filter"], optional = true }
 
 [dev-dependencies]
 rusqlite = "0.38"
 tempfile = "3.8"
+
+[features]
+bin-deps = ["dep:rusqlite", "dep:dotenvy", "dep:tracing-subscriber"]
+
+[[bin]]
+name = "azure_vfs_repro"
+required-features = ["bin-deps"]

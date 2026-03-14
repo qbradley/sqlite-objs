@@ -503,3 +503,37 @@ file:mydb.db?cache_dir=/var/cache/myapp
 
 **Design rationale:** This is the minimal correct fix. Per-connection clients can be done later as an optimization. The lock in `execute_single()` must cover everything from `curl_easy_reset()` through `curl_easy_perform()` and the subsequent `curl_easy_getinfo()` calls. For batch operations, the lock spans the entire batch (including retries) to protect the multi handle.
 
+
+---
+
+## Learnings
+
+### Azure VFS Repro Binary Setup (2025-01)
+
+**Task:** Created `azure_vfs_repro` binary for Azure VFS threading scenario reproduction.
+
+**File locations:**
+- Binary source: `rust/sqlite-objs/src/bin/azure_vfs_repro.rs`
+- Config: `rust/sqlite-objs/Cargo.toml`
+
+**Key decisions:**
+1. **Optional dependencies with feature flag:** Used `bin-deps` feature to keep binary-only dependencies (`rusqlite`, `dotenvy`, `tracing-subscriber`) from polluting library builds
+2. **`[[bin]]` with `required-features`:** Standard Cargo pattern - binary needs explicit feature flag to build
+3. **Version sync fix:** Updated workspace to `0.1.3-alpha` in `rust/Cargo.toml` workspace dependencies
+
+**Dependencies added:**
+- `rusqlite = { version = "0.38", optional = true }`
+- `dotenvy = { version = "0.15", optional = true }`
+- `tracing-subscriber = { version = "0.3", features = ["env-filter"], optional = true }`
+
+**Build commands:**
+- Build binary: `cargo build --bin azure_vfs_repro --features bin-deps`
+- Run binary: `cargo run --bin azure_vfs_repro --features bin-deps -- <mode> [args]`
+- Build library (clean): `cargo build -p sqlite-objs`
+
+**Testing verification:**
+- All 27 workspace tests pass (16 unit + 8 ignored smoke + 5 threading + 4 doctests)
+- Binary compiles and shows usage when called without args
+- Library builds without binary dependencies
+
+**Pattern for future binaries:** Use optional deps + feature flag + required-features to keep utilities separate from core library.

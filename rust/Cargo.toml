@@ -3,7 +3,7 @@ members = ["sqlite-objs-sys", "sqlite-objs"]
 resolver = "2"
 
 [workspace.package]
-version = "0.1.2-alpha"
+version = "0.1.3-alpha"
 authors = ["sqlite-objs Contributors"]
 edition = "2021"
 license = "MIT"
@@ -12,4 +12,4 @@ rust-version = "1.70"
 
 [workspace.dependencies]
 libc = "0.2"
-sqlite-objs-sys = { path = "sqlite-objs-sys", version = "0.1.2-alpha" }
+sqlite-objs-sys = { path = "sqlite-objs-sys", version = "0.1.3-alpha" }

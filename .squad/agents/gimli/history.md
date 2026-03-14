@@ -202,6 +202,39 @@ let uri = UriBuilder::new("mydb.db", "myaccount", "databases")
 
 **Impact:** Eliminates common URI encoding errors for Rust users. Builder API is more ergonomic than manual string concatenation. Zero external dependencies added.
 
+### UriBuilder: cache_dir Parameter (2025-07)
+
+**Added:** `cache_dir` field and builder method to `UriBuilder` in `rust/sqlite-objs/src/lib.rs`.
+
+**Context:** The C VFS is getting a `cache_dir` URI parameter to control where local cache files are stored (defaults to `/tmp`). The Rust builder needed to match.
+
+**Changes:**
+- Added `cache_dir: Option<String>` field to `UriBuilder` struct
+- Added `.cache_dir(dir)` builder method with doc comment
+- Appends `&cache_dir={encoded}` to URI in `build()` if set
+- Updated module-level doc example to show `cache_dir` usage
+- 2 new tests: `test_uri_builder_with_cache_dir`, `test_uri_builder_cache_dir_without_auth`
+
+**Verification:** All 13 unit tests + 4 doc-tests pass. No new dependencies.
+
+### UriBuilder: cache_reuse Parameter (2025-07)
+
+**Added:** `cache_reuse` field and builder method to `UriBuilder` in `rust/sqlite-objs/src/lib.rs`.
+
+**Context:** The C VFS is getting ETag-based cache reuse. When enabled via `cache_reuse=true` in
+the URI, the VFS keeps cache files after close and reuses them on reconnect if the blob's ETag
+matches. The Rust builder needed to expose this parameter.
+
+**Changes:**
+- Added `cache_reuse: bool` field to `UriBuilder` struct (default `false`)
+- Added `.cache_reuse(enabled)` builder method with doc comment explaining ETag behavior
+- `build()` appends `&cache_reuse=1` only when `cache_reuse` is `true`; omitted when `false`
+  (C VFS defaults to off, so no need to send `cache_reuse=0`)
+- Updated module-level doc example to show `cache_reuse(true)` in the builder chain
+- 3 new tests: `test_uri_builder_cache_reuse_enabled`, `test_uri_builder_cache_reuse_default_omitted`,
+  `test_uri_builder_cache_reuse_with_cache_dir`
+
+**Verification:** All 16 unit tests + 4 doc-tests pass. No new dependencies.
 
 
 ### Multi-Threading Test Suite (2025-07)
