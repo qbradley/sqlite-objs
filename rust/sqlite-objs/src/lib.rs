@@ -43,6 +43,7 @@
 //! // Build URI with proper URL encoding
 //! let uri = UriBuilder::new("mydb.db", "myaccount", "databases")
 //!     .sas_token("sv=2024-08-04&ss=b&srt=sco&sp=rwdlacyx&se=2026-01-01T00:00:00Z&sig=abc123")
+//!     .cache_dir("/var/cache/myapp")
 //!     .build();
 //!
 //! // Open database with Azure credentials in URI
@@ -291,6 +292,7 @@ pub struct UriBuilder {
     sas_token: Option<String>,
     account_key: Option<String>,
     endpoint: Option<String>,
+    cache_dir: Option<String>,
 }
 
 impl UriBuilder {
@@ -309,6 +311,7 @@ impl UriBuilder {
             sas_token: None,
             account_key: None,
             endpoint: None,
+            cache_dir: None,
         }
     }
 
@@ -331,6 +334,14 @@ impl UriBuilder {
     /// Set a custom endpoint (e.g., for Azurite: "http://127.0.0.1:10000").
     pub fn endpoint(mut self, endpoint: &str) -> Self {
         self.endpoint = Some(endpoint.to_string());
+        self
+    }
+
+    /// Set the local cache directory for downloaded database files.
+    ///
+    /// If not set, defaults to `/tmp`. The directory will be created if it doesn't exist.
+    pub fn cache_dir(mut self, dir: &str) -> Self {
+        self.cache_dir = Some(dir.to_string());
         self
     }
 
@@ -357,6 +368,11 @@ impl UriBuilder {
         if let Some(endpoint) = &self.endpoint {
             uri.push_str("&azure_endpoint=");
             uri.push_str(&percent_encode(endpoint));
+        }
+
+        if let Some(cache_dir) = &self.cache_dir {
+            uri.push_str("&cache_dir=");
+            uri.push_str(&percent_encode(cache_dir));
         }
 
         uri
@@ -476,6 +492,33 @@ mod tests {
         // SAS token should be present, account key should not
         assert!(uri.contains("azure_sas="));
         assert!(!uri.contains("azure_key="));
+    }
+
+    #[test]
+    fn test_uri_builder_with_cache_dir() {
+        let uri = UriBuilder::new("mydb.db", "myaccount", "mycontainer")
+            .sas_token("token")
+            .cache_dir("/var/cache/myapp")
+            .build();
+
+        assert!(uri.contains("cache_dir=%2Fvar%2Fcache%2Fmyapp"));
+
+        // Verify it appears after the other parameters
+        let cache_pos = uri.find("cache_dir=").unwrap();
+        let sas_pos = uri.find("azure_sas=").unwrap();
+        assert!(cache_pos > sas_pos);
+    }
+
+    #[test]
+    fn test_uri_builder_cache_dir_without_auth() {
+        let uri = UriBuilder::new("test.db", "account", "container")
+            .cache_dir("/tmp/test")
+            .build();
+
+        assert_eq!(
+            uri,
+            "file:test.db?azure_account=account&azure_container=container&cache_dir=%2Ftmp%2Ftest"
+        );
     }
 
     #[test]

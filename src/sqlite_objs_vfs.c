@@ -26,6 +26,8 @@
 #include <sys/time.h>
 #include <assert.h>
 #include <unistd.h>
+#include <errno.h>
+#include <sys/stat.h>
 
 /* ===================================================================
 ** Debug timing — opt-in via SQLITE_OBJS_DEBUG_TIMING=1 environment variable
@@ -1454,6 +1456,28 @@ static int sqliteObjsShmUnmap(sqlite3_file *pFile, int deleteFlag) {
 ** =================================================================== */
 
 /*
+** Build a heap-allocated mkstemp template for the cache file.
+** If cacheDir is non-NULL and non-empty, the template is placed under
+** that directory (which is created with mkdir if it doesn't exist).
+** Otherwise falls back to /tmp.  Returns NULL on allocation failure.
+** The caller must free() the returned string.
+*/
+static char *buildCacheTemplate(const char *cacheDir) {
+    if (cacheDir && cacheDir[0]) {
+        mkdir(cacheDir, 0700);  /* ignore EEXIST */
+        size_t dirLen = strlen(cacheDir);
+        /* Strip trailing slash */
+        if (dirLen > 0 && cacheDir[dirLen - 1] == '/') dirLen--;
+        char *tmpl = (char *)malloc(dirLen + sizeof("/sqlite-objs-XXXXXX"));
+        if (!tmpl) return NULL;
+        memcpy(tmpl, cacheDir, dirLen);
+        memcpy(tmpl + dirLen, "/sqlite-objs-XXXXXX", sizeof("/sqlite-objs-XXXXXX"));
+        return tmpl;
+    }
+    return strdup("/tmp/sqlite-objs-XXXXXX");
+}
+
+/*
 ** Parse Azure URI parameters from a sqlite3_filename.
 ** Returns 1 if azure_account is present (config populated), 0 otherwise.
 */
@@ -1543,6 +1567,9 @@ static int sqliteObjsOpen(sqlite3_vfs *pVfs, sqlite3_filename zName,
     p->cacheFd = -1;  /* Initialize cache fd */
     p->zCachePath = NULL;
 
+    /* Read optional cache_dir URI parameter (only valid for MAIN_DB) */
+    const char *cacheDir = sqlite3_uri_parameter(zName, "cache_dir");
+
     if (isMainDb) {
         /* MAIN_DB → Azure page blob */
         int blobExists = 0;
@@ -1577,22 +1604,20 @@ static int sqliteObjsOpen(sqlite3_vfs *pVfs, sqlite3_filename zName,
             }
 
             /* Create cache file */
-            char cachePathTemplate[] = "/tmp/sqlite-objs-XXXXXX";
-            p->cacheFd = mkstemp(cachePathTemplate);
-            if (p->cacheFd < 0) {
-                sqlite3_free(p->zBlobName);
-                p->zBlobName = NULL;
-                return SQLITE_CANTOPEN;
-            }
-            p->zCachePath = strdup(cachePathTemplate);
-            if (!p->zCachePath) {
-                close(p->cacheFd);
-                unlink(cachePathTemplate);
-                p->cacheFd = -1;
+            char *cacheTemplate = buildCacheTemplate(cacheDir);
+            if (!cacheTemplate) {
                 sqlite3_free(p->zBlobName);
                 p->zBlobName = NULL;
                 return SQLITE_NOMEM;
             }
+            p->cacheFd = mkstemp(cacheTemplate);
+            if (p->cacheFd < 0) {
+                free(cacheTemplate);
+                sqlite3_free(p->zBlobName);
+                p->zBlobName = NULL;
+                return SQLITE_CANTOPEN;
+            }
+            p->zCachePath = cacheTemplate;  /* mkstemp modified it in place */
 
             if (blobSize > 0) {
                 /* Download to temporary buffer, then write to cache file */
@@ -1720,22 +1745,20 @@ static int sqliteObjsOpen(sqlite3_vfs *pVfs, sqlite3_filename zName,
             }
             
             /* Create cache file */
-            char cachePathTemplate[] = "/tmp/sqlite-objs-XXXXXX";
-            p->cacheFd = mkstemp(cachePathTemplate);
-            if (p->cacheFd < 0) {
-                sqlite3_free(p->zBlobName);
-                p->zBlobName = NULL;
-                return SQLITE_CANTOPEN;
-            }
-            p->zCachePath = strdup(cachePathTemplate);
-            if (!p->zCachePath) {
-                close(p->cacheFd);
-                unlink(cachePathTemplate);
-                p->cacheFd = -1;
+            char *cacheTemplate2 = buildCacheTemplate(cacheDir);
+            if (!cacheTemplate2) {
                 sqlite3_free(p->zBlobName);
                 p->zBlobName = NULL;
                 return SQLITE_NOMEM;
             }
+            p->cacheFd = mkstemp(cacheTemplate2);
+            if (p->cacheFd < 0) {
+                free(cacheTemplate2);
+                sqlite3_free(p->zBlobName);
+                p->zBlobName = NULL;
+                return SQLITE_CANTOPEN;
+            }
+            p->zCachePath = cacheTemplate2;  /* mkstemp modified it in place */
             
             p->nData = 0;
         } else if (!blobExists) {
