@@ -374,3 +374,50 @@ Implemented two optimizations from the performance diagnosis (aragorn-perf-diagn
 **Safety guard in xOpen:** After the URI-parse / global-fallback logic, if `p->ops` is still NULL (no URI params + no global client), we now return SQLITE_CANTOPEN immediately. Previously this would proceed with NULL ops and crash on first blob_exists call.
 
 **Result:** All 234 unit tests pass. Shell compiles and runs with `--uri`. TPC-C compiles with URI options.
+
+## 2025-01-12: Replaced in-memory buffer with disk-backed cache
+
+### Context
+User requested replacing the in-memory `aData` buffer with a file-backed cache to reduce memory usage from database-size to ~8MB (SQLite's page cache). This simplifies the architecture compared to the complex mmap/demand-paging approach we rolled back from.
+
+### Changes
+**Core struct modifications (sqlite_objs_vfs.c):**
+- Removed `unsigned char *aData` and `sqlite3_int64 nAlloc` from `sqliteObjsFile`
+- Added `int cacheFd` (file descriptor, -1 when not open)
+- Added `char *zCachePath` (path to cache file for cleanup)
+- Journal/WAL stay in-memory (small, transient)
+
+**Key functions updated:**
+- `xOpen`: Creates cache file via `mkstemp("/tmp/sqlite-objs-XXXXXX")`, downloads blob to temp buffer, writes to cache file
+- `xRead`: Uses `pread(cacheFd, ...)` instead of `memcpy(aData + offset, ...)`  
+- `xWrite`: Uses `pwrite(cacheFd, ...)` instead of `memcpy(aData + offset, ...)`, extends file with `ftruncate()` if needed
+- `xSync`: Reads dirty ranges from cache file via `pread()`, allocates temp buffer for upload
+- `xClose`: Calls `close(cacheFd); unlink(zCachePath)`
+- `xTruncate`: Adds `ftruncate(cacheFd, size)` for cache file
+- `coalesceDirtyRanges`: No longer sets `range.data` (caller fills from cache file)
+
+**Design notes:**
+- Parallel chunked download preserved: downloads to malloc'd buffer, then writes to cache file in one pass
+- Dirty bitmap unchanged: `aDirty`/`nDirtyPages` track which pages need Azure upload
+- `nData` still tracks logical file size
+- `pread`/`pwrite` are thread-safe (no shared file offset concerns)
+- Added `fsync()` after download write to ensure data persistence
+
+### Test results
+- 237/242 tests passing
+- 5 failures all related to close/reopen scenarios in WAL and coalesce tests
+- Failures show `SQLITE_CORRUPT` when reopening database, suggesting edge case in download-to-cache-file logic
+- Core functionality works: basic operations, sync, WAL mode, URI config all pass
+
+### Known issues
+The 5 failing tests (`sync_coalesced_sequential`, `sync_batch_all_succeed`, `wal_insert_select_roundtrip`, `wal_recovery_downloads_existing_wal`) all follow this pattern:
+1. Open database, write data, sync
+2. Close database  
+3. Reopen database
+4. Try to read data → fails with SQLITE_CORRUPT
+
+Likely cause: Edge case in blob download or cache file initialization during reopen. The data is being written to Azure correctly (sync works), but the re-download path may have an issue with buffer sizing, fsync timing, or header detection.
+
+### Memory impact
+Expected reduction: database file size (can be GBs) → ~8MB (SQLite page cache). Cache file on disk instead.
+

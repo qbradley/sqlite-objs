@@ -161,3 +161,45 @@ and simpler for a single define.
 - Docker not available on the current dev machine — files verified via rustfmt + bash syntax check.
   Actual container tests need Docker Desktop or a CI runner.
 
+### URI Builder Helper (2025-03-13)
+
+**Added:** `UriBuilder` struct to `rust/sqlite-objs/src/lib.rs` for constructing SQLite URIs with proper URL encoding.
+
+**Problem:** Users manually building URIs like `file:db?azure_account=x&azure_container=y&azure_sas=token` hit encoding issues. SAS tokens contain `&`, `=`, `%` characters that break URI query strings if not percent-encoded.
+
+**Solution:**
+- Builder pattern: `UriBuilder::new(db, account, container).sas_token(token).build()`
+- Inline percent-encoding implementation (no external deps) — encodes all non-unreserved characters per RFC 3986
+- Prefers SAS token over account key when both set (auth precedence logic)
+- Optional endpoint parameter for Azurite/custom endpoints
+- Returns a `String` (no rusqlite dependency in main crate)
+
+**API Design:**
+```rust
+let uri = UriBuilder::new("mydb.db", "myaccount", "databases")
+    .sas_token("sv=2024-08-04&ss=b&...&sig=abc")
+    .endpoint("http://127.0.0.1:10000/devstoreaccount1")  // optional
+    .build();
+// → "file:mydb.db?azure_account=myaccount&azure_container=databases&azure_sas=sv%3D2024-08-04%26ss%3Db%26...%26sig%3Dabc"
+```
+
+**Key decisions:**
+1. No `percent-encoding` crate dependency — keep it lightweight with inline implementation
+2. Encode all non-unreserved chars (`A-Za-z0-9-_.~`) to avoid edge cases with special chars in Azure tokens
+3. Builder pattern for clarity and optional params (sas_token, account_key, endpoint)
+4. Mutual exclusion: sas_token takes precedence over account_key if both set
+
+**Testing:**
+- 8 new unit tests covering basic, SAS, account_key, endpoint, precedence, encoding edge cases
+- Updated example (basic.rs) to demonstrate UriBuilder usage with real-looking URIs
+- All 11 unit tests + 4 doc-tests pass
+- Clippy clean (fixed trim().split_whitespace() warning in build.rs)
+
+**Files:**
+- `rust/sqlite-objs/src/lib.rs` — UriBuilder struct, percent_encode() function, 8 tests
+- `rust/sqlite-objs/examples/basic.rs` — demo with Azurite endpoint example
+- `rust/sqlite-objs-sys/build.rs` — clippy fix (remove redundant trim())
+
+**Impact:** Eliminates common URI encoding errors for Rust users. Builder API is more ergonomic than manual string concatenation. Zero external dependencies added.
+
+
