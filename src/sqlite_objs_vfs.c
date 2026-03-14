@@ -28,7 +28,9 @@
 #include <unistd.h>
 #include <errno.h>
 #include <sys/stat.h>
+#include <pthread.h>
 #include <fcntl.h>
+#include <pthread.h>
 
 /* ===================================================================
 ** Debug timing — opt-in via SQLITE_OBJS_DEBUG_TIMING=1 environment variable
@@ -193,6 +195,7 @@ struct sqliteObjsVfsData {
     ** This eliminates ~4 HEAD requests per transaction (~110ms saved). */
     sqliteObjsJournalCacheEntry journalCache[SQLITE_OBJS_MAX_JOURNAL_CACHE];
     int nJournalCache;
+    pthread_mutex_t journalCacheMutex;  /* Protects journalCache array */
 };
 
 /* ---------- io_methods v2 ---------- */
@@ -1095,9 +1098,11 @@ static int sqliteObjsSync(sqlite3_file *pFile, int flags) {
 
             /* R1: Journal blob now exists in Azure */
             {
+                pthread_mutex_lock(&p->pVfsData->journalCacheMutex);
                 sqliteObjsJournalCacheEntry *jce =
                     journalCacheGetOrCreate(p->pVfsData, p->zBlobName);
                 if (jce) jce->state = 1;
+                pthread_mutex_unlock(&p->pVfsData->journalCacheMutex);
             }
         }
         return SQLITE_OK;
@@ -1988,20 +1993,25 @@ static int sqliteObjsOpen(sqlite3_vfs *pVfs, sqlite3_filename zName,
         p->aJrnlData = NULL;
 
         /* R1: Track journal blob name and seed the cache from blob_exists check */
+        pthread_mutex_lock(&pVfsData->journalCacheMutex);
         sqliteObjsJournalCacheEntry *jce =
             journalCacheGetOrCreate(pVfsData, zName);
+        int cached_state = jce ? jce->state : -1;
+        pthread_mutex_unlock(&pVfsData->journalCacheMutex);
 
         /* R1: If cache says journal doesn't exist, skip the HEAD request.
         ** Only do a real HEAD when cache is unknown (-1) or says it exists (1).
         ** Since we are the single writer, cache=0 is authoritative. */
         int exists = 0;
-        if (jce && jce->state == 0) {
+        if (cached_state == 0) {
             exists = 0;  /* We deleted it — no HEAD needed */
         } else if (p->ops && p->ops->blob_exists) {
             azure_error_t aerr;
             azure_error_init(&aerr);
             p->ops->blob_exists(p->ops_ctx, zName, &exists, &aerr);
+            pthread_mutex_lock(&pVfsData->journalCacheMutex);
             if (jce) jce->state = exists ? 1 : 0;
+            pthread_mutex_unlock(&pVfsData->journalCacheMutex);
         }
 
         /* Check if journal blob already exists (crash recovery) */
@@ -2147,8 +2157,10 @@ static int sqliteObjsDelete(sqlite3_vfs *pVfs, const char *zName, int syncDir) {
         azure_err_t arc = ops->blob_delete(ops_ctx, zName, &aerr);
         if (arc == AZURE_ERR_NOT_FOUND) {
             /* R1: We know it doesn't exist now */
+            pthread_mutex_lock(&pVfsData->journalCacheMutex);
             sqliteObjsJournalCacheEntry *jce = journalCacheFind(pVfsData, zName);
             if (jce) jce->state = 0;
+            pthread_mutex_unlock(&pVfsData->journalCacheMutex);
             return SQLITE_OK;  /* Already gone — not an error */
         }
         if (arc != AZURE_OK) {
@@ -2157,8 +2169,10 @@ static int sqliteObjsDelete(sqlite3_vfs *pVfs, const char *zName, int syncDir) {
 
         /* R1: After successful delete, update journal cache */
         {
+            pthread_mutex_lock(&pVfsData->journalCacheMutex);
             sqliteObjsJournalCacheEntry *jce = journalCacheFind(pVfsData, zName);
             if (jce) jce->state = 0;
+            pthread_mutex_unlock(&pVfsData->journalCacheMutex);
         }
         return SQLITE_OK;
     }
@@ -2189,19 +2203,23 @@ static int sqliteObjsAccess(sqlite3_vfs *pVfs, const char *zName,
     void *ops_ctx;
     if (resolveOps(pVfsData, zName, &ops, &ops_ctx) && ops->blob_exists) {
         /* R1: Use cached journal existence when available */
+        pthread_mutex_lock(&pVfsData->journalCacheMutex);
         sqliteObjsJournalCacheEntry *jce = journalCacheFind(pVfsData, zName);
         if (jce && jce->state >= 0) {
+            int cached_result = jce->state;
+            pthread_mutex_unlock(&pVfsData->journalCacheMutex);
             switch (flags) {
                 case SQLITE_ACCESS_EXISTS:
                 case SQLITE_ACCESS_READWRITE:
                 case SQLITE_ACCESS_READ:
-                    *pResOut = jce->state;
+                    *pResOut = cached_result;
                     break;
                 default:
                     *pResOut = 0;
             }
             return SQLITE_OK;
         }
+        pthread_mutex_unlock(&pVfsData->journalCacheMutex);
 
         int exists = 0;
         azure_error_t aerr;
@@ -2214,11 +2232,13 @@ static int sqliteObjsAccess(sqlite3_vfs *pVfs, const char *zName,
 
         /* R1: Seed journal cache if this is a journal blob we haven't tracked yet.
         ** Detects journal names by "-journal" suffix (per D7). */
-        if (zName && !jce) {
+        if (zName) {
             size_t nlen = strlen(zName);
             if (nlen >= 8 && strcmp(zName + nlen - 8, "-journal") == 0) {
+                pthread_mutex_lock(&pVfsData->journalCacheMutex);
                 jce = journalCacheGetOrCreate(pVfsData, zName);
                 if (jce) jce->state = exists ? 1 : 0;
+                pthread_mutex_unlock(&pVfsData->journalCacheMutex);
             }
         }
 
@@ -2376,6 +2396,11 @@ int sqlite_objs_vfs_register_with_config(const sqlite_objs_config_t *config,
     memset(&g_vfsData, 0, sizeof(g_vfsData));
     g_vfsData.pDefaultVfs = pDefault;
 
+    /* Initialize journal cache mutex */
+    if (pthread_mutex_init(&g_vfsData.journalCacheMutex, NULL) != 0) {
+        return SQLITE_ERROR;
+    }
+
     if (config->ops) {
         /* Use caller-provided ops (test mode) */
         g_vfsData.ops = (azure_ops_t *)config->ops;
@@ -2462,6 +2487,11 @@ int sqlite_objs_vfs_register_uri(int makeDefault) {
     g_vfsData.ops = NULL;
     g_vfsData.ops_ctx = NULL;
     g_vfsData.client = NULL;
+
+    /* Initialize journal cache mutex */
+    if (pthread_mutex_init(&g_vfsData.journalCacheMutex, NULL) != 0) {
+        return SQLITE_ERROR;
+    }
 
     /* szOsFile must accommodate both our struct and the default VFS's struct */
     int ourSize = (int)sizeof(sqliteObjsFile);

@@ -22,7 +22,18 @@
 #include <sys/time.h>
 #include <limits.h>
 #include <stdint.h>
+#include <pthread.h>
 #include <curl/curl.h>
+
+/* ================================================================
+ * CURL global initialization — thread-safe via pthread_once
+ * ================================================================ */
+
+static pthread_once_t g_curl_init_once = PTHREAD_ONCE_INIT;
+
+static void curl_global_init_once(void) {
+    curl_global_init(CURL_GLOBAL_DEFAULT);
+}
 
 /* ================================================================
  * Secure memory zeroing — guaranteed not to be optimized away (S-C4)
@@ -297,6 +308,9 @@ static azure_err_t execute_single(
     azure_response_headers_t *resp_headers,
     azure_error_t *err)
 {
+    /* Lock mutex to protect curl_handle from concurrent access */
+    pthread_mutex_lock(&client->mutex);
+
     CURL *curl = (CURL *)client->curl_handle;
     CURLcode res;
 
@@ -376,6 +390,7 @@ static azure_err_t execute_single(
             auth_header, sizeof(auth_header));
         if (rc != AZURE_OK) {
             err->code = rc;
+            pthread_mutex_unlock(&client->mutex);
             return rc;
         }
     }
@@ -526,6 +541,7 @@ static azure_err_t execute_single(
         if (!response_body) azure_buffer_free(&local_buf);
 
         /* Timeouts are transient */
+        pthread_mutex_unlock(&client->mutex);
         if (res == CURLE_OPERATION_TIMEDOUT || res == CURLE_COULDNT_CONNECT)
             return AZURE_ERR_TRANSIENT;
         return AZURE_ERR_CURL;
@@ -551,10 +567,12 @@ static azure_err_t execute_single(
 
         err->code = azure_classify_http_error(http_status, err->error_code);
         if (!response_body) azure_buffer_free(&local_buf);
+        pthread_mutex_unlock(&client->mutex);
         return err->code;
     }
 
     if (!response_body) azure_buffer_free(&local_buf);
+    pthread_mutex_unlock(&client->mutex);
     return AZURE_OK;
 
 /* S-H5: cleanup target for SLIST_APPEND allocation failures */
@@ -563,6 +581,7 @@ cleanup:
     err->code = AZURE_ERR_NOMEM;
     snprintf(err->error_message, sizeof(err->error_message),
              "curl_slist_append allocation failed");
+    pthread_mutex_unlock(&client->mutex);
     return AZURE_ERR_NOMEM;
 }
 
@@ -1338,6 +1357,9 @@ static azure_err_t az_page_blob_write_batch(
 
     azure_client_t *c = (azure_client_t *)ctx;
 
+    /* Lock mutex for the entire batch operation (protects multi_handle) */
+    pthread_mutex_lock(&c->mutex);
+
     /* Build URL once — same for all ranges and retry attempts */
     char url[4096];
     build_blob_url(c, name, url, sizeof(url));
@@ -1353,6 +1375,7 @@ static azure_err_t az_page_blob_write_batch(
     /* Per-range completion tracking across retry attempts */
     int *done = calloc((size_t)nRanges, sizeof(int));
     if (!done) {
+        pthread_mutex_unlock(&c->mutex);
         err->code = AZURE_ERR_NOMEM;
         snprintf(err->error_message, sizeof(err->error_message),
                  "batch write: allocation failed");
@@ -1365,6 +1388,7 @@ static azure_err_t az_page_blob_write_batch(
     CURLM *multi = ensure_multi_handle(c);
     if (!multi) {
         free(done);
+        pthread_mutex_unlock(&c->mutex);
         err->code = AZURE_ERR_NETWORK;
         snprintf(err->error_message, sizeof(err->error_message),
                  "curl_multi_init() failed");
@@ -1434,6 +1458,7 @@ static azure_err_t az_page_blob_write_batch(
             }
             free(reqs);
             free(done);
+            pthread_mutex_unlock(&c->mutex);
             return result;
         }
 
@@ -1540,6 +1565,7 @@ static azure_err_t az_page_blob_write_batch(
 
         if (lease_lost) {
             free(done);
+            pthread_mutex_unlock(&c->mutex);
             err->code = AZURE_ERR_LEASE_EXPIRED;
             snprintf(err->error_message, sizeof(err->error_message),
                      "Lease lost during batch write");
@@ -1565,10 +1591,12 @@ static azure_err_t az_page_blob_write_batch(
     free(done);
 
     if (all_ok) {
+        pthread_mutex_unlock(&c->mutex);
         azure_error_init(err);
         return AZURE_OK;
     }
 
+    pthread_mutex_unlock(&c->mutex);
     if (result == AZURE_OK) result = AZURE_ERR_IO;
     err->code = result;
     if (!err->error_message[0])
@@ -1780,6 +1808,9 @@ static azure_err_t az_page_blob_read_multi(
 
     azure_client_t *c = (azure_client_t *)ctx;
 
+    /* Lock mutex for the entire batch operation (protects multi_handle) */
+    pthread_mutex_lock(&c->mutex);
+
     /* Compute chunk layout */
     int nChunks = SQLITE_OBJS_PARALLEL_READ_MAX_STREAMS;
     int64_t chunk_size = (total_size + nChunks - 1) / nChunks;
@@ -1799,6 +1830,7 @@ static azure_err_t az_page_blob_read_multi(
     /* Per-chunk completion tracking */
     int *done = calloc((size_t)nChunks, sizeof(int));
     if (!done) {
+        pthread_mutex_unlock(&c->mutex);
         err->code = AZURE_ERR_NOMEM;
         return AZURE_ERR_NOMEM;
     }
@@ -1806,6 +1838,7 @@ static azure_err_t az_page_blob_read_multi(
     CURLM *multi = ensure_multi_handle(c);
     if (!multi) {
         free(done);
+        pthread_mutex_unlock(&c->mutex);
         err->code = AZURE_ERR_NETWORK;
         snprintf(err->error_message, sizeof(err->error_message),
                  "curl_multi_init() failed");
@@ -1842,6 +1875,7 @@ static azure_err_t az_page_blob_read_multi(
                                         sizeof(read_batch_req_t));
         if (!reqs) {
             free(done);
+            pthread_mutex_unlock(&c->mutex);
             err->code = AZURE_ERR_NOMEM;
             return AZURE_ERR_NOMEM;
         }
@@ -1882,6 +1916,7 @@ static azure_err_t az_page_blob_read_multi(
             }
             free(reqs);
             free(done);
+            pthread_mutex_unlock(&c->mutex);
             return result;
         }
 
@@ -1989,10 +2024,12 @@ static azure_err_t az_page_blob_read_multi(
     free(done);
 
     if (all_ok) {
+        pthread_mutex_unlock(&c->mutex);
         azure_error_init(err);
         return AZURE_OK;
     }
 
+    pthread_mutex_unlock(&c->mutex);
     if (result == AZURE_OK) result = AZURE_ERR_IO;
     err->code = result;
     if (!err->error_message[0])
@@ -2248,6 +2285,9 @@ azure_err_t azure_client_create(const azure_client_config_t *config,
         c->use_sas = 0;
     }
 
+    /* Thread-safe curl global initialization */
+    pthread_once(&g_curl_init_once, curl_global_init_once);
+
     /* Initialize libcurl handle (reused across requests for keep-alive) */
     CURL *curl = curl_easy_init();
     if (!curl) {
@@ -2262,6 +2302,20 @@ azure_err_t azure_client_create(const azure_client_config_t *config,
         return AZURE_ERR_NETWORK;
     }
     c->curl_handle = curl;
+
+    /* Initialize mutex for protecting curl operations */
+    if (pthread_mutex_init(&c->mutex, NULL) != 0) {
+        if (err) {
+            err->code = AZURE_ERR_NETWORK;
+            snprintf(err->error_message, sizeof(err->error_message),
+                     "pthread_mutex_init() failed");
+        }
+        curl_easy_cleanup(curl);
+        secure_zero(c->key_raw, sizeof(c->key_raw));
+        secure_zero(c->key_b64, sizeof(c->key_b64));
+        free(c);
+        return AZURE_ERR_NETWORK;
+    }
 
     if (client_out) *client_out = c;
     return AZURE_OK;
@@ -2279,6 +2333,9 @@ void azure_client_destroy(azure_client_t *client)
         curl_multi_cleanup((CURLM *)client->multi_handle);
         client->multi_handle = NULL;
     }
+
+    /* Destroy mutex */
+    pthread_mutex_destroy(&client->mutex);
 
     if (client->curl_handle) {
         curl_easy_cleanup((CURL *)client->curl_handle);
@@ -2327,6 +2384,9 @@ azure_err_t azure_container_create(azure_client_t *client,
     }
 
     azure_error_init(err);
+
+    /* Lock mutex to protect curl_handle */
+    pthread_mutex_lock(&client->mutex);
 
     CURL *curl = (CURL *)client->curl_handle;
     CURLcode res;
@@ -2385,6 +2445,7 @@ azure_err_t azure_container_create(azure_client_t *client,
             x_ms_headers,
             auth_header, sizeof(auth_header));
         if (rc != AZURE_OK) {
+            pthread_mutex_unlock(&client->mutex);
             err->code = rc;
             snprintf(err->error_message, sizeof(err->error_message),
                      "Failed to sign container create request");
@@ -2438,6 +2499,7 @@ azure_err_t azure_container_create(azure_client_t *client,
     headers = NULL;
 
     if (res != CURLE_OK) {
+        pthread_mutex_unlock(&client->mutex);
         err->code = AZURE_ERR_NETWORK;
         snprintf(err->error_message, sizeof(err->error_message),
                  "curl_easy_perform() failed: %s", curl_easy_strerror(res));
@@ -2451,6 +2513,7 @@ azure_err_t azure_container_create(azure_client_t *client,
 
     /* 201 Created or 409 ContainerAlreadyExists are both success */
     if (http_status == 201 || http_status == 409) {
+        pthread_mutex_unlock(&client->mutex);
         azure_buffer_free(&response_body);
         return AZURE_OK;
     }
@@ -2472,11 +2535,13 @@ azure_err_t azure_container_create(azure_client_t *client,
                  "Container create failed with HTTP %ld", http_status);
     }
 
+    pthread_mutex_unlock(&client->mutex);
     return err->code;
 
 /* S-H5: cleanup for SLIST_APPEND failures in azure_container_create */
 cleanup:
     if (headers) curl_slist_free_all(headers);
+    pthread_mutex_unlock(&client->mutex);
     err->code = AZURE_ERR_NOMEM;
     snprintf(err->error_message, sizeof(err->error_message),
              "curl_slist_append allocation failed");

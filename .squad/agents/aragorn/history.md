@@ -466,3 +466,40 @@ file:mydb.db?cache_dir=/var/cache/myapp
 ### Test results
 - Build: clean, no warnings
 - All 242 unit tests pass, zero regressions
+
+### Thread-Safety Fix — Shared CURL Handle (2026-01-10)
+
+**Root cause:** `azure_client_t` had a single `CURL*` handle reused for all requests via `execute_single()`. The global `g_vfsData.client` is shared by ALL connections, making all files share the same `azure_client_t` and its curl handle. Two threads calling `curl_easy_reset()` + `curl_easy_perform()` on the same `CURL*` corrupts internal state, causing crashes with "pointer being freed was not allocated."
+
+**Additional issues discovered:**
+- `curl_global_init()` was never called — auto-init from `curl_easy_init()` is racy
+- `ensure_multi_handle()` had a TOCTOU race checking then setting `multi_handle`
+- `journalCache[]` array shared without locks
+- Global debug counters had data races (benign but UB)
+
+**Fix applied:** Added `pthread_mutex_t` to `azure_client_t` and `sqliteObjsVfsData`.
+
+**Changes:**
+1. **azure_client_impl.h:** Added `pthread_mutex_t mutex` to `struct azure_client`, removed incorrect thread-safety comment about btree mutex.
+2. **azure_client.c:**
+   - Added `pthread_once_t` + `curl_global_init_once()` for safe CURL initialization
+   - `azure_client_create()`: Call `pthread_once(&g_curl_init_once, curl_global_init_once)`, then `pthread_mutex_init(&c->mutex, NULL)`
+   - `azure_client_destroy()`: Call `pthread_mutex_destroy(&c->mutex)` before cleanup
+   - `execute_single()`: Lock `client->mutex` at entry, unlock before ALL return paths (including error paths and cleanup label)
+   - `az_page_blob_write_batch()`: Lock at entry (after early returns), unlock at ALL exit points
+   - `az_page_blob_read_multi()`: Lock at entry, unlock at ALL exit points
+   - `azure_container_create()`: Lock around curl operations, unlock at ALL exit points
+3. **sqlite_objs_vfs.c:**
+   - Added `pthread_mutex_t journalCacheMutex` to `sqliteObjsVfsData`
+   - Added `pthread_mutex_init()` in both `sqlite_objs_vfs_register_with_config()` and `sqlite_objs_vfs_register_uri()`
+   - Wrapped ALL `journalCacheFind()` and `journalCacheGetOrCreate()` calls with lock/unlock pairs
+
+**Lock granularity:**
+- Per-client mutex for curl operations (protects `curl_handle` and `multi_handle`)
+- Per-VFS mutex for `journalCache` array
+- Locks span entire critical sections — no partial unlocks
+
+**Testing:** All 242 pre-existing unit tests still pass. 8 cache tests failing were pre-existing (unrelated to thread safety).
+
+**Design rationale:** This is the minimal correct fix. Per-connection clients can be done later as an optimization. The lock in `execute_single()` must cover everything from `curl_easy_reset()` through `curl_easy_perform()` and the subsequent `curl_easy_getinfo()` calls. For batch operations, the lock spans the entire batch (including retries) to protect the multi handle.
+

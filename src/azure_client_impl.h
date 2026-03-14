@@ -14,6 +14,7 @@
 #define AZURE_CLIENT_IMPL_H
 
 #include "azure_client.h"
+#include <pthread.h>
 #include <time.h>
 
 #ifdef __cplusplus
@@ -60,9 +61,9 @@ struct azure_client {
     void    *curl_handle;        /* CURL* — opaque to avoid curl.h in header */
     void    *multi_handle;       /* CURLM* — persistent multi handle for batch writes.
                                   * Lazily initialized on first write_batch call.
-                                  * Manages connection pool + TLS session cache.
-                                  * Thread-safety: safe because xSync is serialized
-                                  * by SQLite's btree mutex (D17). */
+                                  * Manages connection pool + TLS session cache. */
+    pthread_mutex_t mutex;       /* Protects curl_handle and multi_handle from
+                                  * concurrent use across threads */
 };
 
 /* Captured HTTP response headers from Azure */
