@@ -44,6 +44,7 @@
 //! let uri = UriBuilder::new("mydb.db", "myaccount", "databases")
 //!     .sas_token("sv=2024-08-04&ss=b&srt=sco&sp=rwdlacyx&se=2026-01-01T00:00:00Z&sig=abc123")
 //!     .cache_dir("/var/cache/myapp")
+//!     .cache_reuse(true)
 //!     .build();
 //!
 //! // Open database with Azure credentials in URI
@@ -293,6 +294,7 @@ pub struct UriBuilder {
     account_key: Option<String>,
     endpoint: Option<String>,
     cache_dir: Option<String>,
+    cache_reuse: bool,
 }
 
 impl UriBuilder {
@@ -312,6 +314,7 @@ impl UriBuilder {
             account_key: None,
             endpoint: None,
             cache_dir: None,
+            cache_reuse: false,
         }
     }
 
@@ -345,6 +348,19 @@ impl UriBuilder {
         self
     }
 
+    /// Enable persistent cache reuse across database connections.
+    ///
+    /// When enabled, the local cache file is kept after closing the database.
+    /// On reopen, the VFS checks the blob's ETag — if unchanged, the cached
+    /// file is reused instead of re-downloading (saving ~20s for large databases).
+    ///
+    /// Requires `cache_dir` to be set for predictable cache file locations.
+    /// Default: `false` (cache files are deleted on close).
+    pub fn cache_reuse(mut self, enabled: bool) -> Self {
+        self.cache_reuse = enabled;
+        self
+    }
+
     /// Build the URI string with proper URL encoding.
     ///
     /// Returns a SQLite URI in the format:
@@ -373,6 +389,10 @@ impl UriBuilder {
         if let Some(cache_dir) = &self.cache_dir {
             uri.push_str("&cache_dir=");
             uri.push_str(&percent_encode(cache_dir));
+        }
+
+        if self.cache_reuse {
+            uri.push_str("&cache_reuse=1");
         }
 
         uri
@@ -519,6 +539,42 @@ mod tests {
             uri,
             "file:test.db?azure_account=account&azure_container=container&cache_dir=%2Ftmp%2Ftest"
         );
+    }
+
+    #[test]
+    fn test_uri_builder_cache_reuse_enabled() {
+        let uri = UriBuilder::new("mydb.db", "myaccount", "mycontainer")
+            .sas_token("token")
+            .cache_reuse(true)
+            .build();
+
+        assert!(uri.contains("&cache_reuse=1"));
+    }
+
+    #[test]
+    fn test_uri_builder_cache_reuse_default_omitted() {
+        let uri = UriBuilder::new("mydb.db", "myaccount", "mycontainer")
+            .sas_token("token")
+            .build();
+
+        assert!(!uri.contains("cache_reuse"));
+    }
+
+    #[test]
+    fn test_uri_builder_cache_reuse_with_cache_dir() {
+        let uri = UriBuilder::new("mydb.db", "myaccount", "mycontainer")
+            .sas_token("token")
+            .cache_dir("/var/cache/myapp")
+            .cache_reuse(true)
+            .build();
+
+        assert!(uri.contains("cache_dir=%2Fvar%2Fcache%2Fmyapp"));
+        assert!(uri.contains("&cache_reuse=1"));
+
+        // cache_reuse should appear after cache_dir
+        let dir_pos = uri.find("cache_dir=").unwrap();
+        let reuse_pos = uri.find("cache_reuse=").unwrap();
+        assert!(reuse_pos > dir_pos);
     }
 
     #[test]
