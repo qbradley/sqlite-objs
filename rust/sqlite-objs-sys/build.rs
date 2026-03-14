@@ -69,7 +69,7 @@ fn main() {
         .output()
     {
         let libs = String::from_utf8_lossy(&output.stdout);
-        for flag in libs.trim().split_whitespace() {
+        for flag in libs.split_whitespace() {
             if let Some(path) = flag.strip_prefix("-L") {
                 println!("cargo:rustc-link-search=native={}", path);
             }

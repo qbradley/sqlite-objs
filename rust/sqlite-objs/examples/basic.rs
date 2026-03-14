@@ -1,6 +1,6 @@
 //! Basic example showing how to use sqlite-objs with rusqlite.
 //!
-//! This example demonstrates VFS registration and basic API usage.
+//! This example demonstrates VFS registration and URI builder usage.
 //! The VFS integrates with rusqlite's standard APIs.
 //!
 //! NOTE: This example just demonstrates successful VFS registration.
@@ -15,40 +15,68 @@
 //!
 //! See the README for full usage examples with Azure credentials.
 
-use sqlite_objs::SqliteObjsVfs;
+use sqlite_objs::UriBuilder;
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    println!("=== sqlite-objs Basic Example ===\n");
+fn main() {
+    println!("sqlite-objs VFS Registration Example\n");
 
-    // Demonstrate VFS registration in URI mode
-    println!("Registering sqlite-objs VFS in URI mode...");
-    SqliteObjsVfs::register_uri(false)?;
-    println!("✓ VFS registered successfully\n");
+    // Example 1: Environment variable registration
+    println!("1. Registration from environment variables:");
+    println!("   Set AZURE_STORAGE_ACCOUNT, AZURE_STORAGE_CONTAINER, AZURE_STORAGE_SAS");
+    println!("   SqliteObjsVfs::register(false)?;\n");
 
-    println!("The sqlite-objs VFS is now available for use with rusqlite.");
-    println!("To open a database with Azure Blob Storage:\n");
+    // Example 2: Explicit config registration
+    println!("2. Registration with explicit config:");
+    println!("   let config = SqliteObjsConfig {{");
+    println!("       account: \"myaccount\".to_string(),");
+    println!("       container: \"databases\".to_string(),");
+    println!("       sas_token: Some(\"sv=2024-08-04&...\".to_string()),");
+    println!("       account_key: None,");
+    println!("       endpoint: None,");
+    println!("   }};");
+    println!("   SqliteObjsVfs::register_with_config(&config, false)?;\n");
+
+    // Example 3: URI mode with URI builder
+    println!("3. URI mode with UriBuilder (recommended for per-database credentials):");
+    println!("   SqliteObjsVfs::register_uri(false)?;");
+    println!();
     
-    println!("  use rusqlite::{{Connection, OpenFlags}};");
-    println!("  ");
-    println!("  let conn = Connection::open_with_flags_and_vfs(");
-    println!("      \"file:mydb.db?azure_account=acct&azure_container=cont&azure_sas=token\",");
-    println!("      OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_CREATE | OpenFlags::SQLITE_OPEN_URI,");
-    println!("      \"sqlite-objs\"");
-    println!("  )?;\n");
+    // Demonstrate URI builder
+    let uri = UriBuilder::new("mydb.db", "myaccount", "databases")
+        .sas_token("sv=2024-08-04&ss=b&srt=sco&sp=rwdlacyx&se=2026-01-01T00:00:00Z&sig=abc123")
+        .build();
+    
+    println!("   let uri = UriBuilder::new(\"mydb.db\", \"myaccount\", \"databases\")");
+    println!("       .sas_token(\"sv=2024-08-04&ss=b&srt=sco&sp=rwdlacyx&se=2026-01-01T00:00:00Z&sig=abc123\")");
+    println!("       .build();");
+    println!();
+    println!("   Generated URI (SAS token is URL-encoded):");
+    println!("   {}\n", uri);
 
-    println!("Or use environment variables:");
-    println!("  export AZURE_STORAGE_ACCOUNT=myaccount");
-    println!("  export AZURE_STORAGE_CONTAINER=databases");
-    println!("  export AZURE_STORAGE_SAS='sv=2024-08-04&...'");
-    println!("  ");
-    println!("  SqliteObjsVfs::register(false)?;");
-    println!("  let conn = Connection::open_with_flags_and_vfs(");
-    println!("      \"mydb.db\",");
-    println!("      OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_CREATE,");
-    println!("      \"sqlite-objs\"");
-    println!("  )?;\n");
+    println!("   Connection::open_with_flags_and_vfs(");
+    println!("       &uri,");
+    println!("       SQLITE_OPEN_READ_WRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_URI,");
+    println!("       \"sqlite-objs\"");
+    println!("   )?;\n");
 
-    println!("✓ Example complete");
+    // Example 4: URI mode with endpoint (Azurite)
+    println!("4. URI mode with custom endpoint (e.g., Azurite):");
+    let azurite_uri = UriBuilder::new("testdb.db", "devstoreaccount1", "testcontainer")
+        .sas_token("sv=2024-08-04&st=2025-01-01T00:00:00Z&se=2026-01-01T00:00:00Z&sr=c&sp=rwdlac&sig=test")
+        .endpoint("http://127.0.0.1:10000/devstoreaccount1")
+        .build();
+    
+    println!("   let uri = UriBuilder::new(\"testdb.db\", \"devstoreaccount1\", \"testcontainer\")");
+    println!("       .sas_token(\"sv=2024-08-04&st=2025-01-01T00:00:00Z&se=2026-01-01T00:00:00Z&sr=c&sp=rwdlac&sig=test\")");
+    println!("       .endpoint(\"http://127.0.0.1:10000/devstoreaccount1\")");
+    println!("       .build();");
+    println!();
+    println!("   Generated URI:");
+    println!("   {}\n", azurite_uri);
 
-    Ok(())
+    println!("Why use UriBuilder?");
+    println!("- Automatic URL encoding of SAS tokens (contains &, =, % characters)");
+    println!("- Prevents malformed URIs that would break SQLite connection");
+    println!("- Type-safe, builder pattern for clarity");
+    println!("- No external dependencies (minimal percent-encoding implementation)");
 }

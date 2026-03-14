@@ -34,15 +34,20 @@
 //! ### URI Mode (Per-Database Credentials)
 //!
 //! ```no_run
-//! use sqlite_objs::SqliteObjsVfs;
+//! use sqlite_objs::{SqliteObjsVfs, UriBuilder};
 //! use rusqlite::Connection;
 //!
 //! // Register VFS in URI mode (no global config)
 //! SqliteObjsVfs::register_uri(false)?;
 //!
+//! // Build URI with proper URL encoding
+//! let uri = UriBuilder::new("mydb.db", "myaccount", "databases")
+//!     .sas_token("sv=2024-08-04&ss=b&srt=sco&sp=rwdlacyx&se=2026-01-01T00:00:00Z&sig=abc123")
+//!     .build();
+//!
 //! // Open database with Azure credentials in URI
 //! let conn = Connection::open_with_flags_and_vfs(
-//!     "file:mydb.db?azure_account=myaccount&azure_container=databases&azure_sas=sv=2024...",
+//!     &uri,
 //!     rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_CREATE | rusqlite::OpenFlags::SQLITE_OPEN_URI,
 //!     "sqlite-objs"
 //! )?;
@@ -74,6 +79,7 @@
 //! ```
 
 use std::ffi::CString;
+use std::fmt::Write;
 use std::ptr;
 use thiserror::Error;
 
@@ -255,6 +261,135 @@ impl SqliteObjsVfs {
     }
 }
 
+/// Builder for constructing sqlite-objs URIs with proper URL encoding.
+///
+/// SQLite URIs use query parameters to pass Azure credentials. SAS tokens contain
+/// special characters (`&`, `=`, `%`) that must be percent-encoded to avoid breaking
+/// the URI query string.
+///
+/// # Example
+///
+/// ```
+/// use sqlite_objs::UriBuilder;
+///
+/// let uri = UriBuilder::new("mydb.db", "myaccount", "databases")
+///     .sas_token("sv=2024-08-04&ss=b&srt=sco&sp=rwdlacyx&se=2026-01-01T00:00:00Z&sig=abc123")
+///     .build();
+///
+/// // URI is properly encoded:
+/// // file:mydb.db?azure_account=myaccount&azure_container=databases&azure_sas=sv%3D2024-08-04%26ss%3Db...
+/// ```
+///
+/// # Authentication
+///
+/// Use either `sas_token()` or `account_key()`, not both. If both are set, `sas_token`
+/// takes precedence.
+pub struct UriBuilder {
+    database: String,
+    account: String,
+    container: String,
+    sas_token: Option<String>,
+    account_key: Option<String>,
+    endpoint: Option<String>,
+}
+
+impl UriBuilder {
+    /// Create a new URI builder with required parameters.
+    ///
+    /// # Arguments
+    ///
+    /// * `database` - Database filename (e.g., "mydb.db")
+    /// * `account` - Azure Storage account name
+    /// * `container` - Blob container name
+    pub fn new(database: &str, account: &str, container: &str) -> Self {
+        Self {
+            database: database.to_string(),
+            account: account.to_string(),
+            container: container.to_string(),
+            sas_token: None,
+            account_key: None,
+            endpoint: None,
+        }
+    }
+
+    /// Set the SAS token for authentication (preferred).
+    ///
+    /// The token will be URL-encoded automatically. Do not encode it yourself.
+    pub fn sas_token(mut self, token: &str) -> Self {
+        self.sas_token = Some(token.to_string());
+        self
+    }
+
+    /// Set the account key for Shared Key authentication (fallback).
+    ///
+    /// The key will be URL-encoded automatically.
+    pub fn account_key(mut self, key: &str) -> Self {
+        self.account_key = Some(key.to_string());
+        self
+    }
+
+    /// Set a custom endpoint (e.g., for Azurite: "http://127.0.0.1:10000").
+    pub fn endpoint(mut self, endpoint: &str) -> Self {
+        self.endpoint = Some(endpoint.to_string());
+        self
+    }
+
+    /// Build the URI string with proper URL encoding.
+    ///
+    /// Returns a SQLite URI in the format:
+    /// `file:{database}?azure_account={account}&azure_container={container}&...`
+    pub fn build(self) -> String {
+        let mut uri = format!("file:{}?azure_account={}&azure_container={}", 
+            self.database, 
+            percent_encode(&self.account),
+            percent_encode(&self.container)
+        );
+
+        // Prefer SAS token over account key
+        if let Some(sas) = &self.sas_token {
+            uri.push_str("&azure_sas=");
+            uri.push_str(&percent_encode(sas));
+        } else if let Some(key) = &self.account_key {
+            uri.push_str("&azure_key=");
+            uri.push_str(&percent_encode(key));
+        }
+
+        if let Some(endpoint) = &self.endpoint {
+            uri.push_str("&azure_endpoint=");
+            uri.push_str(&percent_encode(endpoint));
+        }
+
+        uri
+    }
+}
+
+/// Percent-encode a string for use in URI query parameters.
+///
+/// Encodes characters that have special meaning in URIs:
+/// - Reserved: `&`, `=`, `%`, `#`, `?`, `+`, `/`, `:`, `@`
+/// - Space
+///
+/// This is a minimal implementation sufficient for SQLite URI parameters.
+/// Uses uppercase hex digits per RFC 3986.
+fn percent_encode(s: &str) -> String {
+    let mut result = String::with_capacity(s.len() * 2);
+    
+    for byte in s.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                // Unreserved characters (RFC 3986 section 2.3)
+                result.push(byte as char);
+            }
+            _ => {
+                // Encode everything else
+                write!(result, "%{:02X}", byte).unwrap();
+            }
+        }
+    }
+    
+    result
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -292,5 +427,80 @@ mod tests {
 
         let result = SqliteObjsVfs::register_with_config(&config, false);
         assert!(matches!(result, Err(SqliteObjsError::InvalidConfig(_))));
+    }
+
+    #[test]
+    fn test_uri_builder_basic() {
+        let uri = UriBuilder::new("mydb.db", "myaccount", "mycontainer").build();
+        assert_eq!(uri, "file:mydb.db?azure_account=myaccount&azure_container=mycontainer");
+    }
+
+    #[test]
+    fn test_uri_builder_with_sas() {
+        let uri = UriBuilder::new("mydb.db", "myaccount", "mycontainer")
+            .sas_token("sv=2024-08-04&ss=b&srt=sco&sp=rwdlacyx&se=2026-01-01T00:00:00Z&sig=abc123")
+            .build();
+        
+        // Verify SAS token is encoded (&, =, :)
+        assert!(uri.contains("azure_sas=sv%3D2024-08-04%26ss%3Db%26srt%3Dsco%26sp%3Drwdlacyx%26se%3D2026-01-01T00%3A00%3A00Z%26sig%3Dabc123"));
+        assert!(uri.starts_with("file:mydb.db?azure_account=myaccount&azure_container=mycontainer&azure_sas="));
+    }
+
+    #[test]
+    fn test_uri_builder_with_account_key() {
+        let uri = UriBuilder::new("test.db", "account", "container")
+            .account_key("my/secret+key==")
+            .build();
+        
+        // Verify account key is encoded (/, +, =)
+        assert!(uri.contains("azure_key=my%2Fsecret%2Bkey%3D%3D"));
+    }
+
+    #[test]
+    fn test_uri_builder_with_endpoint() {
+        let uri = UriBuilder::new("test.db", "devstoreaccount1", "testcontainer")
+            .endpoint("http://127.0.0.1:10000/devstoreaccount1")
+            .build();
+        
+        // Verify endpoint is encoded (://)
+        assert!(uri.contains("azure_endpoint=http%3A%2F%2F127.0.0.1%3A10000%2Fdevstoreaccount1"));
+    }
+
+    #[test]
+    fn test_uri_builder_sas_precedence() {
+        let uri = UriBuilder::new("test.db", "account", "container")
+            .sas_token("sas_token_value")
+            .account_key("key_value")
+            .build();
+        
+        // SAS token should be present, account key should not
+        assert!(uri.contains("azure_sas="));
+        assert!(!uri.contains("azure_key="));
+    }
+
+    #[test]
+    fn test_percent_encode_special_chars() {
+        // Test all special characters that need encoding
+        assert_eq!(percent_encode("hello&world"), "hello%26world");
+        assert_eq!(percent_encode("key=value"), "key%3Dvalue");
+        assert_eq!(percent_encode("100%"), "100%25");
+        assert_eq!(percent_encode("a#b"), "a%23b");
+        assert_eq!(percent_encode("a?b"), "a%3Fb");
+        assert_eq!(percent_encode("a+b"), "a%2Bb");
+        assert_eq!(percent_encode("a/b"), "a%2Fb");
+        assert_eq!(percent_encode("a:b"), "a%3Ab");
+        assert_eq!(percent_encode("a@b"), "a%40b");
+        assert_eq!(percent_encode("hello world"), "hello%20world");
+    }
+
+    #[test]
+    fn test_percent_encode_unreserved() {
+        // Unreserved characters should not be encoded
+        assert_eq!(percent_encode("azAZ09-_.~"), "azAZ09-_.~");
+    }
+
+    #[test]
+    fn test_percent_encode_empty() {
+        assert_eq!(percent_encode(""), "");
     }
 }
