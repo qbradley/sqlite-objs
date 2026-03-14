@@ -100,6 +100,8 @@ int sqlite_objs_vfs_register_with_ops(azure_ops_t *ops, void *ctx,
 **   azure_sas        — SAS token
 **   azure_key        — Shared Key
 **   azure_endpoint   — Custom endpoint (e.g. for Azurite)
+**   cache_dir        — Directory for local cache files (default: /tmp)
+**   cache_reuse      — If "1", persist cache on close and reuse via ETag (default: off)
 **
 ** If azure_account is missing from the URI, xOpen returns SQLITE_CANTOPEN.
 ** If makeDefault is non-zero, this VFS becomes the default.

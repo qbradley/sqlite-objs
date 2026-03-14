@@ -224,7 +224,7 @@ struct azure_ops {
                                 int break_period_secs, int *remaining_secs,
                                 azure_error_t *err);
 
-    /* ---- Batch Write (Phase 2 — NULL until curl_multi implemented) ---- */
+    /* ---- Batch Write (parallel flush via curl_multi) ---- */
 
     /* Write multiple page ranges in parallel.
     ** NULL = VFS falls back to sequential page_blob_write().
@@ -233,6 +233,18 @@ struct azure_ops {
         void *ctx, const char *name,
         const azure_page_range_t *ranges, int nRanges,
         const char *lease_id, azure_error_t *err);
+
+    /* ---- Parallel Read (chunked download via curl_multi) ---- */
+
+    /* Download a page blob in parallel chunks directly into a
+    ** pre-allocated buffer.  Falls back to single-stream
+    ** page_blob_read() for small blobs.
+    ** NULL = VFS falls back to single-stream page_blob_read().
+    ** dest must have at least total_size bytes allocated. */
+    azure_err_t (*page_blob_read_multi)(
+        void *ctx, const char *name,
+        int64_t total_size, uint8_t *dest,
+        azure_error_t *err);
 
     /* ---- Append Blob Operations (for WAL mode) ---- */
 

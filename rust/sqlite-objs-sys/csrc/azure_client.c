@@ -22,7 +22,18 @@
 #include <sys/time.h>
 #include <limits.h>
 #include <stdint.h>
+#include <pthread.h>
 #include <curl/curl.h>
+
+/* ================================================================
+ * CURL global initialization — thread-safe via pthread_once
+ * ================================================================ */
+
+static pthread_once_t g_curl_init_once = PTHREAD_ONCE_INIT;
+
+static void curl_global_init_once(void) {
+    curl_global_init(CURL_GLOBAL_DEFAULT);
+}
 
 /* ================================================================
  * Secure memory zeroing — guaranteed not to be optimized away (S-C4)
@@ -170,6 +181,7 @@ static size_t curl_header_cb(char *buffer, size_t size, size_t nitems,
     CAPTURE_HEADER("x-ms-lease-status", 17, h->lease_status)
     CAPTURE_HEADER("x-ms-request-id",   15, h->request_id)
     CAPTURE_HEADER("x-ms-error-code",   15, h->error_code)
+    CAPTURE_HEADER("etag",               4, h->etag)
 
     #undef CAPTURE_HEADER
 
@@ -296,6 +308,9 @@ static azure_err_t execute_single(
     azure_response_headers_t *resp_headers,
     azure_error_t *err)
 {
+    /* Lock mutex to protect curl_handle from concurrent access */
+    pthread_mutex_lock(&client->mutex);
+
     CURL *curl = (CURL *)client->curl_handle;
     CURLcode res;
 
@@ -375,6 +390,7 @@ static azure_err_t execute_single(
             auth_header, sizeof(auth_header));
         if (rc != AZURE_OK) {
             err->code = rc;
+            pthread_mutex_unlock(&client->mutex);
             return rc;
         }
     }
@@ -525,6 +541,7 @@ static azure_err_t execute_single(
         if (!response_body) azure_buffer_free(&local_buf);
 
         /* Timeouts are transient */
+        pthread_mutex_unlock(&client->mutex);
         if (res == CURLE_OPERATION_TIMEDOUT || res == CURLE_COULDNT_CONNECT)
             return AZURE_ERR_TRANSIENT;
         return AZURE_ERR_CURL;
@@ -535,6 +552,8 @@ static azure_err_t execute_single(
     curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_status);
     err->http_status = clamp_http_status(http_status);
     strncpy(err->request_id, rh->request_id, sizeof(err->request_id) - 1);
+    strncpy(err->etag, rh->etag, sizeof(err->etag) - 1);
+    err->etag[sizeof(err->etag) - 1] = '\0';
 
     if (http_status >= 400) {
         /* Parse error XML from response body */
@@ -548,10 +567,12 @@ static azure_err_t execute_single(
 
         err->code = azure_classify_http_error(http_status, err->error_code);
         if (!response_body) azure_buffer_free(&local_buf);
+        pthread_mutex_unlock(&client->mutex);
         return err->code;
     }
 
     if (!response_body) azure_buffer_free(&local_buf);
+    pthread_mutex_unlock(&client->mutex);
     return AZURE_OK;
 
 /* S-H5: cleanup target for SLIST_APPEND allocation failures */
@@ -560,6 +581,7 @@ cleanup:
     err->code = AZURE_ERR_NOMEM;
     snprintf(err->error_message, sizeof(err->error_message),
              "curl_slist_append allocation failed");
+    pthread_mutex_unlock(&client->mutex);
     return AZURE_ERR_NOMEM;
 }
 
@@ -1335,6 +1357,9 @@ static azure_err_t az_page_blob_write_batch(
 
     azure_client_t *c = (azure_client_t *)ctx;
 
+    /* Lock mutex for the entire batch operation (protects multi_handle) */
+    pthread_mutex_lock(&c->mutex);
+
     /* Build URL once — same for all ranges and retry attempts */
     char url[4096];
     build_blob_url(c, name, url, sizeof(url));
@@ -1350,6 +1375,7 @@ static azure_err_t az_page_blob_write_batch(
     /* Per-range completion tracking across retry attempts */
     int *done = calloc((size_t)nRanges, sizeof(int));
     if (!done) {
+        pthread_mutex_unlock(&c->mutex);
         err->code = AZURE_ERR_NOMEM;
         snprintf(err->error_message, sizeof(err->error_message),
                  "batch write: allocation failed");
@@ -1362,6 +1388,7 @@ static azure_err_t az_page_blob_write_batch(
     CURLM *multi = ensure_multi_handle(c);
     if (!multi) {
         free(done);
+        pthread_mutex_unlock(&c->mutex);
         err->code = AZURE_ERR_NETWORK;
         snprintf(err->error_message, sizeof(err->error_message),
                  "curl_multi_init() failed");
@@ -1431,6 +1458,7 @@ static azure_err_t az_page_blob_write_batch(
             }
             free(reqs);
             free(done);
+            pthread_mutex_unlock(&c->mutex);
             return result;
         }
 
@@ -1537,6 +1565,7 @@ static azure_err_t az_page_blob_write_batch(
 
         if (lease_lost) {
             free(done);
+            pthread_mutex_unlock(&c->mutex);
             err->code = AZURE_ERR_LEASE_EXPIRED;
             snprintf(err->error_message, sizeof(err->error_message),
                      "Lease lost during batch write");
@@ -1562,16 +1591,451 @@ static azure_err_t az_page_blob_write_batch(
     free(done);
 
     if (all_ok) {
+        pthread_mutex_unlock(&c->mutex);
         azure_error_init(err);
         return AZURE_OK;
     }
 
+    pthread_mutex_unlock(&c->mutex);
     if (result == AZURE_OK) result = AZURE_ERR_IO;
     err->code = result;
     if (!err->error_message[0])
         snprintf(err->error_message, sizeof(err->error_message),
                  "Batch write: ranges failed after %d retries",
                  BATCH_MAX_RETRIES);
+    return result;
+}
+
+/* ================================================================
+ * PARALLEL READ — chunked download via curl_multi
+ *
+ * Downloads a page blob in parallel chunks.  Each chunk is fetched
+ * with a separate GET + Range header.  Data is written directly
+ * into the caller's pre-allocated buffer at the correct offset,
+ * avoiding intermediate allocations and copies.
+ *
+ * Chunk count = min(total_size / 1 MiB, PARALLEL_READ_MAX_STREAMS).
+ * For blobs < PARALLEL_READ_MIN_SIZE, falls back to single GET.
+ * ================================================================ */
+
+#ifndef SQLITE_OBJS_PARALLEL_READ_MAX_STREAMS
+#define SQLITE_OBJS_PARALLEL_READ_MAX_STREAMS 16
+#endif
+
+#define PARALLEL_READ_MIN_SIZE (1 * 1024 * 1024)   /* 1 MiB — below this, single GET */
+#define PARALLEL_READ_BATCH_RETRIES 3
+
+/* Write callback that writes directly into the destination buffer */
+typedef struct {
+    uint8_t *dest;        /* Target position in caller's buffer */
+    size_t   capacity;    /* Max bytes for this chunk */
+    size_t   received;    /* Bytes received so far */
+} read_chunk_ctx_t;
+
+static size_t read_chunk_write_cb(void *data, size_t size, size_t nmemb,
+                                  void *userp)
+{
+    if (size != 0 && nmemb > SIZE_MAX / size) return 0;
+    size_t bytes = size * nmemb;
+    read_chunk_ctx_t *ctx = (read_chunk_ctx_t *)userp;
+    if (ctx->received + bytes > ctx->capacity)
+        bytes = ctx->capacity - ctx->received;
+    memcpy(ctx->dest + ctx->received, data, bytes);
+    ctx->received += bytes;
+    return size * nmemb;
+}
+
+/* Per-chunk request context */
+typedef struct {
+    CURL                     *easy;
+    struct curl_slist        *hdrs;
+    azure_buffer_t            err_body;     /* Only used for error responses */
+    azure_response_headers_t  resp_hdrs;
+    read_chunk_ctx_t          chunk_ctx;
+    int                       chunk_idx;
+} read_batch_req_t;
+
+static void read_batch_free_req(read_batch_req_t *req)
+{
+    if (req->easy) {
+        curl_easy_cleanup(req->easy);
+        req->easy = NULL;
+    }
+    if (req->hdrs) {
+        curl_slist_free_all(req->hdrs);
+        req->hdrs = NULL;
+    }
+    azure_buffer_free(&req->err_body);
+}
+
+/*
+ * Set up one CURL easy handle for a GET Range request.
+ * url must remain valid for the handle's lifetime.
+ */
+static azure_err_t read_batch_init_easy(
+    azure_client_t *c,
+    const char *url,
+    const char *blob_name,
+    int64_t offset, size_t len,
+    read_batch_req_t *req)
+{
+    req->easy = curl_easy_init();
+    if (!req->easy) return AZURE_ERR_NETWORK;
+
+    req->hdrs = NULL;
+    azure_buffer_init(&req->err_body);
+    memset(&req->resp_hdrs, 0, sizeof(req->resp_hdrs));
+    req->resp_hdrs.retry_after = -1;
+
+    curl_easy_setopt(req->easy, CURLOPT_URL, url);
+
+    /* Timestamp for auth */
+    char date_buf[64];
+    azure_rfc1123_time(date_buf, sizeof(date_buf));
+
+    char range_val[128];
+    snprintf(range_val, sizeof(range_val), "bytes=%lld-%lld",
+             (long long)offset,
+             (long long)(offset + (int64_t)len - 1));
+
+    /* ---- SharedKey auth signing ---- */
+    char auth_hdr[512] = "";
+    if (!c->use_sas) {
+        char h_date[128], h_ver[64], h_rng[192];
+        snprintf(h_date, sizeof(h_date), "x-ms-date:%s", date_buf);
+        snprintf(h_ver, sizeof(h_ver), "x-ms-version:%s", AZURE_API_VERSION);
+        snprintf(h_rng, sizeof(h_rng), "x-ms-range:%s", range_val);
+
+        const char *xms[4];
+        int n = 0;
+        xms[n++] = h_date;
+        xms[n++] = h_rng;
+        xms[n++] = h_ver;
+        xms[n] = NULL;
+
+        char path[1024];
+        if (c->endpoint[0]) {
+            snprintf(path, sizeof(path), "/%s/%s/%s",
+                     c->account, c->container, blob_name);
+        } else {
+            snprintf(path, sizeof(path), "/%s/%s",
+                     c->container, blob_name);
+        }
+
+        azure_err_t rc = azure_auth_sign_request(
+            c, "GET", path, NULL,
+            "", "", "",
+            (const char *const *)xms,
+            auth_hdr, sizeof(auth_hdr));
+        if (rc != AZURE_OK) {
+            curl_easy_cleanup(req->easy);
+            req->easy = NULL;
+            return rc;
+        }
+    }
+
+    /* ---- HTTP headers ---- */
+    char h[600];
+    struct curl_slist *list = NULL;
+
+    snprintf(h, sizeof(h), "x-ms-date: %s", date_buf);
+    SLIST_APPEND(list, h);
+
+    snprintf(h, sizeof(h), "x-ms-version: %s", AZURE_API_VERSION);
+    SLIST_APPEND(list, h);
+
+    snprintf(h, sizeof(h), "x-ms-range: %s", range_val);
+    SLIST_APPEND(list, h);
+
+    if (auth_hdr[0]) {
+        snprintf(h, sizeof(h), "Authorization: %s", auth_hdr);
+        SLIST_APPEND(list, h);
+    }
+
+    req->hdrs = list;
+    curl_easy_setopt(req->easy, CURLOPT_HTTPHEADER, req->hdrs);
+
+    /* Write callback — writes directly to destination buffer */
+    curl_easy_setopt(req->easy, CURLOPT_WRITEFUNCTION, read_chunk_write_cb);
+    curl_easy_setopt(req->easy, CURLOPT_WRITEDATA, &req->chunk_ctx);
+    curl_easy_setopt(req->easy, CURLOPT_HEADERFUNCTION, curl_header_cb);
+    curl_easy_setopt(req->easy, CURLOPT_HEADERDATA, &req->resp_hdrs);
+
+    /* Timeouts and keep-alive */
+    curl_easy_setopt(req->easy, CURLOPT_TIMEOUT, 120L);
+    curl_easy_setopt(req->easy, CURLOPT_CONNECTTIMEOUT, 10L);
+    curl_easy_setopt(req->easy, CURLOPT_TCP_KEEPALIVE, 1L);
+    curl_easy_setopt(req->easy, CURLOPT_TCP_KEEPIDLE, 30L);
+    curl_easy_setopt(req->easy, CURLOPT_TCP_KEEPINTVL, 15L);
+    curl_easy_setopt(req->easy, CURLOPT_SSL_SESSIONID_CACHE, 1L);
+
+    /* Link back for result collection */
+    curl_easy_setopt(req->easy, CURLOPT_PRIVATE, (char *)req);
+
+    return AZURE_OK;
+
+cleanup:
+    if (list) curl_slist_free_all(list);
+    req->hdrs = NULL;
+    curl_easy_cleanup(req->easy);
+    req->easy = NULL;
+    return AZURE_ERR_NOMEM;
+}
+
+static azure_err_t az_page_blob_read_multi(
+    void *ctx, const char *name,
+    int64_t total_size, uint8_t *dest,
+    azure_error_t *err)
+{
+    if (!ctx || !name || !dest || !err) return AZURE_ERR_INVALID_ARG;
+    azure_error_init(err);
+
+    if (total_size <= 0) return AZURE_OK;
+
+    /* Small blobs — single GET (no parallelism overhead) */
+    if (total_size < PARALLEL_READ_MIN_SIZE) {
+        azure_buffer_t buf = {0};
+        azure_err_t rc = az_page_blob_read(ctx, name, 0,
+                                            (size_t)total_size, &buf, err);
+        if (rc == AZURE_OK && buf.data && buf.size > 0) {
+            size_t copy = buf.size;
+            if ((int64_t)copy > total_size) copy = (size_t)total_size;
+            memcpy(dest, buf.data, copy);
+        }
+        free(buf.data);
+        return rc;
+    }
+
+    azure_client_t *c = (azure_client_t *)ctx;
+
+    /* Lock mutex for the entire batch operation (protects multi_handle) */
+    pthread_mutex_lock(&c->mutex);
+
+    /* Compute chunk layout */
+    int nChunks = SQLITE_OBJS_PARALLEL_READ_MAX_STREAMS;
+    int64_t chunk_size = (total_size + nChunks - 1) / nChunks;
+    /* Round up to 512-byte alignment */
+    chunk_size = (chunk_size + 511) & ~(int64_t)511;
+    /* Recalculate actual chunk count */
+    nChunks = (int)((total_size + chunk_size - 1) / chunk_size);
+
+    /* Build URL once */
+    char url[4096];
+    build_blob_url(c, name, url, sizeof(url));
+    if (c->use_sas) {
+        size_t url_len = strlen(url);
+        snprintf(url + url_len, sizeof(url) - url_len, "?%s", c->sas_token);
+    }
+
+    /* Per-chunk completion tracking */
+    int *done = calloc((size_t)nChunks, sizeof(int));
+    if (!done) {
+        pthread_mutex_unlock(&c->mutex);
+        err->code = AZURE_ERR_NOMEM;
+        return AZURE_ERR_NOMEM;
+    }
+
+    CURLM *multi = ensure_multi_handle(c);
+    if (!multi) {
+        free(done);
+        pthread_mutex_unlock(&c->mutex);
+        err->code = AZURE_ERR_NETWORK;
+        snprintf(err->error_message, sizeof(err->error_message),
+                 "curl_multi_init() failed");
+        return AZURE_ERR_NETWORK;
+    }
+
+    azure_err_t result = AZURE_OK;
+
+    double read_t0 = 0;
+    if (az_debug_timing()) read_t0 = az_time_ms();
+
+    for (int attempt = 0; attempt <= PARALLEL_READ_BATCH_RETRIES; attempt++) {
+        int pending = 0;
+        for (int i = 0; i < nChunks; i++) {
+            if (!done[i]) pending++;
+        }
+        if (pending == 0) break;
+
+        /* Backoff on retry */
+        if (attempt > 0) {
+            int delay_ms = AZURE_RETRY_BASE_MS * (1 << (attempt - 1));
+            if (delay_ms > AZURE_RETRY_MAX_MS)
+                delay_ms = AZURE_RETRY_MAX_MS;
+            fprintf(stderr,
+                    "[sqlite-objs] parallel read: %d/%d chunks pending, "
+                    "retry %d/%d in %dms\n",
+                    pending, nChunks, attempt, PARALLEL_READ_BATCH_RETRIES,
+                    delay_ms);
+            azure_retry_sleep_ms(delay_ms);
+        }
+
+        /* Set up easy handles for pending chunks */
+        read_batch_req_t *reqs = calloc((size_t)pending,
+                                        sizeof(read_batch_req_t));
+        if (!reqs) {
+            free(done);
+            pthread_mutex_unlock(&c->mutex);
+            err->code = AZURE_ERR_NOMEM;
+            return AZURE_ERR_NOMEM;
+        }
+
+        int req_count = 0;
+        int setup_ok = 1;
+        for (int i = 0; i < nChunks && setup_ok; i++) {
+            if (done[i]) continue;
+
+            int64_t offset = (int64_t)i * chunk_size;
+            int64_t remaining = total_size - offset;
+            size_t len = (remaining < chunk_size)
+                             ? (size_t)remaining : (size_t)chunk_size;
+
+            reqs[req_count].chunk_idx = i;
+            reqs[req_count].chunk_ctx.dest = dest + offset;
+            reqs[req_count].chunk_ctx.capacity = len;
+            reqs[req_count].chunk_ctx.received = 0;
+
+            azure_err_t rc = read_batch_init_easy(
+                c, url, name, offset, len, &reqs[req_count]);
+            if (rc != AZURE_OK) {
+                result = rc;
+                err->code = rc;
+                snprintf(err->error_message, sizeof(err->error_message),
+                         "parallel read: request setup failed");
+                setup_ok = 0;
+                break;
+            }
+            curl_multi_add_handle(multi, reqs[req_count].easy);
+            req_count++;
+        }
+
+        if (!setup_ok) {
+            for (int j = 0; j < req_count; j++) {
+                curl_multi_remove_handle(multi, reqs[j].easy);
+                read_batch_free_req(&reqs[j]);
+            }
+            free(reqs);
+            free(done);
+            pthread_mutex_unlock(&c->mutex);
+            return result;
+        }
+
+        /* ---- Event loop ---- */
+        int still_running = 0;
+        curl_multi_perform(multi, &still_running);
+
+        while (still_running > 0) {
+            curl_multi_wait(multi, NULL, 0, 1000, NULL);
+            curl_multi_perform(multi, &still_running);
+        }
+
+        /* ---- Collect results ---- */
+        azure_err_t attempt_err = AZURE_OK;
+        CURLMsg *msg;
+        int msgs_left;
+
+        while ((msg = curl_multi_info_read(multi, &msgs_left))) {
+            if (msg->msg != CURLMSG_DONE) continue;
+
+            char *priv = NULL;
+            curl_easy_getinfo(msg->easy_handle, CURLINFO_PRIVATE, &priv);
+            read_batch_req_t *req = (read_batch_req_t *)priv;
+            if (!req) continue;
+
+            if (msg->data.result != CURLE_OK) {
+                azure_err_t rc =
+                    (msg->data.result == CURLE_OPERATION_TIMEDOUT ||
+                     msg->data.result == CURLE_COULDNT_CONNECT)
+                    ? AZURE_ERR_SERVER : AZURE_ERR_NETWORK;
+                if (attempt_err == AZURE_OK) attempt_err = rc;
+                continue;
+            }
+
+            long http_status = 0;
+            curl_easy_getinfo(msg->easy_handle,
+                              CURLINFO_RESPONSE_CODE, &http_status);
+
+            if (http_status >= 200 && http_status < 300) {
+                done[req->chunk_idx] = 1;
+            } else {
+                azure_err_t rc = azure_classify_http_error(
+                    http_status, req->resp_hdrs.error_code);
+                if (attempt_err == AZURE_OK) {
+                    attempt_err = rc;
+                    err->http_status = clamp_http_status(http_status);
+                    if (req->resp_hdrs.error_code[0])
+                        strncpy(err->error_code,
+                                req->resp_hdrs.error_code,
+                                sizeof(err->error_code) - 1);
+                }
+            }
+        }
+
+        /* Cleanup easy handles */
+        if (az_debug_timing()) {
+            double elapsed = az_time_ms() - read_t0;
+            int completed = 0;
+            for (int i = 0; i < nChunks; i++) {
+                if (done[i]) completed++;
+            }
+            fprintf(stderr,
+                    "[TIMING] parallel_read: %.1fms attempt=%d handles=%d "
+                    "completed=%d/%d total=%.1fMB\n",
+                    elapsed, attempt, req_count,
+                    completed, nChunks,
+                    (double)total_size / (1024.0 * 1024.0));
+        }
+
+        for (int j = 0; j < req_count; j++) {
+            curl_multi_remove_handle(multi, reqs[j].easy);
+            read_batch_free_req(&reqs[j]);
+        }
+        free(reqs);
+
+        result = attempt_err;
+
+        /* All done? Or non-retryable error? */
+        int all_done = 1;
+        for (int i = 0; i < nChunks; i++) {
+            if (!done[i]) { all_done = 0; break; }
+        }
+        if (all_done) break;
+        if (!azure_is_retryable(attempt_err)) break;
+    }
+
+    /* Final verdict */
+    int all_ok = 1;
+    for (int i = 0; i < nChunks; i++) {
+        if (!done[i]) { all_ok = 0; break; }
+    }
+
+    if (az_debug_timing() && all_ok) {
+        double elapsed = az_time_ms() - read_t0;
+        double mbps = (double)total_size / (1024.0 * 1024.0) /
+                      (elapsed / 1000.0);
+        fprintf(stderr,
+                "[TIMING] parallel_read complete: %.1fms "
+                "%.1f MB @ %.1f MB/s (%d chunks)\n",
+                elapsed,
+                (double)total_size / (1024.0 * 1024.0),
+                mbps, nChunks);
+    }
+
+    free(done);
+
+    if (all_ok) {
+        pthread_mutex_unlock(&c->mutex);
+        azure_error_init(err);
+        return AZURE_OK;
+    }
+
+    pthread_mutex_unlock(&c->mutex);
+    if (result == AZURE_OK) result = AZURE_ERR_IO;
+    err->code = result;
+    if (!err->error_message[0])
+        snprintf(err->error_message, sizeof(err->error_message),
+                 "Parallel read: chunks failed after %d retries",
+                 PARALLEL_READ_BATCH_RETRIES);
     return result;
 }
 
@@ -1720,8 +2184,10 @@ static const azure_ops_t azure_production_ops = {
     .lease_renew   = az_lease_renew,
     .lease_release = az_lease_release,
     .lease_break   = az_lease_break,
-    /* Batch write — parallel flush via curl_multi (Phase 2) */
+    /* Batch write — parallel flush via curl_multi */
     .page_blob_write_batch = az_page_blob_write_batch,
+    /* Parallel read — chunked download via curl_multi */
+    .page_blob_read_multi = az_page_blob_read_multi,
     /* Append blob — WAL mode */
     .append_blob_create = az_append_blob_create,
     .append_blob_append = az_append_blob_append,
@@ -1819,6 +2285,9 @@ azure_err_t azure_client_create(const azure_client_config_t *config,
         c->use_sas = 0;
     }
 
+    /* Thread-safe curl global initialization */
+    pthread_once(&g_curl_init_once, curl_global_init_once);
+
     /* Initialize libcurl handle (reused across requests for keep-alive) */
     CURL *curl = curl_easy_init();
     if (!curl) {
@@ -1833,6 +2302,20 @@ azure_err_t azure_client_create(const azure_client_config_t *config,
         return AZURE_ERR_NETWORK;
     }
     c->curl_handle = curl;
+
+    /* Initialize mutex for protecting curl operations */
+    if (pthread_mutex_init(&c->mutex, NULL) != 0) {
+        if (err) {
+            err->code = AZURE_ERR_NETWORK;
+            snprintf(err->error_message, sizeof(err->error_message),
+                     "pthread_mutex_init() failed");
+        }
+        curl_easy_cleanup(curl);
+        secure_zero(c->key_raw, sizeof(c->key_raw));
+        secure_zero(c->key_b64, sizeof(c->key_b64));
+        free(c);
+        return AZURE_ERR_NETWORK;
+    }
 
     if (client_out) *client_out = c;
     return AZURE_OK;
@@ -1850,6 +2333,9 @@ void azure_client_destroy(azure_client_t *client)
         curl_multi_cleanup((CURLM *)client->multi_handle);
         client->multi_handle = NULL;
     }
+
+    /* Destroy mutex */
+    pthread_mutex_destroy(&client->mutex);
 
     if (client->curl_handle) {
         curl_easy_cleanup((CURL *)client->curl_handle);
@@ -1898,6 +2384,9 @@ azure_err_t azure_container_create(azure_client_t *client,
     }
 
     azure_error_init(err);
+
+    /* Lock mutex to protect curl_handle */
+    pthread_mutex_lock(&client->mutex);
 
     CURL *curl = (CURL *)client->curl_handle;
     CURLcode res;
@@ -1956,6 +2445,7 @@ azure_err_t azure_container_create(azure_client_t *client,
             x_ms_headers,
             auth_header, sizeof(auth_header));
         if (rc != AZURE_OK) {
+            pthread_mutex_unlock(&client->mutex);
             err->code = rc;
             snprintf(err->error_message, sizeof(err->error_message),
                      "Failed to sign container create request");
@@ -2009,6 +2499,7 @@ azure_err_t azure_container_create(azure_client_t *client,
     headers = NULL;
 
     if (res != CURLE_OK) {
+        pthread_mutex_unlock(&client->mutex);
         err->code = AZURE_ERR_NETWORK;
         snprintf(err->error_message, sizeof(err->error_message),
                  "curl_easy_perform() failed: %s", curl_easy_strerror(res));
@@ -2022,6 +2513,7 @@ azure_err_t azure_container_create(azure_client_t *client,
 
     /* 201 Created or 409 ContainerAlreadyExists are both success */
     if (http_status == 201 || http_status == 409) {
+        pthread_mutex_unlock(&client->mutex);
         azure_buffer_free(&response_body);
         return AZURE_OK;
     }
@@ -2043,11 +2535,13 @@ azure_err_t azure_container_create(azure_client_t *client,
                  "Container create failed with HTTP %ld", http_status);
     }
 
+    pthread_mutex_unlock(&client->mutex);
     return err->code;
 
 /* S-H5: cleanup for SLIST_APPEND failures in azure_container_create */
 cleanup:
     if (headers) curl_slist_free_all(headers);
+    pthread_mutex_unlock(&client->mutex);
     err->code = AZURE_ERR_NOMEM;
     snprintf(err->error_message, sizeof(err->error_message),
              "curl_slist_append allocation failed");

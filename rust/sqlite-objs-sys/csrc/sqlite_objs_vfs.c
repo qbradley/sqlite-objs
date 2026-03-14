@@ -25,6 +25,12 @@
 #include <time.h>
 #include <sys/time.h>
 #include <assert.h>
+#include <unistd.h>
+#include <errno.h>
+#include <sys/stat.h>
+#include <pthread.h>
+#include <fcntl.h>
+#include <pthread.h>
 
 /* ===================================================================
 ** Debug timing — opt-in via SQLITE_OBJS_DEBUG_TIMING=1 environment variable
@@ -114,10 +120,10 @@ typedef struct sqliteObjsFile {
     void *ops_ctx;                      /* Context for ops */
     char *zBlobName;                    /* Blob name in container */
 
-    /* In-memory buffer (cache + write buffer) for MAIN_DB */
-    unsigned char *aData;               /* Full blob content */
+    /* Disk-backed cache for MAIN_DB */
+    int cacheFd;                        /* File descriptor (-1 if not open) */
+    char *zCachePath;                   /* Path to cache file (for cleanup) */
     sqlite3_int64 nData;                /* Current logical size */
-    sqlite3_int64 nAlloc;               /* Allocated buffer size */
 
     /* Dirty page tracking */
     unsigned char *aDirty;              /* Bitmap: 1 bit per page, 1=dirty */
@@ -135,8 +141,9 @@ typedef struct sqliteObjsFile {
     /* R2: Skip redundant resize — track last synced blob size */
     sqlite3_int64 lastSyncedSize;       /* Blob size after last successful resize/open */
 
-    /* ETag tracking (preparation for MVP 2 cache invalidation) */
+    /* ETag tracking for cache invalidation */
     char etag[128];                     /* Current blob ETag */
+    int cacheReuse;                     /* 1 = persistent cache with ETag validation */
 
     /* File type */
     int eFileType;                      /* SQLITE_OPEN_MAIN_DB, etc. */
@@ -188,6 +195,7 @@ struct sqliteObjsVfsData {
     ** This eliminates ~4 HEAD requests per transaction (~110ms saved). */
     sqliteObjsJournalCacheEntry journalCache[SQLITE_OBJS_MAX_JOURNAL_CACHE];
     int nJournalCache;
+    pthread_mutex_t journalCacheMutex;  /* Protects journalCache array */
 };
 
 /* ---------- io_methods v2 ---------- */
@@ -277,9 +285,8 @@ static int dirtyIsPageDirty(sqliteObjsFile *p, int pageIdx) {
 }
 
 static void dirtyClearAll(sqliteObjsFile *p) {
-    if (p->aDirty) {
-        int nBytes = dirtyBitmapSize(p->nAlloc, p->pageSize);
-        memset(p->aDirty, 0, nBytes);
+    if (p->aDirty && p->nDirtyAlloc > 0) {
+        memset(p->aDirty, 0, p->nDirtyAlloc);
     }
     p->nDirtyPages = 0;
 }
@@ -289,7 +296,7 @@ static void dirtyClearAll(sqliteObjsFile *p) {
 ** Returns SQLITE_OK or SQLITE_NOMEM.
 */
 static int dirtyEnsureCapacity(sqliteObjsFile *p) {
-    int needed = dirtyBitmapSize(p->nAlloc, p->pageSize);
+    int needed = dirtyBitmapSize(p->nData, p->pageSize);
     if (needed <= 0) return SQLITE_OK;
     if (needed <= p->nDirtyAlloc) return SQLITE_OK;
     unsigned char *pNew = (unsigned char *)realloc(p->aDirty, needed);
@@ -301,30 +308,118 @@ static int dirtyEnsureCapacity(sqliteObjsFile *p) {
     return SQLITE_OK;
 }
 
+/*
+** Check if any dirty bits are set in the bitmap.
+** Returns 1 if any page is dirty, 0 if all clean.
+*/
+static int dirtyHasAny(sqliteObjsFile *p) {
+    if (!p->aDirty) return 0;
+    for (int i = 0; i < p->nDirtyAlloc; i++) {
+        if (p->aDirty[i]) return 1;
+    }
+    return 0;
+}
+
 
 /* ===================================================================
-** Helper: buffer management
+** Helper: cache file management for MAIN_DB
 ** =================================================================== */
 
 /*
-** Ensure aData has room for at least newSize bytes.
-** Grows geometrically.  Returns SQLITE_OK or SQLITE_NOMEM.
+** Ensure the cache file has room for at least newSize bytes.
+** Returns SQLITE_OK or SQLITE_IOERR.
 */
-static int bufferEnsure(sqliteObjsFile *p, sqlite3_int64 newSize) {
-    if (newSize <= p->nAlloc) return SQLITE_OK;
-    sqlite3_int64 alloc = p->nAlloc;
-    if (alloc == 0) alloc = SQLITE_OBJS_INITIAL_ALLOC;
-    while (alloc < newSize) {
-        alloc *= 2;
-        if (alloc < 0) return SQLITE_NOMEM; /* overflow */
+static int cacheEnsureSize(sqliteObjsFile *p, sqlite3_int64 newSize) {
+    if (p->cacheFd < 0) return SQLITE_IOERR;
+    
+    /* Get current file size */
+    off_t currentSize = lseek(p->cacheFd, 0, SEEK_END);
+    if (currentSize < 0) return SQLITE_IOERR;
+    
+    if (newSize <= currentSize) return SQLITE_OK;
+    
+    /* Extend cache file */
+    if (ftruncate(p->cacheFd, (off_t)newSize) != 0) {
+        return SQLITE_IOERR;
     }
-    unsigned char *pNew = (unsigned char *)realloc(p->aData, (size_t)alloc);
-    if (!pNew) return SQLITE_NOMEM;
-    /* Zero the new region */
-    memset(pNew + p->nAlloc, 0, (size_t)(alloc - p->nAlloc));
-    p->aData = pNew;
-    p->nAlloc = alloc;
+    
     return dirtyEnsureCapacity(p);
+}
+
+/* ===================================================================
+** Helper: ETag sidecar file operations for cache reuse
+** =================================================================== */
+
+/*
+** Build the ETag sidecar path from a cache path: replace .cache with .etag
+** Returns heap-allocated string.  Caller must free().
+*/
+static char *buildEtagPath(const char *cachePath) {
+    if (!cachePath) return NULL;
+    size_t len = strlen(cachePath);
+    const char *suffix = ".cache";
+    size_t suffixLen = 6;
+    if (len >= suffixLen && strcmp(cachePath + len - suffixLen, suffix) == 0) {
+        size_t baseLen = len - suffixLen;
+        char *path = (char *)malloc(baseLen + 6);  /* ".etag\0" */
+        if (!path) return NULL;
+        memcpy(path, cachePath, baseLen);
+        memcpy(path + baseLen, ".etag", 6);
+        return path;
+    }
+    /* Fallback: append .etag */
+    char *path = (char *)malloc(len + 6);
+    if (!path) return NULL;
+    memcpy(path, cachePath, len);
+    memcpy(path + len, ".etag", 6);
+    return path;
+}
+
+/*
+** Read stored ETag from sidecar file.
+** Returns 0 on success with buf filled, -1 on failure.
+*/
+static int readEtagFile(const char *path, char *buf, size_t bufSize) {
+    if (!path || !buf || bufSize == 0) return -1;
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) return -1;
+    ssize_t n = read(fd, buf, bufSize - 1);
+    close(fd);
+    if (n <= 0) return -1;
+    while (n > 0 && (buf[n-1] == '\n' || buf[n-1] == '\r' || buf[n-1] == ' '))
+        n--;
+    buf[n] = '\0';
+    return 0;
+}
+
+/*
+** Write ETag to sidecar file derived from cachePath (.cache → .etag).
+** Returns 0 on success, -1 on failure.
+*/
+static int writeEtagFile(const char *cachePath, const char *etag) {
+    if (!cachePath || !etag || !etag[0]) return -1;
+    char *etagPath = buildEtagPath(cachePath);
+    if (!etagPath) return -1;
+    int fd = open(etagPath, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    if (fd < 0) { free(etagPath); return -1; }
+    size_t len = strlen(etag);
+    ssize_t nw = write(fd, etag, len);
+    fsync(fd);
+    close(fd);
+    free(etagPath);
+    return (nw == (ssize_t)len) ? 0 : -1;
+}
+
+/*
+** Remove the ETag sidecar file corresponding to a cache path.
+*/
+static void unlinkEtagFile(const char *cachePath) {
+    if (!cachePath) return;
+    char *etagPath = buildEtagPath(cachePath);
+    if (etagPath) {
+        unlink(etagPath);
+        free(etagPath);
+    }
 }
 
 /*
@@ -502,8 +597,25 @@ static int sqliteObjsClose(sqlite3_file *pFile) {
         p->leaseId[0] = '\0';
     }
 
-    free(p->aData);
-    p->aData = NULL;
+    /* Close and conditionally delete cache file for MAIN_DB */
+    if (p->cacheFd >= 0) {
+        close(p->cacheFd);
+        p->cacheFd = -1;
+    }
+    if (p->zCachePath) {
+        if (p->cacheReuse && p->etag[0] != '\0' && !dirtyHasAny(p)) {
+            /* Cache is clean and we have a valid ETag — persist for reuse */
+            writeEtagFile(p->zCachePath, p->etag);
+            /* DON'T unlink the cache file */
+        } else {
+            /* Default behavior: clean up */
+            unlink(p->zCachePath);
+            unlinkEtagFile(p->zCachePath);
+        }
+        free(p->zCachePath);
+        p->zCachePath = NULL;
+    }
+    
     free(p->aDirty);
     p->aDirty = NULL;
     free(p->aJrnlData);
@@ -524,56 +636,103 @@ static int sqliteObjsClose(sqlite3_file *pFile) {
 }
 
 /*
-** xRead — Read from the in-memory buffer.
-** For MAIN_DB: read from aData.
+** xRead — Read from cache file or in-memory buffer.
+** For MAIN_DB: read from cache file via pread.
 ** For MAIN_JOURNAL: read from aJrnlData.
 ** Must zero-fill on short read (SQLITE_IOERR_SHORT_READ).
 */
 static int sqliteObjsRead(sqlite3_file *pFile, void *pBuf, int iAmt,
                         sqlite3_int64 iOfst) {
     sqliteObjsFile *p = (sqliteObjsFile *)pFile;
-    unsigned char *src;
-    sqlite3_int64 srcLen;
-
+    
     if (p->eFileType == SQLITE_OPEN_WAL) {
-        src = p->aWalData;
-        srcLen = p->nWalData;
-    } else if (p->eFileType & SQLITE_OPEN_MAIN_JOURNAL) {
-        src = p->aJrnlData;
-        srcLen = p->nJrnlData;
-        g_xread_journal_count++;
-    } else {
-        src = p->aData;
-        srcLen = p->nData;
-        g_xread_count++;
+        unsigned char *src = p->aWalData;
+        sqlite3_int64 srcLen = p->nWalData;
+        if (!src) {
+            memset(pBuf, 0, iAmt);
+            return SQLITE_IOERR_SHORT_READ;
+        }
+        if (iOfst >= srcLen) {
+            memset(pBuf, 0, iAmt);
+            return SQLITE_IOERR_SHORT_READ;
+        }
+        sqlite3_int64 avail = srcLen - iOfst;
+        if (avail >= iAmt) {
+            memcpy(pBuf, src + iOfst, iAmt);
+            return SQLITE_OK;
+        }
+        memcpy(pBuf, src + iOfst, (size_t)avail);
+        memset((unsigned char *)pBuf + avail, 0, iAmt - (size_t)avail);
+        return SQLITE_IOERR_SHORT_READ;
     }
-
-    if (!src) {
+    
+    if (p->eFileType & SQLITE_OPEN_MAIN_JOURNAL) {
+        unsigned char *src = p->aJrnlData;
+        sqlite3_int64 srcLen = p->nJrnlData;
+        g_xread_journal_count++;
+        if (!src) {
+            memset(pBuf, 0, iAmt);
+            return SQLITE_IOERR_SHORT_READ;
+        }
+        if (iOfst >= srcLen) {
+            memset(pBuf, 0, iAmt);
+            return SQLITE_IOERR_SHORT_READ;
+        }
+        sqlite3_int64 avail = srcLen - iOfst;
+        if (avail >= iAmt) {
+            memcpy(pBuf, src + iOfst, iAmt);
+            return SQLITE_OK;
+        }
+        memcpy(pBuf, src + iOfst, (size_t)avail);
+        memset((unsigned char *)pBuf + avail, 0, iAmt - (size_t)avail);
+        return SQLITE_IOERR_SHORT_READ;
+    }
+    
+    /* MAIN_DB — read from cache file */
+    g_xread_count++;
+    
+    if (p->cacheFd < 0) {
         memset(pBuf, 0, iAmt);
         return SQLITE_IOERR_SHORT_READ;
     }
-
-    if (iOfst >= srcLen) {
+    
+    if (iOfst >= p->nData) {
         /* Reading entirely past end — zero fill */
         memset(pBuf, 0, iAmt);
         return SQLITE_IOERR_SHORT_READ;
     }
-
-    sqlite3_int64 avail = srcLen - iOfst;
-    if (avail >= iAmt) {
-        memcpy(pBuf, src + iOfst, iAmt);
+    
+    sqlite3_int64 avail = p->nData - iOfst;
+    int toRead = (avail >= iAmt) ? iAmt : (int)avail;
+    
+    if (toRead > 0) {
+        ssize_t nRead = pread(p->cacheFd, pBuf, toRead, (off_t)iOfst);
+        if (nRead < 0) {
+            memset(pBuf, 0, iAmt);
+            return SQLITE_IOERR_READ;
+        }
+        if (nRead < toRead) {
+            /* Short read from pread — zero rest */
+            memset((unsigned char *)pBuf + nRead, 0, toRead - nRead);
+        }
+        if (toRead < iAmt) {
+            /* Past EOF — zero remaining */
+            memset((unsigned char *)pBuf + toRead, 0, iAmt - toRead);
+            return SQLITE_IOERR_SHORT_READ;
+        }
+        if (nRead < iAmt) {
+            return SQLITE_IOERR_SHORT_READ;
+        }
         return SQLITE_OK;
     }
-
-    /* Short read — copy what we have, zero the rest */
-    memcpy(pBuf, src + iOfst, (size_t)avail);
-    memset((unsigned char *)pBuf + avail, 0, iAmt - (size_t)avail);
+    
+    memset(pBuf, 0, iAmt);
     return SQLITE_IOERR_SHORT_READ;
 }
 
 /*
-** xWrite — Write to the in-memory buffer.
-** For MAIN_DB: write to aData, mark dirty bitmap.
+** xWrite — Write to cache file or in-memory buffer.
+** For MAIN_DB: write to cache file via pwrite, mark dirty bitmap.
 ** For MAIN_JOURNAL: append/write to aJrnlData.
 */
 static int sqliteObjsWrite(sqlite3_file *pFile, const void *pBuf, int iAmt,
@@ -605,13 +764,34 @@ static int sqliteObjsWrite(sqlite3_file *pFile, const void *pBuf, int iAmt,
         return SQLITE_OK;
     }
 
-    /* MAIN_DB — write to aData + mark dirty */
+    /* MAIN_DB — write to cache file + mark dirty */
+    if (p->cacheFd < 0) {
+        return SQLITE_IOERR_WRITE;
+    }
+    
     sqlite3_int64 end = iOfst + iAmt;
-    rc = bufferEnsure(p, end);
-    if (rc != SQLITE_OK) return rc;
-
-    memcpy(p->aData + iOfst, pBuf, iAmt);
+    sqlite3_int64 prevNData = p->nData;
+    
+    /* Update nData BEFORE cacheEnsureSize so dirtyEnsureCapacity sizes the
+    ** bitmap for the new file size, not the old one. Without this, dirty
+    ** marks for pages beyond the old EOF are silently dropped. */
     if (end > p->nData) p->nData = end;
+    
+    /* Extend cache file if needed */
+    if (end > prevNData) {
+        rc = cacheEnsureSize(p, end);
+        if (rc != SQLITE_OK) {
+            p->nData = prevNData;
+            return rc;
+        }
+    }
+    
+    /* Write to cache file */
+    ssize_t nWritten = pwrite(p->cacheFd, pBuf, iAmt, (off_t)iOfst);
+    if (nWritten != iAmt) {
+        p->nData = prevNData;
+        return SQLITE_IOERR_WRITE;
+    }
 
     /* Renew lease if needed during long write sequences */
     if (hasLease(p)) {
@@ -701,6 +881,13 @@ static int sqliteObjsTruncate(sqlite3_file *pFile, sqlite3_int64 size) {
         p->lastSyncedSize = size;
     }
 
+    /* Truncate the cache file */
+    if (p->cacheFd >= 0) {
+        if (ftruncate(p->cacheFd, (off_t)size) != 0) {
+            return SQLITE_IOERR_TRUNCATE;
+        }
+    }
+    
     if (size < p->nData) {
         p->nData = size;
     }
@@ -717,6 +904,8 @@ static int sqliteObjsTruncate(sqlite3_file *pFile, sqlite3_int64 size) {
 **
 ** Returns the number of ranges written to `ranges`, or -1 if maxRanges
 ** is too small to hold all the coalesced ranges.
+**
+** NOTE: range.data is NOT set here — caller must read from cache file.
 */
 static int coalesceDirtyRanges(
     sqliteObjsFile *p,
@@ -762,7 +951,7 @@ static int coalesceDirtyRanges(
         if (nRanges >= maxRanges) return -1;
 
         ranges[nRanges].offset = runStart;
-        ranges[nRanges].data = p->aData + runStart;
+        ranges[nRanges].data = NULL;  /* Caller must fill from cache file */
         ranges[nRanges].len = len;
         nRanges++;
     }
@@ -909,9 +1098,11 @@ static int sqliteObjsSync(sqlite3_file *pFile, int flags) {
 
             /* R1: Journal blob now exists in Azure */
             {
+                pthread_mutex_lock(&p->pVfsData->journalCacheMutex);
                 sqliteObjsJournalCacheEntry *jce =
                     journalCacheGetOrCreate(p->pVfsData, p->zBlobName);
                 if (jce) jce->state = 1;
+                pthread_mutex_unlock(&p->pVfsData->journalCacheMutex);
             }
         }
         return SQLITE_OK;
@@ -977,6 +1168,49 @@ static int sqliteObjsSync(sqlite3_file *pFile, int flags) {
     double coalesce_ms = 0;
     if (sqlite_objs_debug_timing()) coalesce_ms = sqlite_objs_time_ms() - coalesce_t0;
 
+    /* Allocate buffer for dirty range data and read from cache file */
+    unsigned char *rangeDataBuf = NULL;
+    size_t totalRangeBytes = 0;
+    for (int i = 0; i < nRanges; i++) {
+        totalRangeBytes += ranges[i].len;
+    }
+    
+    if (totalRangeBytes > 0) {
+        /* Ensure cache file covers 512-byte aligned range ends.
+        ** Ranges are padded to 512-byte boundaries for Azure, but the cache
+        ** file may be shorter (nData may not be 512-aligned). Extend with
+        ** zeros so pread returns full data. */
+        if (nRanges > 0 && p->cacheFd >= 0) {
+            sqlite3_int64 maxEnd = ranges[nRanges-1].offset + ranges[nRanges-1].len;
+            off_t curSize = lseek(p->cacheFd, 0, SEEK_END);
+            if (curSize >= 0 && maxEnd > curSize) {
+                ftruncate(p->cacheFd, (off_t)maxEnd);
+            }
+        }
+
+        rangeDataBuf = (unsigned char *)sqlite3_malloc64(totalRangeBytes);
+        if (!rangeDataBuf) {
+            if (ranges != stackRanges) sqlite3_free(ranges);
+            return SQLITE_NOMEM;
+        }
+        
+        unsigned char *bufPos = rangeDataBuf;
+        for (int i = 0; i < nRanges; i++) {
+            ssize_t nRead = pread(p->cacheFd, bufPos, ranges[i].len, (off_t)ranges[i].offset);
+            if (nRead < 0) {
+                sqlite3_free(rangeDataBuf);
+                if (ranges != stackRanges) sqlite3_free(ranges);
+                return SQLITE_IOERR_FSYNC;
+            }
+            if ((size_t)nRead < ranges[i].len) {
+                /* Zero-fill tail — alignment padding beyond actual data */
+                memset(bufPos + nRead, 0, ranges[i].len - (size_t)nRead);
+            }
+            ranges[i].data = bufPos;
+            bufPos += ranges[i].len;
+        }
+    }
+
     /* Try batch write if available (Phase 2 — will be non-NULL with curl_multi) */
     if (p->ops->page_blob_write_batch) {
         double wt0 = 0;
@@ -1003,6 +1237,7 @@ static int sqliteObjsSync(sqlite3_file *pFile, int flags) {
             g_xread_journal_count = 0;
         }
 
+        sqlite3_free(rangeDataBuf);
         if (ranges != stackRanges) sqlite3_free(ranges);
         if (arc != AZURE_OK) return SQLITE_IOERR_FSYNC;
         p->lastSyncDirtyCount = dirtyCountBeforeSync;
@@ -1022,6 +1257,7 @@ static int sqliteObjsSync(sqlite3_file *pFile, int flags) {
         if (hasLease(p) && i > 0 && (i % 50 == 0)) {
             rc = leaseRenewIfNeeded(p);
             if (rc != SQLITE_OK) {
+                sqlite3_free(rangeDataBuf);
                 if (ranges != stackRanges) sqlite3_free(ranges);
                 return SQLITE_IOERR_FSYNC;
             }
@@ -1034,6 +1270,7 @@ static int sqliteObjsSync(sqlite3_file *pFile, int flags) {
             hasLease(p) ? p->leaseId : NULL, &aerr);
 
         if (arc != AZURE_OK) {
+            sqlite3_free(rangeDataBuf);
             if (ranges != stackRanges) sqlite3_free(ranges);
             return SQLITE_IOERR_FSYNC;
         }
@@ -1058,6 +1295,7 @@ static int sqliteObjsSync(sqlite3_file *pFile, int flags) {
         memcpy(p->etag, aerr.etag, sizeof(p->etag));
     }
 
+    sqlite3_free(rangeDataBuf);
     if (ranges != stackRanges) sqlite3_free(ranges);
     dirtyClearAll(p);
     return SQLITE_OK;
@@ -1321,6 +1559,82 @@ static int sqliteObjsShmUnmap(sqlite3_file *pFile, int deleteFlag) {
 ** =================================================================== */
 
 /*
+** Build a heap-allocated mkstemp template for the cache file.
+** If cacheDir is non-NULL and non-empty, the template is placed under
+** that directory (which is created with mkdir if it doesn't exist).
+** Otherwise falls back to /tmp.  Returns NULL on allocation failure.
+** The caller must free() the returned string.
+*/
+static char *buildCacheTemplate(const char *cacheDir) {
+    if (cacheDir && cacheDir[0]) {
+        mkdir(cacheDir, 0700);  /* ignore EEXIST */
+        size_t dirLen = strlen(cacheDir);
+        /* Strip trailing slash */
+        if (dirLen > 0 && cacheDir[dirLen - 1] == '/') dirLen--;
+        char *tmpl = (char *)malloc(dirLen + sizeof("/sqlite-objs-XXXXXX"));
+        if (!tmpl) return NULL;
+        memcpy(tmpl, cacheDir, dirLen);
+        memcpy(tmpl + dirLen, "/sqlite-objs-XXXXXX", sizeof("/sqlite-objs-XXXXXX"));
+        return tmpl;
+    }
+    return strdup("/tmp/sqlite-objs-XXXXXX");
+}
+
+/* ===================================================================
+** ETag-based cache reuse helpers
+** =================================================================== */
+
+/*
+** FNV-1a hash — fast non-cryptographic hash for cache path naming.
+*/
+static uint64_t fnv1a_hash(const char *data, size_t len) {
+    uint64_t h = 0xcbf29ce484222325ULL;
+    for (size_t i = 0; i < len; i++) {
+        h ^= (uint64_t)(unsigned char)data[i];
+        h *= 0x100000001b3ULL;
+    }
+    return h;
+}
+
+/*
+** Build a deterministic cache file path from blob identity.
+** Returns heap-allocated string: {cacheDir}/sqlite-objs-{hex}.cache
+** Caller must free().  Returns NULL on allocation failure.
+*/
+static char *buildCachePath(const char *cacheDir, const char *account,
+                            const char *container, const char *blobName) {
+    if (!cacheDir || !cacheDir[0]) cacheDir = "/tmp";
+    mkdir(cacheDir, 0700);  /* ignore EEXIST */
+
+    /* Hash "account:container:blobName" */
+    size_t aLen = account ? strlen(account) : 0;
+    size_t cLen = container ? strlen(container) : 0;
+    size_t bLen = blobName ? strlen(blobName) : 0;
+    size_t keyLen = aLen + 1 + cLen + 1 + bLen;
+    char *key = (char *)malloc(keyLen + 1);
+    if (!key) return NULL;
+    snprintf(key, keyLen + 1, "%s:%s:%s",
+             account ? account : "",
+             container ? container : "",
+             blobName ? blobName : "");
+    uint64_t h = fnv1a_hash(key, keyLen);
+    free(key);
+
+    char hex[17];
+    snprintf(hex, sizeof(hex), "%016llx", (unsigned long long)h);
+
+    size_t dirLen = strlen(cacheDir);
+    if (dirLen > 0 && cacheDir[dirLen - 1] == '/') dirLen--;
+
+    /* "{dir}/sqlite-objs-{16hex}.cache\0" */
+    size_t pathLen = dirLen + 1 + 12 + 16 + 6 + 1;
+    char *path = (char *)malloc(pathLen);
+    if (!path) return NULL;
+    snprintf(path, pathLen, "%.*s/sqlite-objs-%s.cache", (int)dirLen, cacheDir, hex);
+    return path;
+}
+
+/*
 ** Parse Azure URI parameters from a sqlite3_filename.
 ** Returns 1 if azure_account is present (config populated), 0 otherwise.
 */
@@ -1407,6 +1721,13 @@ static int sqliteObjsOpen(sqlite3_vfs *pVfs, sqlite3_filename zName,
     p->lastSyncDirtyCount = 0;
     p->etag[0] = '\0';
     p->pageSize = SQLITE_OBJS_DEFAULT_PAGE_SIZE;
+    p->cacheFd = -1;  /* Initialize cache fd */
+    p->zCachePath = NULL;
+    p->cacheReuse = 0;
+
+    /* Read optional cache_dir and cache_reuse URI parameters */
+    const char *cacheDir = sqlite3_uri_parameter(zName, "cache_dir");
+    int cacheReuse = sqlite3_uri_boolean(zName, "cache_reuse", 0);
 
     if (isMainDb) {
         /* MAIN_DB → Azure page blob */
@@ -1441,22 +1762,126 @@ static int sqliteObjsOpen(sqlite3_vfs *pVfs, sqlite3_filename zName,
                 memcpy(p->etag, aerr.etag, sizeof(p->etag));
             }
 
-            if (blobSize > 0) {
-                int rc = bufferEnsure(p, blobSize);
-                if (rc != SQLITE_OK) {
+            /* ETag-based cache reuse: try to reuse existing cache file */
+            if (cacheReuse && blobSize > 0) {
+                const char *acct = sqlite3_uri_parameter(zName, "azure_account");
+                const char *cont = sqlite3_uri_parameter(zName, "azure_container");
+                char *cachePath = buildCachePath(cacheDir, acct, cont, zName);
+                if (cachePath) {
+                    char *etagPath = buildEtagPath(cachePath);
+                    char storedEtag[128] = {0};
+                    if (etagPath &&
+                        readEtagFile(etagPath, storedEtag, sizeof(storedEtag)) == 0 &&
+                        p->etag[0] != '\0' &&
+                        strcmp(storedEtag, p->etag) == 0) {
+                        /* ETag match — try to reuse cache file */
+                        int fd = open(cachePath, O_RDWR);
+                        if (fd >= 0) {
+                            /* Verify cached file size matches blob */
+                            off_t cachedSize = lseek(fd, 0, SEEK_END);
+                            if (cachedSize == (off_t)blobSize) {
+                                p->cacheFd = fd;
+                                p->zCachePath = cachePath;
+                                p->cacheReuse = 1;
+                                p->nData = blobSize;
+
+                                /* Detect page size from header */
+                                unsigned char header[100];
+                                ssize_t nRead = pread(p->cacheFd, header, sizeof(header), 0);
+                                if (nRead == (ssize_t)sizeof(header)) {
+                                    int detected = detectPageSize(header, sizeof(header));
+                                    if (detected > 0) p->pageSize = detected;
+                                }
+                                dirtyEnsureCapacity(p);
+                                p->lastSyncedSize = p->nData;
+                                free(etagPath);
+                                goto cache_ready;
+                            }
+                            close(fd);
+                        }
+                    }
+                    free(etagPath);
+                    /* Cache miss — use deterministic name for fresh download */
+                    p->cacheFd = open(cachePath, O_RDWR | O_CREAT | O_TRUNC, 0600);
+                    if (p->cacheFd < 0) {
+                        free(cachePath);
+                        sqlite3_free(p->zBlobName);
+                        p->zBlobName = NULL;
+                        return SQLITE_CANTOPEN;
+                    }
+                    p->zCachePath = cachePath;
+                    p->cacheReuse = 1;
+                    goto cache_download;
+                }
+                /* buildCachePath failed — fall through to mkstemp path */
+            }
+
+            /* Create cache file (default: random mkstemp name) */
+            {
+                char *cacheTemplate = buildCacheTemplate(cacheDir);
+                if (!cacheTemplate) {
                     sqlite3_free(p->zBlobName);
                     p->zBlobName = NULL;
-                    return rc;
+                    return SQLITE_NOMEM;
+                }
+                p->cacheFd = mkstemp(cacheTemplate);
+                if (p->cacheFd < 0) {
+                    free(cacheTemplate);
+                    sqlite3_free(p->zBlobName);
+                    p->zBlobName = NULL;
+                    return SQLITE_CANTOPEN;
+                }
+                p->zCachePath = cacheTemplate;
+            }
+
+            cache_download:
+            if (blobSize > 0) {
+                /* Download to temporary buffer, then write to cache file */
+                unsigned char *tempBuf = (unsigned char *)malloc(blobSize);
+                if (!tempBuf) {
+                    close(p->cacheFd);
+                    unlink(p->zCachePath);
+                    free(p->zCachePath);
+                    p->cacheFd = -1;
+                    p->zCachePath = NULL;
+                    sqlite3_free(p->zBlobName);
+                    p->zBlobName = NULL;
+                    return SQLITE_NOMEM;
                 }
 
-                azure_buffer_t buf = {0};
                 azure_error_init(&aerr);
-                arc = p->ops->page_blob_read(p->ops_ctx, zName,
-                                              0, (size_t)blobSize,
-                                              &buf, &aerr);
+
+                /* Use parallel chunked download when available */
+                if (p->ops->page_blob_read_multi) {
+                    arc = p->ops->page_blob_read_multi(
+                        p->ops_ctx, zName, blobSize,
+                        tempBuf, &aerr);
+                } else {
+                    /* Fallback: single-stream download */
+                    azure_buffer_t buf = {0};
+                    arc = p->ops->page_blob_read(p->ops_ctx, zName,
+                                                  0, (size_t)blobSize,
+                                                  &buf, &aerr);
+                    if (arc == AZURE_OK) {
+                        if (!buf.data || buf.size == 0) {
+                            /* Unexpected: blob properties said size>0 but read returned nothing */
+                            arc = AZURE_ERR_INVALID_ARG;
+                        } else {
+                            sqlite3_int64 copyLen = (sqlite3_int64)buf.size;
+                            if (copyLen > blobSize) copyLen = blobSize;
+                            memcpy(tempBuf, buf.data, (size_t)copyLen);
+                        }
+                    }
+                    free(buf.data);
+                }
+
                 if (arc != AZURE_OK) {
-                    free(p->aData);
-                    p->aData = NULL;
+                    free(tempBuf);
+                    close(p->cacheFd);
+                    unlink(p->zCachePath);
+                    free(p->zCachePath);
+                    p->cacheFd = -1;
+                    p->zCachePath = NULL;
                     free(p->aDirty);
                     p->aDirty = NULL;
                     sqlite3_free(p->zBlobName);
@@ -1464,18 +1889,53 @@ static int sqliteObjsOpen(sqlite3_vfs *pVfs, sqlite3_filename zName,
                     return azureErrToSqlite(arc, SQLITE_CANTOPEN);
                 }
 
-                /* Copy downloaded data into our buffer */
-                if (buf.data && buf.size > 0) {
-                    sqlite3_int64 copyLen = (sqlite3_int64)buf.size;
-                    if (copyLen > blobSize) copyLen = blobSize;
-                    memcpy(p->aData, buf.data, (size_t)copyLen);
-                    p->nData = copyLen;
+                /* Write downloaded data to cache file */
+                ssize_t totalWritten = 0;
+                while (totalWritten < blobSize) {
+                    ssize_t nWritten = write(p->cacheFd, tempBuf + totalWritten, 
+                                            blobSize - totalWritten);
+                    if (nWritten <= 0) {
+                        free(tempBuf);
+                        close(p->cacheFd);
+                        unlink(p->zCachePath);
+                        free(p->zCachePath);
+                        p->cacheFd = -1;
+                        p->zCachePath = NULL;
+                        free(p->aDirty);
+                        p->aDirty = NULL;
+                        sqlite3_free(p->zBlobName);
+                        p->zBlobName = NULL;
+                        return SQLITE_IOERR;
+                    }
+                    totalWritten += nWritten;
                 }
-                free(buf.data);
+                
+                /* Ensure data is written to disk */
+                if (fsync(p->cacheFd) != 0) {
+                    free(tempBuf);
+                    close(p->cacheFd);
+                    unlink(p->zCachePath);
+                    free(p->zCachePath);
+                    p->cacheFd = -1;
+                    p->zCachePath = NULL;
+                    free(p->aDirty);
+                    p->aDirty = NULL;
+                    sqlite3_free(p->zBlobName);
+                    p->zBlobName = NULL;
+                    return SQLITE_IOERR;
+                }
+                
+                free(tempBuf);
+                
+                p->nData = blobSize;
 
                 /* Detect page size from header */
-                int detected = detectPageSize(p->aData, p->nData);
-                if (detected > 0) p->pageSize = detected;
+                unsigned char header[100];
+                ssize_t nRead = pread(p->cacheFd, header, sizeof(header), 0);
+                if (nRead == sizeof(header)) {
+                    int detected = detectPageSize(header, sizeof(header));
+                    if (detected > 0) p->pageSize = detected;
+                }
 
                 /* Re-ensure dirty bitmap with correct page size */
                 dirtyEnsureCapacity(p);
@@ -1483,8 +1943,10 @@ static int sqliteObjsOpen(sqlite3_vfs *pVfs, sqlite3_filename zName,
                 /* R2: Record initial Azure blob size to skip redundant resizes */
                 p->lastSyncedSize = p->nData;
             } else {
+                /* Empty blob */
                 p->nData = 0;
             }
+            cache_ready: ;  /* ETag cache hit jumps here */
         } else if (!blobExists && (flags & SQLITE_OPEN_CREATE)) {
             /* Create new page blob */
             if (p->ops && p->ops->page_blob_create) {
@@ -1498,14 +1960,24 @@ static int sqliteObjsOpen(sqlite3_vfs *pVfs, sqlite3_filename zName,
                     return azureErrToSqlite(arc, SQLITE_CANTOPEN);
                 }
             }
-            p->nData = 0;
-            /* Allocate initial buffer */
-            int rc = bufferEnsure(p, SQLITE_OBJS_INITIAL_ALLOC);
-            if (rc != SQLITE_OK) {
+            
+            /* Create cache file */
+            char *cacheTemplate2 = buildCacheTemplate(cacheDir);
+            if (!cacheTemplate2) {
                 sqlite3_free(p->zBlobName);
                 p->zBlobName = NULL;
-                return rc;
+                return SQLITE_NOMEM;
             }
+            p->cacheFd = mkstemp(cacheTemplate2);
+            if (p->cacheFd < 0) {
+                free(cacheTemplate2);
+                sqlite3_free(p->zBlobName);
+                p->zBlobName = NULL;
+                return SQLITE_CANTOPEN;
+            }
+            p->zCachePath = cacheTemplate2;  /* mkstemp modified it in place */
+            
+            p->nData = 0;
         } else if (!blobExists) {
             sqlite3_free(p->zBlobName);
             p->zBlobName = NULL;
@@ -1521,20 +1993,25 @@ static int sqliteObjsOpen(sqlite3_vfs *pVfs, sqlite3_filename zName,
         p->aJrnlData = NULL;
 
         /* R1: Track journal blob name and seed the cache from blob_exists check */
+        pthread_mutex_lock(&pVfsData->journalCacheMutex);
         sqliteObjsJournalCacheEntry *jce =
             journalCacheGetOrCreate(pVfsData, zName);
+        int cached_state = jce ? jce->state : -1;
+        pthread_mutex_unlock(&pVfsData->journalCacheMutex);
 
         /* R1: If cache says journal doesn't exist, skip the HEAD request.
         ** Only do a real HEAD when cache is unknown (-1) or says it exists (1).
         ** Since we are the single writer, cache=0 is authoritative. */
         int exists = 0;
-        if (jce && jce->state == 0) {
+        if (cached_state == 0) {
             exists = 0;  /* We deleted it — no HEAD needed */
         } else if (p->ops && p->ops->blob_exists) {
             azure_error_t aerr;
             azure_error_init(&aerr);
             p->ops->blob_exists(p->ops_ctx, zName, &exists, &aerr);
+            pthread_mutex_lock(&pVfsData->journalCacheMutex);
             if (jce) jce->state = exists ? 1 : 0;
+            pthread_mutex_unlock(&pVfsData->journalCacheMutex);
         }
 
         /* Check if journal blob already exists (crash recovery) */
@@ -1680,8 +2157,10 @@ static int sqliteObjsDelete(sqlite3_vfs *pVfs, const char *zName, int syncDir) {
         azure_err_t arc = ops->blob_delete(ops_ctx, zName, &aerr);
         if (arc == AZURE_ERR_NOT_FOUND) {
             /* R1: We know it doesn't exist now */
+            pthread_mutex_lock(&pVfsData->journalCacheMutex);
             sqliteObjsJournalCacheEntry *jce = journalCacheFind(pVfsData, zName);
             if (jce) jce->state = 0;
+            pthread_mutex_unlock(&pVfsData->journalCacheMutex);
             return SQLITE_OK;  /* Already gone — not an error */
         }
         if (arc != AZURE_OK) {
@@ -1690,8 +2169,10 @@ static int sqliteObjsDelete(sqlite3_vfs *pVfs, const char *zName, int syncDir) {
 
         /* R1: After successful delete, update journal cache */
         {
+            pthread_mutex_lock(&pVfsData->journalCacheMutex);
             sqliteObjsJournalCacheEntry *jce = journalCacheFind(pVfsData, zName);
             if (jce) jce->state = 0;
+            pthread_mutex_unlock(&pVfsData->journalCacheMutex);
         }
         return SQLITE_OK;
     }
@@ -1722,19 +2203,23 @@ static int sqliteObjsAccess(sqlite3_vfs *pVfs, const char *zName,
     void *ops_ctx;
     if (resolveOps(pVfsData, zName, &ops, &ops_ctx) && ops->blob_exists) {
         /* R1: Use cached journal existence when available */
+        pthread_mutex_lock(&pVfsData->journalCacheMutex);
         sqliteObjsJournalCacheEntry *jce = journalCacheFind(pVfsData, zName);
         if (jce && jce->state >= 0) {
+            int cached_result = jce->state;
+            pthread_mutex_unlock(&pVfsData->journalCacheMutex);
             switch (flags) {
                 case SQLITE_ACCESS_EXISTS:
                 case SQLITE_ACCESS_READWRITE:
                 case SQLITE_ACCESS_READ:
-                    *pResOut = jce->state;
+                    *pResOut = cached_result;
                     break;
                 default:
                     *pResOut = 0;
             }
             return SQLITE_OK;
         }
+        pthread_mutex_unlock(&pVfsData->journalCacheMutex);
 
         int exists = 0;
         azure_error_t aerr;
@@ -1747,11 +2232,13 @@ static int sqliteObjsAccess(sqlite3_vfs *pVfs, const char *zName,
 
         /* R1: Seed journal cache if this is a journal blob we haven't tracked yet.
         ** Detects journal names by "-journal" suffix (per D7). */
-        if (zName && !jce) {
+        if (zName) {
             size_t nlen = strlen(zName);
             if (nlen >= 8 && strcmp(zName + nlen - 8, "-journal") == 0) {
+                pthread_mutex_lock(&pVfsData->journalCacheMutex);
                 jce = journalCacheGetOrCreate(pVfsData, zName);
                 if (jce) jce->state = exists ? 1 : 0;
+                pthread_mutex_unlock(&pVfsData->journalCacheMutex);
             }
         }
 
@@ -1909,6 +2396,11 @@ int sqlite_objs_vfs_register_with_config(const sqlite_objs_config_t *config,
     memset(&g_vfsData, 0, sizeof(g_vfsData));
     g_vfsData.pDefaultVfs = pDefault;
 
+    /* Initialize journal cache mutex */
+    if (pthread_mutex_init(&g_vfsData.journalCacheMutex, NULL) != 0) {
+        return SQLITE_ERROR;
+    }
+
     if (config->ops) {
         /* Use caller-provided ops (test mode) */
         g_vfsData.ops = (azure_ops_t *)config->ops;
@@ -1995,6 +2487,11 @@ int sqlite_objs_vfs_register_uri(int makeDefault) {
     g_vfsData.ops = NULL;
     g_vfsData.ops_ctx = NULL;
     g_vfsData.client = NULL;
+
+    /* Initialize journal cache mutex */
+    if (pthread_mutex_init(&g_vfsData.journalCacheMutex, NULL) != 0) {
+        return SQLITE_ERROR;
+    }
 
     /* szOsFile must accommodate both our struct and the default VFS's struct */
     int ourSize = (int)sizeof(sqliteObjsFile);
