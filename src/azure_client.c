@@ -170,6 +170,7 @@ static size_t curl_header_cb(char *buffer, size_t size, size_t nitems,
     CAPTURE_HEADER("x-ms-lease-status", 17, h->lease_status)
     CAPTURE_HEADER("x-ms-request-id",   15, h->request_id)
     CAPTURE_HEADER("x-ms-error-code",   15, h->error_code)
+    CAPTURE_HEADER("etag",               4, h->etag)
 
     #undef CAPTURE_HEADER
 
@@ -535,6 +536,8 @@ static azure_err_t execute_single(
     curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_status);
     err->http_status = clamp_http_status(http_status);
     strncpy(err->request_id, rh->request_id, sizeof(err->request_id) - 1);
+    strncpy(err->etag, rh->etag, sizeof(err->etag) - 1);
+    err->etag[sizeof(err->etag) - 1] = '\0';
 
     if (http_status >= 400) {
         /* Parse error XML from response body */

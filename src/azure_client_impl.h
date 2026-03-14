@@ -72,6 +72,7 @@ typedef struct {
     char    lease_status[32];
     char    request_id[64];
     char    error_code[128];
+    char    etag[128];           /* ETag header value */
     int64_t content_length;
     int     lease_time;          /* x-ms-lease-time (break lease remaining) */
     int     retry_after;         /* Retry-After header in seconds (-1 = not present) */
