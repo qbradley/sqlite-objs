@@ -1,20 +1,23 @@
 # Makefile for sqlite-objs — SQLite VFS backed by Azure Blob Storage
 #
 # Targets:
-#   all              Build libsqlite_objs.a and sqlite-objs-shell (stub, no external deps)
-#   all-production   Build with real Azure client (requires libcurl + OpenSSL)
+#   all              Build everything: library, shell, benchmarks
+#   shell            Build just the shell binary
+#   benchmarks       Build speedtest1 benchmarks
+#   tpcc             Build TPC-C benchmarks
 #   test-unit        Build and run Layer 1 unit tests
 #   test-integration Build and run Layer 2 integration tests (requires Azurite)
 #   test             Run test-unit + test-integration
-#   clean            Remove build artifacts
-#   amalgamation     Produce single-file distribution (future)
+#   clean            Remove all build artifacts
 
 # ---------- Directories ----------
 
-SQLITE_DIR  = sqlite-autoconf-3520000
-SRC_DIR     = src
-TEST_DIR    = test
-BUILD_DIR   = build
+SQLITE_DIR    = sqlite-autoconf-3520000
+SRC_DIR       = src
+TEST_DIR      = test
+BENCH_DIR     = benchmark
+TPCC_DIR      = benchmark/tpcc
+BUILD_DIR     = build
 
 # ---------- Toolchain ----------
 
@@ -25,8 +28,6 @@ CFLAGS   += -DSQLITE_THREADSAFE=1
 CFLAGS   += -DSQLITE_ENABLE_FTS5
 CFLAGS   += -DSQLITE_ENABLE_JSON1
 # Expose POSIX declarations hidden by -std=c11.
-# macOS: _DARWIN_C_SOURCE exposes POSIX + BSD (u_int, flock, etc.)
-# Linux: _POSIX_C_SOURCE + _DEFAULT_SOURCE exposes POSIX + BSD compat
 UNAME_S := $(shell uname -s)
 ifeq ($(UNAME_S),Darwin)
 CFLAGS   += -D_DARWIN_C_SOURCE
@@ -34,46 +35,32 @@ else
 CFLAGS   += -D_POSIX_C_SOURCE=200809L -D_DEFAULT_SOURCE
 endif
 
-# Include paths: our src/ dir + SQLite source dir
 CFLAGS   += -I$(SRC_DIR) -I$(SQLITE_DIR)
 
-# Platform-specific linker flags
 ifeq ($(UNAME_S),Darwin)
     LDFLAGS  = -lpthread -lm
 else
     LDFLAGS  = -lpthread -ldl -lm
 endif
 
-# pkg-config support for production dependencies (OpenSSL + libcurl)
-# Falls back to hardcoded values if pkg-config is unavailable
+# External dependencies (libcurl + OpenSSL) via pkg-config
 PKG_CONFIG ?= pkg-config
 OPENSSL_CFLAGS  := $(shell $(PKG_CONFIG) --cflags openssl 2>/dev/null || echo "")
 OPENSSL_LDFLAGS := $(shell $(PKG_CONFIG) --libs openssl 2>/dev/null || echo "-lssl -lcrypto")
 CURL_CFLAGS     := $(shell $(PKG_CONFIG) --cflags libcurl 2>/dev/null || echo "")
 CURL_LDFLAGS    := $(shell $(PKG_CONFIG) --libs libcurl 2>/dev/null || echo "-lcurl")
 
-# Production CFLAGS and LDFLAGS
-CFLAGS_PROD  = $(CFLAGS) $(OPENSSL_CFLAGS) $(CURL_CFLAGS)
-LDFLAGS_PROD = $(LDFLAGS) $(CURL_LDFLAGS) $(OPENSSL_LDFLAGS)
+CFLAGS_ALL   = $(CFLAGS) $(OPENSSL_CFLAGS) $(CURL_CFLAGS)
+LDFLAGS_ALL  = $(LDFLAGS) $(CURL_LDFLAGS) $(OPENSSL_LDFLAGS)
 
-# Test-specific CFLAGS (suppress GNU extension warning in test harness)
+# Test-specific CFLAGS
 TEST_CFLAGS = $(CFLAGS) $(OPENSSL_CFLAGS) -I$(TEST_DIR)
 
-# ---------- Sources ----------
+# ---------- Core objects ----------
 
-SQLITE_SRC  = $(SQLITE_DIR)/sqlite3.c
 SQLITE_OBJ  = $(BUILD_DIR)/sqlite3.o
 
-VFS_SRCS    = $(SRC_DIR)/sqlite_objs_vfs.c \
-              $(SRC_DIR)/azure_client_stub.c
 VFS_OBJS    = $(BUILD_DIR)/sqlite_objs_vfs.o \
-              $(BUILD_DIR)/azure_client_stub.o
-
-PROD_SRCS   = $(SRC_DIR)/sqlite_objs_vfs.c \
-              $(SRC_DIR)/azure_client.c \
-              $(SRC_DIR)/azure_auth.c \
-              $(SRC_DIR)/azure_error.c
-PROD_OBJS   = $(BUILD_DIR)/sqlite_objs_vfs.o \
               $(BUILD_DIR)/azure_client.o \
               $(BUILD_DIR)/azure_auth.o \
               $(BUILD_DIR)/azure_error.o
@@ -81,128 +68,148 @@ PROD_OBJS   = $(BUILD_DIR)/sqlite_objs_vfs.o \
 LIB_OBJS    = $(SQLITE_OBJ) $(VFS_OBJS)
 LIBRARY      = $(BUILD_DIR)/libsqlite_objs.a
 
-PROD_LIB_OBJS = $(SQLITE_OBJ) $(PROD_OBJS)
-PROD_LIBRARY   = $(BUILD_DIR)/libsqlite_objs.a
-
-SHELL_SRC   = $(SRC_DIR)/sqlite_objs_shell.c
 SHELL_BIN   = sqlite-objs-shell
 
-# Test objects — tests link against mock + stub + auth + error modules
+# Unit test objects (stub client — no curl/OpenSSL needed for mocks)
 MOCK_OBJ    = $(BUILD_DIR)/mock_azure_ops.o
-TEST_OBJS   = $(SQLITE_OBJ) $(BUILD_DIR)/sqlite_objs_vfs.o $(BUILD_DIR)/azure_client_stub.o $(MOCK_OBJ) \
+TEST_OBJS   = $(SQLITE_OBJ) $(BUILD_DIR)/sqlite_objs_vfs.o \
+              $(BUILD_DIR)/azure_client_stub.o $(MOCK_OBJ) \
               $(BUILD_DIR)/azure_auth.o $(BUILD_DIR)/azure_error.o
+
+# Benchmark binaries
+SPEEDTEST1_BIN       = $(BENCH_DIR)/speedtest1
+SPEEDTEST1_AZURE_BIN = $(BENCH_DIR)/speedtest1-azure
+BENCHMARK_BIN        = $(BENCH_DIR)/benchmark
+
+# TPC-C binaries
+TPCC_LOCAL_BIN = $(TPCC_DIR)/tpcc-local
+TPCC_AZURE_BIN = $(TPCC_DIR)/tpcc-azure
+TPCC_BUILD     = $(TPCC_DIR)/build
+
+# TPC-C objects
+TPCC_LOCAL_OBJS = $(TPCC_BUILD)/tpcc_local.o \
+                  $(TPCC_BUILD)/tpcc_load_local.o \
+                  $(TPCC_BUILD)/tpcc_txn_local.o
+
+TPCC_AZURE_OBJS = $(TPCC_BUILD)/tpcc_azure.o \
+                  $(TPCC_BUILD)/tpcc_load_azure.o \
+                  $(TPCC_BUILD)/tpcc_txn_azure.o
 
 # ---------- Default target ----------
 
-.PHONY: all all-production clean test test-unit test-integration amalgamation \
-       sanitize coverage
+.PHONY: all shell benchmarks tpcc clean test test-unit test-integration \
+        sanitize coverage help
 
-all: $(LIBRARY) $(SHELL_BIN)
+all: $(LIBRARY) shell benchmarks tpcc
 
-# ---------- Build directory ----------
+# ---------- Build directories ----------
 
 $(BUILD_DIR):
 	@mkdir -p $(BUILD_DIR)
 
+$(TPCC_BUILD):
+	@mkdir -p $(TPCC_BUILD)
+
 # ---------- SQLite amalgamation ----------
 
-$(SQLITE_OBJ): $(SQLITE_SRC) | $(BUILD_DIR)
+$(SQLITE_OBJ): $(SQLITE_DIR)/sqlite3.c | $(BUILD_DIR)
 	$(CC) $(CFLAGS) -w -c -o $@ $<
 
-# ---------- VFS sources ----------
+# ---------- VFS + Azure client ----------
 
 $(BUILD_DIR)/sqlite_objs_vfs.o: $(SRC_DIR)/sqlite_objs_vfs.c $(SRC_DIR)/sqlite_objs.h $(SRC_DIR)/azure_client.h | $(BUILD_DIR)
-	$(CC) $(CFLAGS) -c -o $@ $<
+	$(CC) $(CFLAGS_ALL) -c -o $@ $<
 
+$(BUILD_DIR)/azure_client.o: $(SRC_DIR)/azure_client.c $(SRC_DIR)/azure_client_impl.h $(SRC_DIR)/azure_client.h | $(BUILD_DIR)
+	$(CC) $(CFLAGS_ALL) -c -o $@ $<
+
+$(BUILD_DIR)/azure_auth.o: $(SRC_DIR)/azure_auth.c $(SRC_DIR)/azure_client_impl.h $(SRC_DIR)/azure_client.h | $(BUILD_DIR)
+	$(CC) $(CFLAGS_ALL) -c -o $@ $<
+
+$(BUILD_DIR)/azure_error.o: $(SRC_DIR)/azure_error.c $(SRC_DIR)/azure_client_impl.h $(SRC_DIR)/azure_client.h | $(BUILD_DIR)
+	$(CC) $(CFLAGS_ALL) -c -o $@ $<
+
+# Stub client — only used by unit tests
 $(BUILD_DIR)/azure_client_stub.o: $(SRC_DIR)/azure_client_stub.c $(SRC_DIR)/azure_client.h | $(BUILD_DIR)
 	$(CC) $(CFLAGS) -c -o $@ $<
 
-# ---------- Production client sources ----------
-
-$(BUILD_DIR)/azure_client.o: $(SRC_DIR)/azure_client.c $(SRC_DIR)/azure_client_impl.h $(SRC_DIR)/azure_client.h | $(BUILD_DIR)
-	$(CC) $(CFLAGS_PROD) -c -o $@ $<
-
-$(BUILD_DIR)/azure_auth.o: $(SRC_DIR)/azure_auth.c $(SRC_DIR)/azure_client_impl.h $(SRC_DIR)/azure_client.h | $(BUILD_DIR)
-	$(CC) $(CFLAGS_PROD) -c -o $@ $<
-
-$(BUILD_DIR)/azure_error.o: $(SRC_DIR)/azure_error.c $(SRC_DIR)/azure_client_impl.h $(SRC_DIR)/azure_client.h | $(BUILD_DIR)
-	$(CC) $(CFLAGS_PROD) -c -o $@ $<
-
-# ---------- Static library (stub) ----------
+# ---------- Static library ----------
 
 $(LIBRARY): $(LIB_OBJS) | $(BUILD_DIR)
 	$(AR) rcs $@ $(LIB_OBJS)
 
-# ---------- Production build ----------
+# ---------- Shell ----------
 
-all-production: $(PROD_LIB_OBJS) $(SHELL_SRC) | $(BUILD_DIR)
-	$(AR) rcs $(PROD_LIBRARY) $(PROD_LIB_OBJS)
-	$(CC) $(CFLAGS_PROD) -w -I$(SRC_DIR) -I$(SQLITE_DIR) \
-		-DSQLITE_THREADSAFE=1 \
-		-o $(SHELL_BIN) $(SRC_DIR)/sqlite_objs_shell.c \
-		$(BUILD_DIR)/sqlite_objs_vfs.o \
-		$(BUILD_DIR)/azure_client.o \
-		$(BUILD_DIR)/azure_auth.o \
-		$(BUILD_DIR)/azure_error.o \
-		$(SQLITE_OBJ) \
-		$(LDFLAGS_PROD)
-
-# ---------- Shell binary ----------
-# The shell is compiled as a single translation unit that #includes shell.c.
-# We suppress warnings from the SQLite shell code with -w.
+shell: $(SHELL_BIN)
 
 $(SHELL_BIN): $(SRC_DIR)/sqlite_objs_shell.c $(LIBRARY)
-	$(CC) $(CFLAGS) -w -I$(SRC_DIR) -I$(SQLITE_DIR) \
-		-DSQLITE_THREADSAFE=1 \
-		-o $@ $(SRC_DIR)/sqlite_objs_shell.c \
-		$(BUILD_DIR)/sqlite_objs_vfs.o \
-		$(BUILD_DIR)/azure_client_stub.o \
-		$(SQLITE_OBJ) \
-		$(LDFLAGS)
+	$(CC) $(CFLAGS_ALL) -w -DSQLITE_THREADSAFE=1 \
+		-o $@ $< $(LIB_OBJS) $(LDFLAGS_ALL)
 
-# ---------- Mock object (for tests) ----------
+# ---------- Benchmarks (speedtest1) ----------
+
+benchmarks: $(BENCHMARK_BIN) $(SPEEDTEST1_BIN) $(SPEEDTEST1_AZURE_BIN)
+
+$(BENCHMARK_BIN): $(BENCH_DIR)/benchmark.c
+	$(CC) $(CFLAGS) -I$(BENCH_DIR) -o $@ $<
+
+$(SPEEDTEST1_BIN): $(BENCH_DIR)/speedtest1.c $(SQLITE_OBJ)
+	$(CC) $(CFLAGS) -w -o $@ $< $(SQLITE_OBJ) $(LDFLAGS)
+
+$(SPEEDTEST1_AZURE_BIN): $(BENCH_DIR)/speedtest1_wrapper.c $(BENCH_DIR)/speedtest1.c $(LIBRARY)
+	$(CC) $(CFLAGS_ALL) -w -I$(BENCH_DIR) -o $@ $< $(LIB_OBJS) $(LDFLAGS_ALL)
+
+# ---------- TPC-C ----------
+
+tpcc: $(TPCC_LOCAL_BIN) $(TPCC_AZURE_BIN)
+
+$(TPCC_LOCAL_BIN): $(TPCC_LOCAL_OBJS) $(SQLITE_OBJ)
+	$(CC) $(CFLAGS) -o $@ $(TPCC_LOCAL_OBJS) $(SQLITE_OBJ) $(LDFLAGS)
+
+$(TPCC_AZURE_BIN): $(TPCC_AZURE_OBJS) $(SQLITE_OBJ) $(VFS_OBJS)
+	$(CC) $(CFLAGS_ALL) -DSQLITE_OBJS_VFS_AVAILABLE \
+		-o $@ $(TPCC_AZURE_OBJS) $(SQLITE_OBJ) $(VFS_OBJS) $(LDFLAGS_ALL)
+
+$(TPCC_BUILD)/%_local.o: $(TPCC_DIR)/%.c $(TPCC_DIR)/tpcc_schema.h | $(TPCC_BUILD)
+	$(CC) $(CFLAGS) -I$(TPCC_DIR) -c -o $@ $<
+
+$(TPCC_BUILD)/%_azure.o: $(TPCC_DIR)/%.c $(TPCC_DIR)/tpcc_schema.h | $(TPCC_BUILD)
+	$(CC) $(CFLAGS_ALL) -I$(TPCC_DIR) -DSQLITE_OBJS_VFS_AVAILABLE -c -o $@ $<
+
+# ---------- Mock object (for unit tests) ----------
 
 $(MOCK_OBJ): $(TEST_DIR)/mock_azure_ops.c $(TEST_DIR)/mock_azure_ops.h $(SRC_DIR)/azure_client.h | $(BUILD_DIR)
 	$(CC) $(TEST_CFLAGS) -c -o $@ $<
 
 # ---------- Tests ----------
 
-# Layer 1: Unit tests (C mocks, no network)
-# test_main.c #includes test_vfs.c and test_azure_client.c directly,
-# so we build only test_main and link against mock + VFS (not stub).
 test-unit: $(BUILD_DIR)/test_main
 	@echo "=== Running unit tests ==="
 	$(BUILD_DIR)/test_main
 	@echo "=== All unit tests passed ==="
 
 $(BUILD_DIR)/test_main: $(TEST_DIR)/test_main.c $(TEST_DIR)/test_vfs.c $(TEST_DIR)/test_azure_client.c $(TEST_DIR)/test_coalesce.c $(TEST_DIR)/test_wal.c $(TEST_DIR)/test_uri.c $(TEST_DIR)/mock_azure_ops.h $(TEST_DIR)/test_harness.h $(TEST_OBJS) | $(BUILD_DIR)
-	$(CC) $(TEST_CFLAGS) -DENABLE_VFS_INTEGRATION -DENABLE_WAL_TESTS -DENABLE_AZURE_CLIENT_TESTS -o $@ $(TEST_DIR)/test_main.c $(TEST_OBJS) $(LDFLAGS) $(OPENSSL_LDFLAGS)
+	$(CC) $(TEST_CFLAGS) -DENABLE_VFS_INTEGRATION -DENABLE_WAL_TESTS -DENABLE_AZURE_CLIENT_TESTS \
+		-o $@ $(TEST_DIR)/test_main.c $(TEST_OBJS) $(LDFLAGS) $(OPENSSL_LDFLAGS)
 
-# Layer 2: Integration tests (requires Azurite)
-# These tests link against the REAL azure_client.c (not stubs/mocks)
-# and require Azurite to be running.
 test-integration: $(BUILD_DIR)/test_integration
 	@echo "=== Running integration tests (requires Azurite) ==="
 	@./test/run-integration.sh
 
-# Build the integration test binary
-# Links against: SQLite + VFS + REAL Azure client (with libcurl + OpenSSL)
-$(BUILD_DIR)/test_integration: $(TEST_DIR)/test_integration.c $(TEST_DIR)/test_harness.h $(PROD_LIB_OBJS) | $(BUILD_DIR)
-	$(CC) $(TEST_CFLAGS) -o $@ $(TEST_DIR)/test_integration.c $(PROD_LIB_OBJS) $(LDFLAGS_PROD)
+$(BUILD_DIR)/test_integration: $(TEST_DIR)/test_integration.c $(TEST_DIR)/test_harness.h $(LIB_OBJS) | $(BUILD_DIR)
+	$(CC) $(TEST_CFLAGS) -o $@ $< $(LIB_OBJS) $(LDFLAGS_ALL)
 
-# Both layers
 test: test-unit test-integration
 
 # ---------- Clean ----------
 
 clean:
-	rm -rf $(BUILD_DIR)
+	rm -rf $(BUILD_DIR) $(TPCC_BUILD)
 	rm -f $(SHELL_BIN)
+	rm -f $(BENCHMARK_BIN) $(SPEEDTEST1_BIN) $(SPEEDTEST1_AZURE_BIN)
+	rm -f $(TPCC_LOCAL_BIN) $(TPCC_AZURE_BIN)
 
 # ---------- Sanitizer build ----------
-# Build and run unit tests with AddressSanitizer + UndefinedBehaviorSanitizer.
-# Catches: buffer overflows, use-after-free, memory leaks, signed integer
-# overflow, null-pointer dereference, and other undefined behavior.
 
 SANITIZE_CFLAGS  = -fsanitize=address,undefined -fno-omit-frame-pointer -O1 -g \
                    -fno-sanitize-recover=all
@@ -216,9 +223,6 @@ sanitize: clean
 	@echo "=== Sanitizer tests passed ==="
 
 # ---------- Coverage build ----------
-# Build and run unit tests with code coverage instrumentation.
-# Produces an HTML report in $(BUILD_DIR)/coverage-report/.
-# Requires: gcov (ships with gcc), lcov, genhtml (install via package manager).
 
 coverage: clean
 	@echo "=== Building with coverage instrumentation ==="
@@ -235,8 +239,17 @@ coverage: clean
 		--rc branch_coverage=1 --quiet
 	@echo "=== Coverage report: $(BUILD_DIR)/coverage-report/index.html ==="
 
-# ---------- Amalgamation (future) ----------
+# ---------- Help ----------
 
-amalgamation:
-	@echo "Amalgamation target is planned for post-MVP 1."
-	@echo "It will produce sqlite_objs.c + sqlite_objs.h as single-file distribution."
+help:
+	@echo "sqlite-objs Build Targets:"
+	@echo "  all              Build everything (library, shell, benchmarks, tpcc)"
+	@echo "  shell            Build the sqlite-objs shell"
+	@echo "  benchmarks       Build speedtest1 benchmarks"
+	@echo "  tpcc             Build TPC-C benchmarks (local + azure)"
+	@echo "  test-unit        Run unit tests"
+	@echo "  test-integration Run integration tests (requires Azurite)"
+	@echo "  test             Run all tests"
+	@echo "  sanitize         Run unit tests with ASan + UBSan"
+	@echo "  coverage         Generate code coverage report"
+	@echo "  clean            Remove all build artifacts"
