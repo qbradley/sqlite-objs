@@ -1023,6 +1023,292 @@ TEST(wal_large_upload_after_restart) {
     wal_close_db(db);
 }
 
+
+/* ══════════════════════════════════════════════════════════════════
+** Suite: WAL Mode — Parallel Upload
+**
+** Tests the parallel WAL upload path (Put Block + Put Block List)
+** toggled via PRAGMA sqlite_objs_wal_parallel.
+** ══════════════════════════════════════════════════════════════════ */
+
+/*
+** Helper: enable parallel WAL upload via PRAGMA on an open DB.
+** Returns SQLITE_OK on success.
+*/
+static int wal_enable_parallel(sqlite3 *db) {
+    return wal_exec(db, "PRAGMA sqlite_objs_wal_parallel=ON;");
+}
+
+/*
+** Helper: set WAL chunk size via PRAGMA.
+*/
+static int wal_set_chunk_size(sqlite3 *db, int chunk_size) {
+    char sql[64];
+    int n = snprintf(sql, sizeof(sql),
+                     "PRAGMA sqlite_objs_wal_chunk_size=%d;", chunk_size);
+    if (n < 0 || (size_t)n >= sizeof(sql)) return SQLITE_ERROR;
+    return wal_exec(db, sql);
+}
+
+/*
+** Test 19: PRAGMA sqlite_objs_wal_parallel toggles correctly.
+*/
+TEST(wal_parallel_pragma_toggle) {
+    wal_setup();
+
+    sqlite3 *db = wal_open_db(wal_base_ops, wal_ctx, "walpar_toggle.db");
+    ASSERT_NOT_NULL(db);
+
+    /* Default: OFF */
+    sqlite3_stmt *stmt = NULL;
+    int rc = sqlite3_prepare_v2(db,
+        "PRAGMA sqlite_objs_wal_parallel;", -1, &stmt, NULL);
+    ASSERT_OK(rc);
+    rc = sqlite3_step(stmt);
+    ASSERT_EQ(rc, SQLITE_ROW);
+    ASSERT_STR_EQ((const char *)sqlite3_column_text(stmt, 0), "off");
+    rc = sqlite3_finalize(stmt);
+    ASSERT_OK(rc);
+
+    /* Enable */
+    rc = wal_enable_parallel(db);
+    ASSERT_OK(rc);
+
+    /* Verify ON */
+    rc = sqlite3_prepare_v2(db,
+        "PRAGMA sqlite_objs_wal_parallel;", -1, &stmt, NULL);
+    ASSERT_OK(rc);
+    rc = sqlite3_step(stmt);
+    ASSERT_EQ(rc, SQLITE_ROW);
+    ASSERT_STR_EQ((const char *)sqlite3_column_text(stmt, 0), "on");
+    rc = sqlite3_finalize(stmt);
+    ASSERT_OK(rc);
+
+    /* Disable */
+    rc = wal_exec(db, "PRAGMA sqlite_objs_wal_parallel=OFF;");
+    ASSERT_OK(rc);
+
+    rc = sqlite3_prepare_v2(db,
+        "PRAGMA sqlite_objs_wal_parallel;", -1, &stmt, NULL);
+    ASSERT_OK(rc);
+    rc = sqlite3_step(stmt);
+    ASSERT_EQ(rc, SQLITE_ROW);
+    ASSERT_STR_EQ((const char *)sqlite3_column_text(stmt, 0), "off");
+    rc = sqlite3_finalize(stmt);
+    ASSERT_OK(rc);
+
+    wal_close_db(db);
+}
+
+/*
+** Test 20: Parallel WAL upload writes data correctly.
+** With parallel enabled, WAL sync should call block_blob_upload_parallel
+** and the data should be stored identically to the single-PUT path.
+*/
+TEST(wal_parallel_upload_basic) {
+    wal_setup();
+
+    sqlite3 *db = wal_open_db(wal_base_ops, wal_ctx, "walpar_basic.db");
+    ASSERT_NOT_NULL(db);
+
+    /* Enable parallel before any writes */
+    int rc = wal_enable_parallel(db);
+    ASSERT_OK(rc);
+
+    rc = wal_exec(db, "CREATE TABLE t(id INTEGER PRIMARY KEY, val TEXT);");
+    ASSERT_OK(rc);
+
+    mock_reset_call_counts(wal_ctx);
+
+    rc = wal_exec(db, "INSERT INTO t VALUES(1, 'parallel-test');");
+    ASSERT_OK(rc);
+
+    /* Verify parallel upload was called */
+    int par_count = mock_get_call_count(wal_ctx,
+                                         "block_blob_upload_parallel");
+    ASSERT_GT(par_count, 0);
+
+    /* Verify the WAL blob exists */
+    int exists = 0;
+    azure_error_t aerr;
+    azure_error_init(&aerr);
+    azure_err_t arc = wal_base_ops->blob_exists(wal_ctx,
+        "walpar_basic.db-wal", &exists, &aerr);
+    ASSERT_AZURE_OK(arc);
+    ASSERT_TRUE(exists);
+
+    /* Verify data is readable */
+    sqlite3_stmt *stmt = NULL;
+    rc = sqlite3_prepare_v2(db, "SELECT val FROM t WHERE id=1;",
+                             -1, &stmt, NULL);
+    ASSERT_OK(rc);
+    rc = sqlite3_step(stmt);
+    ASSERT_EQ(rc, SQLITE_ROW);
+    ASSERT_STR_EQ((const char *)sqlite3_column_text(stmt, 0),
+                  "parallel-test");
+    rc = sqlite3_finalize(stmt);
+    ASSERT_OK(rc);
+
+    wal_close_db(db);
+}
+
+/*
+** Test 21: Parallel upload with custom chunk size.
+** Uses a small chunk size to ensure actual chunking occurs.
+*/
+TEST(wal_parallel_custom_chunk_size) {
+    wal_setup();
+
+    sqlite3 *db = wal_open_db(wal_base_ops, wal_ctx, "walpar_chunk.db");
+    ASSERT_NOT_NULL(db);
+
+    /* Enable parallel with small chunk size */
+    int rc = wal_enable_parallel(db);
+    ASSERT_OK(rc);
+    rc = wal_set_chunk_size(db, 4096);  /* 4 KiB chunks */
+    ASSERT_OK(rc);
+
+    /* Verify chunk size was set */
+    sqlite3_stmt *stmt = NULL;
+    rc = sqlite3_prepare_v2(db,
+        "PRAGMA sqlite_objs_wal_chunk_size;", -1, &stmt, NULL);
+    ASSERT_OK(rc);
+    rc = sqlite3_step(stmt);
+    ASSERT_EQ(rc, SQLITE_ROW);
+    ASSERT_EQ(sqlite3_column_int(stmt, 0), 4096);
+    rc = sqlite3_finalize(stmt);
+    ASSERT_OK(rc);
+
+    rc = wal_exec(db, "CREATE TABLE t(id INTEGER PRIMARY KEY, val TEXT);");
+    ASSERT_OK(rc);
+
+    mock_reset_call_counts(wal_ctx);
+
+    /* Insert data to generate WAL content */
+    for (int i = 0; i < 20; i++) {
+        char sql[128];
+        int n = snprintf(sql, sizeof(sql),
+                         "INSERT INTO t VALUES(%d, 'chunk-test-%d');", i, i);
+        ASSERT_TRUE(n > 0 && (size_t)n < sizeof(sql));
+        rc = wal_exec(db, sql);
+        ASSERT_OK(rc);
+    }
+
+    /* Verify parallel upload was used */
+    int par_count = mock_get_call_count(wal_ctx,
+                                         "block_blob_upload_parallel");
+    ASSERT_GT(par_count, 0);
+
+    /* Verify all data readable */
+    rc = sqlite3_prepare_v2(db, "SELECT COUNT(*) FROM t;",
+                             -1, &stmt, NULL);
+    ASSERT_OK(rc);
+    rc = sqlite3_step(stmt);
+    ASSERT_EQ(rc, SQLITE_ROW);
+    ASSERT_EQ(sqlite3_column_int(stmt, 0), 20);
+    rc = sqlite3_finalize(stmt);
+    ASSERT_OK(rc);
+
+    wal_close_db(db);
+}
+
+/*
+** Test 22: Parallel upload round-trip (write → checkpoint → close → reopen).
+** Data written via parallel path must survive the full lifecycle.
+*/
+TEST(wal_parallel_roundtrip) {
+    wal_setup();
+
+    /* Phase 1: Write with parallel upload */
+    sqlite3 *db = wal_open_db(wal_base_ops, wal_ctx, "walpar_rt.db");
+    ASSERT_NOT_NULL(db);
+
+    int rc = wal_enable_parallel(db);
+    ASSERT_OK(rc);
+
+    rc = wal_exec(db, "CREATE TABLE t(id INTEGER PRIMARY KEY, val TEXT);");
+    ASSERT_OK(rc);
+    rc = wal_exec(db, "INSERT INTO t VALUES(1, 'parallel-persist');");
+    ASSERT_OK(rc);
+    rc = wal_exec(db, "INSERT INTO t VALUES(2, 'parallel-persist-2');");
+    ASSERT_OK(rc);
+
+    /* Checkpoint to flush to page blob */
+    rc = wal_exec(db, "PRAGMA wal_checkpoint(TRUNCATE);");
+    ASSERT_OK(rc);
+
+    wal_close_db(db);
+    db = NULL;
+
+    /* Phase 2: Reopen without parallel — verify data persists */
+    rc = sqlite_objs_vfs_register_with_ops(wal_base_ops, wal_ctx, 0);
+    ASSERT_OK(rc);
+
+    rc = sqlite3_open_v2("walpar_rt.db", &db,
+                          SQLITE_OPEN_READWRITE, "sqlite-objs");
+    ASSERT_OK(rc);
+    ASSERT_NOT_NULL(db);
+
+    rc = wal_exec(db, "PRAGMA locking_mode=EXCLUSIVE;");
+    ASSERT_OK(rc);
+
+    sqlite3_stmt *stmt = NULL;
+    rc = sqlite3_prepare_v2(db, "SELECT val FROM t ORDER BY id;",
+                             -1, &stmt, NULL);
+    ASSERT_OK(rc);
+
+    rc = sqlite3_step(stmt);
+    ASSERT_EQ(rc, SQLITE_ROW);
+    ASSERT_STR_EQ((const char *)sqlite3_column_text(stmt, 0),
+                  "parallel-persist");
+
+    rc = sqlite3_step(stmt);
+    ASSERT_EQ(rc, SQLITE_ROW);
+    ASSERT_STR_EQ((const char *)sqlite3_column_text(stmt, 0),
+                  "parallel-persist-2");
+
+    rc = sqlite3_step(stmt);
+    ASSERT_EQ(rc, SQLITE_DONE);
+
+    rc = sqlite3_finalize(stmt);
+    ASSERT_OK(rc);
+
+    wal_close_db(db);
+}
+
+/*
+** Test 23: Parallel upload error propagation.
+** If block_blob_upload_parallel fails, xSync should fail.
+*/
+TEST(wal_parallel_upload_failure) {
+    wal_setup();
+
+    sqlite3 *db = wal_open_db(wal_base_ops, wal_ctx, "walpar_fail.db");
+    ASSERT_NOT_NULL(db);
+
+    int rc = wal_enable_parallel(db);
+    ASSERT_OK(rc);
+
+    rc = wal_exec(db, "CREATE TABLE t(id INTEGER PRIMARY KEY, val TEXT);");
+    ASSERT_OK(rc);
+
+    /* Inject failure on parallel upload */
+    mock_set_fail_operation(wal_ctx, "block_blob_upload_parallel",
+                            AZURE_ERR_IO);
+
+    char *err_msg = NULL;
+    rc = sqlite3_exec(db, "INSERT INTO t VALUES(1, 'should-fail');",
+                       NULL, NULL, &err_msg);
+    ASSERT_NE(rc, SQLITE_OK);
+    if (err_msg) {
+        fprintf(stderr, "    Expected failure: %s\n", err_msg);
+        sqlite3_free(err_msg);
+    }
+
+    mock_clear_failures(wal_ctx);
+    wal_close_db(db);
+}
+
 #endif /* ENABLE_WAL_TESTS */
 
 
@@ -1073,6 +1359,14 @@ void run_wal_tests(void) {
     RUN_TEST(wal_restart_after_checkpoint);
     RUN_TEST(wal_large_upload);
     RUN_TEST(wal_large_upload_after_restart);
+    TEST_SUITE_END();
+
+    TEST_SUITE_BEGIN("WAL Mode \xe2\x80\x94 Parallel Upload");
+    RUN_TEST(wal_parallel_pragma_toggle);
+    RUN_TEST(wal_parallel_upload_basic);
+    RUN_TEST(wal_parallel_custom_chunk_size);
+    RUN_TEST(wal_parallel_roundtrip);
+    RUN_TEST(wal_parallel_upload_failure);
     TEST_SUITE_END();
 
     /* Cleanup */

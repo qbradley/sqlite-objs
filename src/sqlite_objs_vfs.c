@@ -101,6 +101,7 @@ static int sqliteObjsShmUnmap(sqlite3_file*, int);
 #define SQLITE_OBJS_DIRTY_PAGE_THRESHOLD 100   /* dirty pages triggering extended lease */
 #define SQLITE_OBJS_MAX_PATHNAME       512
 #define SQLITE_OBJS_INITIAL_ALLOC      (64*1024)  /* 64 KiB initial buffer */
+#define SQLITE_OBJS_WAL_DEFAULT_CHUNK  (1024*1024)  /* 1 MiB default chunk */
 
 /* ---------- Types ---------- */
 
@@ -186,6 +187,10 @@ struct sqliteObjsVfsData {
     void *ops_ctx;                      /* Context for ops */
     azure_client_t *client;             /* Production client (may be NULL for tests) */
     char lastError[256];                /* Last error message for xGetLastError */
+
+    /* WAL parallel upload config (set via PRAGMA sqlite_objs_wal_parallel) */
+    int walParallelUpload;              /* 1 = use parallel Put Block path */
+    int walChunkSize;                   /* Chunk size in bytes (0 = default) */
 
     /* R1: Per-journal blob existence cache (one entry per database).
     ** Since we are the single writer, we know when a journal blob exists
@@ -950,7 +955,7 @@ static int sqliteObjsSync(sqlite3_file *pFile, int flags) {
     (void)flags;
 
     if (p->eFileType == SQLITE_OPEN_WAL) {
-        /* WAL sync — upload entire WAL as block blob (single PUT) */
+        /* WAL sync — upload entire WAL as block blob */
         if (p->nWalData <= 0) {
             return SQLITE_OK;  /* Nothing to sync */
         }
@@ -963,14 +968,39 @@ static int sqliteObjsSync(sqlite3_file *pFile, int flags) {
         if (sqlite_objs_debug_timing()) t0 = sqlite_objs_time_ms();
 
         azure_error_init(&aerr);
-        azure_err_t arc = p->ops->block_blob_upload(
-            p->ops_ctx, p->zBlobName,
-            p->aWalData, (size_t)p->nWalData, &aerr);
+        azure_err_t arc;
 
-        if (sqlite_objs_debug_timing()) {
-            double elapsed = sqlite_objs_time_ms() - t0;
-            fprintf(stderr, "[TIMING] xSync(wal): %.1fms (%lld bytes, blob=%s)\n",
-                    elapsed, (long long)p->nWalData, p->zBlobName);
+        if (p->pVfsData && p->pVfsData->walParallelUpload &&
+            p->ops->block_blob_upload_parallel) {
+            /* Parallel path: Put Block + Put Block List */
+            int chunkSz = (p->pVfsData->walChunkSize > 0)
+                        ? p->pVfsData->walChunkSize
+                        : SQLITE_OBJS_WAL_DEFAULT_CHUNK;
+            arc = p->ops->block_blob_upload_parallel(
+                p->ops_ctx, p->zBlobName,
+                p->aWalData, (size_t)p->nWalData,
+                (size_t)chunkSz, &aerr);
+
+            if (sqlite_objs_debug_timing()) {
+                double elapsed = sqlite_objs_time_ms() - t0;
+                int nChunks = ((int)p->nWalData + chunkSz - 1) / chunkSz;
+                fprintf(stderr, "[TIMING] xSync(wal-parallel): %.1fms "
+                        "(%lld bytes, chunks=%d, chunk_size=%d, blob=%s)\n",
+                        elapsed, (long long)p->nWalData, nChunks,
+                        chunkSz, p->zBlobName);
+            }
+        } else {
+            /* Single PUT path */
+            arc = p->ops->block_blob_upload(
+                p->ops_ctx, p->zBlobName,
+                p->aWalData, (size_t)p->nWalData, &aerr);
+
+            if (sqlite_objs_debug_timing()) {
+                double elapsed = sqlite_objs_time_ms() - t0;
+                fprintf(stderr, "[TIMING] xSync(wal): %.1fms "
+                        "(%lld bytes, blob=%s)\n",
+                        elapsed, (long long)p->nWalData, p->zBlobName);
+            }
         }
 
         if (arc != AZURE_OK) {
@@ -1380,6 +1410,38 @@ static int sqliteObjsFileControl(sqlite3_file *pFile, int op, void *pArg) {
                     ** return SQLITE_IOERR and fail safely. */
                     return SQLITE_NOTFOUND;
                 }
+            }
+            /* PRAGMA sqlite_objs_wal_parallel = ON|OFF|1|0 */
+            if (aArg[1] && sqlite3_stricmp(aArg[1],
+                    "sqlite_objs_wal_parallel") == 0) {
+                sqliteObjsFile *p = (sqliteObjsFile *)pFile;
+                if (aArg[2]) {
+                    /* SET: enable/disable parallel WAL upload */
+                    int val = (sqlite3_stricmp(aArg[2], "on") == 0 ||
+                               sqlite3_stricmp(aArg[2], "1") == 0);
+                    if (p->pVfsData) p->pVfsData->walParallelUpload = val;
+                    aArg[0] = sqlite3_mprintf(val ? "on" : "off");
+                } else {
+                    /* GET: query current setting */
+                    int val = p->pVfsData ? p->pVfsData->walParallelUpload : 0;
+                    aArg[0] = sqlite3_mprintf(val ? "on" : "off");
+                }
+                return SQLITE_OK;
+            }
+            /* PRAGMA sqlite_objs_wal_chunk_size = <bytes> */
+            if (aArg[1] && sqlite3_stricmp(aArg[1],
+                    "sqlite_objs_wal_chunk_size") == 0) {
+                sqliteObjsFile *p = (sqliteObjsFile *)pFile;
+                if (aArg[2]) {
+                    int val = atoi(aArg[2]);
+                    if (val < 0) val = 0;
+                    if (p->pVfsData) p->pVfsData->walChunkSize = val;
+                    aArg[0] = sqlite3_mprintf("%d", val);
+                } else {
+                    int val = p->pVfsData ? p->pVfsData->walChunkSize : 0;
+                    aArg[0] = sqlite3_mprintf("%d", val);
+                }
+                return SQLITE_OK;
             }
             return SQLITE_NOTFOUND;
         }

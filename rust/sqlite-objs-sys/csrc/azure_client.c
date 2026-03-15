@@ -399,6 +399,12 @@ static azure_err_t execute_single(
     curl_easy_reset(curl);
     curl_easy_setopt(curl, CURLOPT_URL, url);
 
+    /* Negotiate HTTP/2 over TLS (ALPN), fall back to HTTP/1.1 if unsupported.
+     * Azure Blob Storage supports HTTP/2; this enables multiplexing for
+     * concurrent requests on the same connection.  If libcurl was built
+     * without nghttp2, this silently falls back to HTTP/1.1. */
+    curl_easy_setopt(curl, CURLOPT_HTTP_VERSION, CURL_HTTP_VERSION_2TLS);
+
     /* HTTP method */
     if (strcmp(method, "PUT") == 0) {
         curl_easy_setopt(curl, CURLOPT_CUSTOMREQUEST, "PUT");
@@ -889,6 +895,485 @@ static azure_err_t az_block_blob_download(void *ctx, const char *name,
 }
 
 /* ================================================================
+ * BLOCK BLOB PARALLEL UPLOAD — Put Block + Put Block List
+ *
+ * Splits data into chunks, uploads each via curl_multi Put Block,
+ * then commits with a single Put Block List call.  Falls back to
+ * single-PUT block_blob_upload for small payloads (< 256 KiB).
+ *
+ * Block IDs: "block-NNNN" base64-encoded, all same length.
+ * Retry: failed chunks retried up to 3 times with backoff.
+ * ================================================================ */
+
+#define BLOCK_UPLOAD_MIN_PARALLEL_SIZE (256 * 1024)  /* 256 KiB threshold */
+#define BLOCK_UPLOAD_MAX_RETRIES       3
+
+/* Forward declaration — defined in batch write section */
+static CURLM *ensure_multi_handle(azure_client_t *c);
+
+/* Per-chunk request context for Put Block */
+typedef struct {
+    CURL                     *easy;
+    struct curl_slist        *hdrs;
+    azure_buffer_t            resp_body;
+    azure_response_headers_t  resp_hdrs;
+    int                       chunk_idx;
+} block_req_t;
+
+/* Free all resources owned by a block request */
+static void block_req_free(block_req_t *req)
+{
+    if (req->easy) {
+        curl_easy_cleanup(req->easy);
+        req->easy = NULL;
+    }
+    if (req->hdrs) {
+        curl_slist_free_all(req->hdrs);
+        req->hdrs = NULL;
+    }
+    azure_buffer_free(&req->resp_body);
+}
+
+/*
+ * Generate a base64-encoded block ID for the given chunk index.
+ * All IDs have the same raw length ("block-NNNN" = 10 chars)
+ * so base64 output is always the same length.
+ */
+static int block_make_id(int chunk_idx, char *b64_out, size_t b64_out_size)
+{
+    char raw[16];
+    snprintf(raw, sizeof(raw), "block-%04d", chunk_idx);
+    return azure_base64_encode((const uint8_t *)raw, strlen(raw),
+                               b64_out, b64_out_size);
+}
+
+/*
+ * Configure one CURL easy handle for a Put Block request.
+ */
+static azure_err_t block_init_easy(
+    azure_client_t *c,
+    const char *url,
+    const char *blob_name,
+    const char *query_params,  /* "comp=block&blockid=XXX" */
+    const uint8_t *chunk_data,
+    size_t chunk_len,
+    block_req_t *req)
+{
+    req->easy = curl_easy_init();
+    if (!req->easy) return AZURE_ERR_NETWORK;
+
+    req->hdrs = NULL;
+    azure_buffer_init(&req->resp_body);
+    memset(&req->resp_hdrs, 0, sizeof(req->resp_hdrs));
+    req->resp_hdrs.retry_after = -1;
+
+    curl_easy_setopt(req->easy, CURLOPT_URL, url);
+    curl_easy_setopt(req->easy, CURLOPT_CUSTOMREQUEST, "PUT");
+
+    /* Body */
+    curl_easy_setopt(req->easy, CURLOPT_POSTFIELDS, chunk_data);
+    curl_easy_setopt(req->easy, CURLOPT_POSTFIELDSIZE_LARGE,
+                     (curl_off_t)chunk_len);
+
+    /* Timestamp */
+    char date_buf[64];
+    azure_rfc1123_time(date_buf, sizeof(date_buf));
+
+    /* SharedKey auth signing */
+    char auth_hdr[512] = "";
+    if (!c->use_sas) {
+        char h_date[128], h_ver[64];
+        snprintf(h_date, sizeof(h_date), "x-ms-date:%s", date_buf);
+        snprintf(h_ver, sizeof(h_ver), "x-ms-version:%s", AZURE_API_VERSION);
+
+        const char *xms[4];
+        int n = 0;
+        xms[n++] = h_date;
+        xms[n++] = h_ver;
+        xms[n] = NULL;
+
+        char path[1024];
+        if (c->endpoint[0]) {
+            snprintf(path, sizeof(path), "/%s/%s/%s",
+                     c->account, c->container, blob_name);
+        } else {
+            snprintf(path, sizeof(path), "/%s/%s",
+                     c->container, blob_name);
+        }
+
+        char cl_str[32];
+        snprintf(cl_str, sizeof(cl_str), "%zu", chunk_len);
+
+        azure_err_t rc = azure_auth_sign_request(
+            c, "PUT", path, query_params,
+            cl_str, "application/octet-stream", "",
+            (const char *const *)xms,
+            auth_hdr, sizeof(auth_hdr));
+        if (rc != AZURE_OK) {
+            curl_easy_cleanup(req->easy);
+            req->easy = NULL;
+            return rc;
+        }
+    }
+
+    /* HTTP headers */
+    char h[600];
+    struct curl_slist *list = NULL;
+
+    snprintf(h, sizeof(h), "x-ms-date: %s", date_buf);
+    SLIST_APPEND(list, h);
+
+    snprintf(h, sizeof(h), "x-ms-version: %s", AZURE_API_VERSION);
+    SLIST_APPEND(list, h);
+
+    snprintf(h, sizeof(h), "Content-Length: %zu", chunk_len);
+    SLIST_APPEND(list, h);
+
+    SLIST_APPEND(list, "Content-Type: application/octet-stream");
+
+    if (auth_hdr[0]) {
+        snprintf(h, sizeof(h), "Authorization: %s", auth_hdr);
+        SLIST_APPEND(list, h);
+    }
+
+    req->hdrs = list;
+    curl_easy_setopt(req->easy, CURLOPT_HTTPHEADER, req->hdrs);
+
+    /* Response callbacks */
+    curl_easy_setopt(req->easy, CURLOPT_WRITEFUNCTION, curl_write_cb);
+    curl_easy_setopt(req->easy, CURLOPT_WRITEDATA, &req->resp_body);
+    curl_easy_setopt(req->easy, CURLOPT_HEADERFUNCTION, curl_header_cb);
+    curl_easy_setopt(req->easy, CURLOPT_HEADERDATA, &req->resp_hdrs);
+
+    /* Timeouts and keep-alive (match execute_single settings) */
+    curl_easy_setopt(req->easy, CURLOPT_TIMEOUT, 60L);
+    curl_easy_setopt(req->easy, CURLOPT_CONNECTTIMEOUT, 10L);
+    curl_easy_setopt(req->easy, CURLOPT_TCP_KEEPALIVE, 1L);
+    curl_easy_setopt(req->easy, CURLOPT_TCP_KEEPIDLE, 30L);
+    curl_easy_setopt(req->easy, CURLOPT_TCP_KEEPINTVL, 15L);
+
+    /* TLS session caching + HTTP/2 multiplexing */
+    curl_easy_setopt(req->easy, CURLOPT_SSL_SESSIONID_CACHE, 1L);
+    curl_easy_setopt(req->easy, CURLOPT_HTTP_VERSION, CURL_HTTP_VERSION_2TLS);
+    curl_easy_setopt(req->easy, CURLOPT_PIPEWAIT, 1L);
+
+    /* Link back for result collection */
+    curl_easy_setopt(req->easy, CURLOPT_PRIVATE, (char *)req);
+
+    return AZURE_OK;
+
+/* S-H5: cleanup for SLIST_APPEND failures */
+cleanup:
+    if (list) curl_slist_free_all(list);
+    req->hdrs = NULL;
+    curl_easy_cleanup(req->easy);
+    req->easy = NULL;
+    return AZURE_ERR_NOMEM;
+}
+
+/*
+ * Build Put Block List XML body.
+ * Allocates memory — caller must free the returned pointer.
+ */
+static char *block_build_blocklist_xml(int nChunks, size_t *xml_len)
+{
+    /* Each <Latest> entry: ~40 bytes (tag + base64 id + newline) */
+    size_t est_size = 128 + (size_t)nChunks * 48;
+    char *xml = malloc(est_size);
+    if (!xml) return NULL;
+
+    size_t off = 0;
+    int n = snprintf(xml + off, est_size - off,
+                     "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<BlockList>\n");
+    if (n > 0) off += (size_t)n;
+
+    for (int i = 0; i < nChunks; i++) {
+        char b64_id[32];
+        if (block_make_id(i, b64_id, sizeof(b64_id)) != 0) {
+            free(xml);
+            return NULL;
+        }
+        n = snprintf(xml + off, est_size - off,
+                     "  <Latest>%s</Latest>\n", b64_id);
+        if (n > 0) off += (size_t)n;
+    }
+
+    n = snprintf(xml + off, est_size - off, "</BlockList>\n");
+    if (n > 0) off += (size_t)n;
+
+    *xml_len = off;
+    return xml;
+}
+
+/*
+ * Upload data as a block blob using parallel Put Block + Put Block List.
+ *
+ * For small payloads (< 256 KiB), delegates to single-PUT block_blob_upload.
+ * For larger payloads, splits into chunks and uploads in parallel.
+ */
+static azure_err_t az_block_blob_upload_parallel(
+    void *ctx, const char *name,
+    const uint8_t *data, size_t len,
+    size_t chunk_size,
+    azure_error_t *err)
+{
+    if (!ctx || !name || !err) return AZURE_ERR_INVALID_ARG;
+    azure_error_init(err);
+
+    /* Small payload — single PUT is cheaper */
+    if (len < BLOCK_UPLOAD_MIN_PARALLEL_SIZE) {
+        return az_block_blob_upload(ctx, name, data, len, err);
+    }
+
+    azure_client_t *c = (azure_client_t *)ctx;
+
+    /* Calculate chunk count */
+    int nChunks = (int)((len + chunk_size - 1) / chunk_size);
+    if (nChunks <= 1) {
+        return az_block_blob_upload(ctx, name, data, len, err);
+    }
+
+    /* Lock mutex for the entire operation (protects multi_handle) */
+    pthread_mutex_lock(&c->mutex);
+
+    /* ---- Phase 1: Put Block (parallel) ---- */
+    CURLM *multi = ensure_multi_handle(c);
+    if (!multi) {
+        pthread_mutex_unlock(&c->mutex);
+        err->code = AZURE_ERR_NETWORK;
+        snprintf(err->error_message, sizeof(err->error_message),
+                 "curl_multi_init() failed");
+        return AZURE_ERR_NETWORK;
+    }
+
+    int *done = calloc((size_t)nChunks, sizeof(int));
+    if (!done) {
+        pthread_mutex_unlock(&c->mutex);
+        err->code = AZURE_ERR_NOMEM;
+        snprintf(err->error_message, sizeof(err->error_message),
+                 "block upload: allocation failed");
+        return AZURE_ERR_NOMEM;
+    }
+
+    /* Pre-compute base URL and per-chunk URLs with block IDs */
+    char base_url[4096];
+    build_blob_url(c, name, base_url, sizeof(base_url));
+
+    azure_err_t result = AZURE_OK;
+
+    for (int attempt = 0; attempt <= BLOCK_UPLOAD_MAX_RETRIES; attempt++) {
+        int pending = 0;
+        for (int i = 0; i < nChunks; i++) {
+            if (!done[i]) pending++;
+        }
+        if (pending == 0) break;
+
+        /* Backoff on retry */
+        if (attempt > 0) {
+            int delay_ms = AZURE_RETRY_BASE_MS * (1 << (attempt - 1));
+            if (delay_ms > AZURE_RETRY_MAX_MS)
+                delay_ms = AZURE_RETRY_MAX_MS;
+#if defined(__APPLE__) || defined(__FreeBSD__)
+            delay_ms += (int)arc4random_uniform(100);
+#else
+            {
+                unsigned int r;
+                if (getrandom(&r, sizeof(r), 0) == (ssize_t)sizeof(r))
+                    delay_ms += (int)(r % 100);
+            }
+#endif
+            fprintf(stderr,
+                    "[sqlite-objs] block upload: %d/%d chunks pending, "
+                    "retry %d/%d in %dms\n",
+                    pending, nChunks, attempt, BLOCK_UPLOAD_MAX_RETRIES,
+                    delay_ms);
+            azure_retry_sleep_ms(delay_ms);
+        }
+
+        /* Set up easy handles for pending chunks */
+        block_req_t *reqs = calloc((size_t)pending, sizeof(block_req_t));
+        if (!reqs) {
+            free(done);
+            pthread_mutex_unlock(&c->mutex);
+            err->code = AZURE_ERR_NOMEM;
+            return AZURE_ERR_NOMEM;
+        }
+
+        int req_count = 0;
+        int setup_ok = 1;
+        for (int i = 0; i < nChunks && setup_ok; i++) {
+            if (done[i]) continue;
+
+            /* Build block ID and URL for this chunk */
+            char b64_id[32];
+            if (block_make_id(i, b64_id, sizeof(b64_id)) != 0) {
+                result = AZURE_ERR_IO;
+                setup_ok = 0;
+                break;
+            }
+
+            /* Query params: comp=block&blockid=<b64_id> */
+            char query[256];
+            snprintf(query, sizeof(query), "comp=block&blockid=%s", b64_id);
+
+            /* Full URL with query params and SAS token */
+            char url[4096];
+            size_t url_len = (size_t)snprintf(url, sizeof(url), "%s?%s",
+                                               base_url, query);
+            if (c->use_sas) {
+                snprintf(url + url_len, sizeof(url) - url_len,
+                         "&%s", c->sas_token);
+            }
+
+            /* Chunk data bounds */
+            size_t chunk_off = (size_t)i * chunk_size;
+            size_t this_len = chunk_size;
+            if (chunk_off + this_len > len)
+                this_len = len - chunk_off;
+
+            reqs[req_count].chunk_idx = i;
+            azure_err_t rc = block_init_easy(c, url, name, query,
+                                              data + chunk_off, this_len,
+                                              &reqs[req_count]);
+            if (rc != AZURE_OK) {
+                result = rc;
+                err->code = rc;
+                snprintf(err->error_message, sizeof(err->error_message),
+                         "block upload: request setup failed");
+                setup_ok = 0;
+                break;
+            }
+            curl_multi_add_handle(multi, reqs[req_count].easy);
+            req_count++;
+        }
+
+        if (!setup_ok) {
+            for (int j = 0; j < req_count; j++) {
+                curl_multi_remove_handle(multi, reqs[j].easy);
+                block_req_free(&reqs[j]);
+            }
+            free(reqs);
+            free(done);
+            pthread_mutex_unlock(&c->mutex);
+            return result;
+        }
+
+        /* Event loop */
+        int still_running = 0;
+        curl_multi_perform(multi, &still_running);
+
+        while (still_running > 0) {
+            curl_multi_wait(multi, NULL, 0, 1000, NULL);
+            curl_multi_perform(multi, &still_running);
+        }
+
+        /* Collect results */
+        azure_err_t attempt_err = AZURE_OK;
+        CURLMsg *msg;
+        int msgs_left;
+
+        while ((msg = curl_multi_info_read(multi, &msgs_left))) {
+            if (msg->msg != CURLMSG_DONE) continue;
+
+            char *priv = NULL;
+            curl_easy_getinfo(msg->easy_handle, CURLINFO_PRIVATE, &priv);
+            block_req_t *req = (block_req_t *)priv;
+            if (!req) continue;
+
+            if (msg->data.result != CURLE_OK) {
+                azure_err_t rc =
+                    (msg->data.result == CURLE_OPERATION_TIMEDOUT ||
+                     msg->data.result == CURLE_COULDNT_CONNECT)
+                    ? AZURE_ERR_SERVER : AZURE_ERR_NETWORK;
+                if (attempt_err == AZURE_OK) attempt_err = rc;
+                continue;
+            }
+
+            long http_status = 0;
+            curl_easy_getinfo(msg->easy_handle,
+                              CURLINFO_RESPONSE_CODE, &http_status);
+
+            if (http_status >= 200 && http_status < 300) {
+                done[req->chunk_idx] = 1;
+            } else {
+                azure_err_t rc = azure_classify_http_error(
+                    http_status, req->resp_hdrs.error_code);
+                if (attempt_err == AZURE_OK) {
+                    attempt_err = rc;
+                    err->http_status = clamp_http_status(http_status);
+                    if (req->resp_body.size > 0)
+                        azure_parse_error_xml(
+                            (const char *)req->resp_body.data,
+                            req->resp_body.size, err);
+                    if (req->resp_hdrs.error_code[0])
+                        strncpy(err->error_code,
+                                req->resp_hdrs.error_code,
+                                sizeof(err->error_code) - 1);
+                }
+            }
+        }
+
+        /* Cleanup easy handles */
+        for (int j = 0; j < req_count; j++) {
+            curl_multi_remove_handle(multi, reqs[j].easy);
+            block_req_free(&reqs[j]);
+        }
+        free(reqs);
+
+        result = attempt_err;
+
+        /* All done? Or non-retryable error? */
+        int all_done = 1;
+        for (int i = 0; i < nChunks; i++) {
+            if (!done[i]) { all_done = 0; break; }
+        }
+        if (all_done) break;
+        if (!azure_is_retryable(attempt_err)) break;
+    }
+
+    /* Verify all chunks uploaded */
+    int all_ok = 1;
+    for (int i = 0; i < nChunks; i++) {
+        if (!done[i]) { all_ok = 0; break; }
+    }
+    free(done);
+
+    if (!all_ok) {
+        pthread_mutex_unlock(&c->mutex);
+        if (result == AZURE_OK) result = AZURE_ERR_IO;
+        err->code = result;
+        if (!err->error_message[0])
+            snprintf(err->error_message, sizeof(err->error_message),
+                     "Block upload: chunks failed after %d retries",
+                     BLOCK_UPLOAD_MAX_RETRIES);
+        return result;
+    }
+
+    /* ---- Phase 2: Put Block List (commit) ---- */
+    size_t xml_len = 0;
+    char *xml = block_build_blocklist_xml(nChunks, &xml_len);
+    if (!xml) {
+        pthread_mutex_unlock(&c->mutex);
+        err->code = AZURE_ERR_NOMEM;
+        snprintf(err->error_message, sizeof(err->error_message),
+                 "Block upload: failed to build block list XML");
+        return AZURE_ERR_NOMEM;
+    }
+
+    /* Unlock before calling execute_with_retry (which locks internally) */
+    pthread_mutex_unlock(&c->mutex);
+
+    azure_error_init(err);
+    result = execute_with_retry(c, "PUT", name, "comp=blocklist",
+                                NULL, "application/xml",
+                                (const uint8_t *)xml, xml_len, NULL,
+                                NULL, NULL, err);
+    free(xml);
+
+    return result;
+}
+
+/* ================================================================
  * COMMON BLOB OPERATIONS
  * ================================================================ */
 
@@ -1157,6 +1642,11 @@ static CURLM *ensure_multi_handle(azure_client_t *c)
     curl_multi_setopt(multi, CURLMOPT_MAXCONNECTS,
                       (long)SQLITE_OBJS_MAX_PARALLEL_PUTS);
 
+    /* Enable HTTP/2 multiplexing: allow curl_multi to send multiple
+     * requests over a single HTTP/2 connection concurrently, rather
+     * than opening separate TCP connections per request. */
+    curl_multi_setopt(multi, CURLMOPT_PIPELINING, CURLPIPE_MULTIPLEX);
+
     c->multi_handle = multi;
     return multi;
 }
@@ -1302,6 +1792,11 @@ static azure_err_t batch_init_easy(
     /* Explicitly enable TLS session ID caching.  The persistent CURLM
      * handle's connection pool manages TLS session reuse across calls. */
     curl_easy_setopt(req->easy, CURLOPT_SSL_SESSIONID_CACHE, 1L);
+
+    /* HTTP/2 for multi handles: negotiate via ALPN, wait for an existing
+     * multiplexed connection rather than opening a new one. */
+    curl_easy_setopt(req->easy, CURLOPT_HTTP_VERSION, CURL_HTTP_VERSION_2TLS);
+    curl_easy_setopt(req->easy, CURLOPT_PIPEWAIT, 1L);
 
     /* Link back to batch context for result collection */
     curl_easy_setopt(req->easy, CURLOPT_PRIVATE, (char *)req);
@@ -1769,6 +2264,11 @@ static azure_err_t read_batch_init_easy(
     curl_easy_setopt(req->easy, CURLOPT_TCP_KEEPINTVL, 15L);
     curl_easy_setopt(req->easy, CURLOPT_SSL_SESSIONID_CACHE, 1L);
 
+    /* HTTP/2 for multi handles: negotiate via ALPN, wait for an existing
+     * multiplexed connection rather than opening a new one. */
+    curl_easy_setopt(req->easy, CURLOPT_HTTP_VERSION, CURL_HTTP_VERSION_2TLS);
+    curl_easy_setopt(req->easy, CURLOPT_PIPEWAIT, 1L);
+
     /* Link back for result collection */
     curl_easy_setopt(req->easy, CURLOPT_PRIVATE, (char *)req);
 
@@ -2192,6 +2692,8 @@ static const azure_ops_t azure_production_ops = {
     .append_blob_create = az_append_blob_create,
     .append_blob_append = az_append_blob_append,
     .append_blob_delete = az_append_blob_delete,
+    /* Block blob parallel upload — WAL acceleration */
+    .block_blob_upload_parallel = az_block_blob_upload_parallel,
 };
 
 /* ================================================================

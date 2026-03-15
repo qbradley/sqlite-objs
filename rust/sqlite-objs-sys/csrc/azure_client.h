@@ -280,6 +280,19 @@ struct azure_ops {
         const char *lease_id,     /* NULL if no lease */
         azure_error_t *err
     );
+
+    /* ---- Block Blob Parallel Upload (WAL acceleration) ---- */
+
+    /* Upload data as a block blob using parallel Put Block + Put Block List.
+    ** Splits data into chunks of chunk_size bytes, uploads each chunk
+    ** via curl_multi, then commits with a single Put Block List call.
+    ** Falls back to single block_blob_upload for small payloads.
+    ** NULL = VFS falls back to single-PUT block_blob_upload. */
+    azure_err_t (*block_blob_upload_parallel)(
+        void *ctx, const char *name,
+        const uint8_t *data, size_t len,
+        size_t chunk_size,
+        azure_error_t *err);
 };
 
 

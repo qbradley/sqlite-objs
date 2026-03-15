@@ -41,6 +41,7 @@ typedef enum {
     OP_APPEND_BLOB_CREATE,
     OP_APPEND_BLOB_APPEND,
     OP_APPEND_BLOB_DELETE,
+    OP_BLOCK_BLOB_UPLOAD_PARALLEL,
     OP_COUNT
 } op_index_t;
 
@@ -61,6 +62,7 @@ static const char *op_names[OP_COUNT] = {
     "append_blob_create",
     "append_blob_append",
     "append_blob_delete",
+    "block_blob_upload_parallel",
 };
 
 static op_index_t op_name_to_index(const char *name) {
@@ -475,6 +477,49 @@ static azure_err_t mock_block_blob_download(void *vctx, const char *name,
     return AZURE_OK;
 }
 
+/*
+ * Mock block_blob_upload_parallel — same behavior as block_blob_upload.
+ * The mock doesn't need to simulate chunking; it just stores the data.
+ */
+static azure_err_t mock_block_blob_upload_parallel(void *vctx, const char *name,
+                                                    const uint8_t *data,
+                                                    size_t len,
+                                                    size_t chunk_size,
+                                                    azure_error_t *err) {
+    mock_azure_ctx_t *ctx = (mock_azure_ctx_t *)vctx;
+    azure_err_t rc = pre_call(ctx, OP_BLOCK_BLOB_UPLOAD_PARALLEL, err);
+    if (rc != AZURE_OK) return rc;
+    (void)chunk_size;
+
+    mock_blob_t *b = find_blob(ctx, name);
+    if (b && b->type != BLOB_TYPE_BLOCK) {
+        set_error(err, 409, "BlobTypeMismatch", "Blob exists as different type");
+        return AZURE_ERR_CONFLICT;
+    }
+
+    if (!b) {
+        b = create_blob(ctx, name, BLOB_TYPE_BLOCK);
+        if (!b) {
+            set_error(err, 500, "OutOfMemory", "Too many blobs");
+            return AZURE_ERR_NOMEM;
+        }
+    }
+
+    free_blob_data(b);
+    if (len > 0) {
+        b->data = (uint8_t *)malloc(len);
+        if (!b->data) {
+            set_error(err, 500, "OutOfMemory", "Failed to allocate blob data");
+            return AZURE_ERR_NOMEM;
+        }
+        memcpy(b->data, data, len);
+    }
+    b->size = (int64_t)len;
+    b->capacity = (int64_t)len;
+    b->type = BLOB_TYPE_BLOCK;
+    return AZURE_OK;
+}
+
 /* ── Common Blob Operations ───────────────────────────────────────── */
 
 static azure_err_t mock_blob_get_properties(void *vctx, const char *name,
@@ -807,6 +852,8 @@ static azure_ops_t mock_ops = {
     .append_blob_create = mock_append_blob_create_impl,
     .append_blob_append = mock_append_blob_append_impl,
     .append_blob_delete = mock_append_blob_delete_impl,
+    /* Block blob parallel upload — WAL acceleration */
+    .block_blob_upload_parallel = mock_block_blob_upload_parallel,
 };
 
 /* ══════════════════════════════════════════════════════════════════════
