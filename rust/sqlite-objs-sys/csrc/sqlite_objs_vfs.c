@@ -589,6 +589,22 @@ static int sqliteObjsClose(sqlite3_file *pFile) {
         rc = sqliteObjsSync(pFile, 0);
     }
 
+    /* Refresh ETag from Azure before persisting the sidecar.
+    ** The batch write path may not reliably capture the final ETag
+    ** (concurrent PUTs return ETags in indeterminate order), so a
+    ** HEAD request gives us the definitive current ETag while we
+    ** still hold the lease. */
+    if (p->cacheReuse && p->ops && p->ops->blob_get_properties
+        && p->zBlobName && rc == SQLITE_OK) {
+        azure_error_t aerr;
+        azure_error_init(&aerr);
+        azure_err_t arc = p->ops->blob_get_properties(
+            p->ops_ctx, p->zBlobName, NULL, NULL, NULL, &aerr);
+        if (arc == AZURE_OK && aerr.etag[0] != '\0') {
+            memcpy(p->etag, aerr.etag, sizeof(p->etag));
+        }
+    }
+
     /* Release lease if held.  Best-effort: lease auto-expires so we log
     ** but don't fail xClose on release errors. */
     if (hasLease(p) && p->ops && p->ops->lease_release) {

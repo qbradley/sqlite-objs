@@ -1878,6 +1878,7 @@ static azure_err_t az_page_blob_write_batch(
     }
 
     azure_err_t result = AZURE_OK;
+    char last_etag[128] = {0};   /* Best-effort ETag from last successful PUT */
 
     /* ---- Persistent multi handle (lazy init, connection pool reused) ---- */
     CURLM *multi = ensure_multi_handle(c);
@@ -2021,6 +2022,9 @@ static azure_err_t az_page_blob_write_batch(
 
             if (http_status >= 200 && http_status < 300) {
                 done[req->range_idx] = 1;
+                if (req->resp_hdrs.etag[0] != '\0') {
+                    memcpy(last_etag, req->resp_hdrs.etag, sizeof(last_etag));
+                }
             } else {
                 azure_err_t rc = azure_classify_http_error(
                     http_status, req->resp_hdrs.error_code);
@@ -2088,6 +2092,10 @@ static azure_err_t az_page_blob_write_batch(
     if (all_ok) {
         pthread_mutex_unlock(&c->mutex);
         azure_error_init(err);
+        /* Restore best-effort ETag so callers can track blob state */
+        if (last_etag[0] != '\0') {
+            memcpy(err->etag, last_etag, sizeof(err->etag));
+        }
         return AZURE_OK;
     }
 
