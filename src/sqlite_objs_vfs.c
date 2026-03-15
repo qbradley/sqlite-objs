@@ -162,6 +162,10 @@ typedef struct sqliteObjsFile {
     sqlite3_int64 nWalData;            /* WAL logical size */
     sqlite3_int64 nWalAlloc;           /* WAL allocated size */
 
+    /* Download counter — incremented each time a full blob GET occurs.
+    ** ETag-based cache hits do NOT increment this. */
+    int nDownloads;
+
     /* Per-file Azure client (NULL = using global VFS client) */
     azure_client_t *ownClient;
 } sqliteObjsFile;
@@ -1449,6 +1453,11 @@ static int sqliteObjsFileControl(sqlite3_file *pFile, int op, void *pArg) {
             *(char **)pArg = sqlite3_mprintf("sqlite-objs");
             return SQLITE_OK;
         }
+        case SQLITE_OBJS_FCNTL_DOWNLOAD_COUNT: {
+            sqliteObjsFile *p = (sqliteObjsFile *)pFile;
+            *(int *)pArg = p->nDownloads;
+            return SQLITE_OK;
+        }
         default:
             return SQLITE_NOTFOUND;
     }
@@ -1801,6 +1810,7 @@ static int sqliteObjsOpen(sqlite3_vfs *pVfs, sqlite3_filename zName,
             }
 
             cache_download:
+            p->nDownloads++;
             if (blobSize > 0) {
                 /* Download to temporary buffer, then write to cache file */
                 unsigned char *tempBuf = (unsigned char *)malloc(blobSize);
@@ -1927,21 +1937,43 @@ static int sqliteObjsOpen(sqlite3_vfs *pVfs, sqlite3_filename zName,
                 }
             }
             
-            /* Create cache file */
-            char *cacheTemplate2 = buildCacheTemplate(cacheDir);
-            if (!cacheTemplate2) {
-                sqlite3_free(p->zBlobName);
-                p->zBlobName = NULL;
-                return SQLITE_NOMEM;
+            /* Create cache file — use deterministic path when cache_reuse
+            ** is requested so the ETag sidecar can be persisted on close. */
+            if (cacheReuse) {
+                const char *acct = sqlite3_uri_parameter(zName, "azure_account");
+                const char *cont = sqlite3_uri_parameter(zName, "azure_container");
+                char *cachePath = buildCachePath(cacheDir, acct, cont, zName);
+                if (cachePath) {
+                    p->cacheFd = open(cachePath, O_RDWR | O_CREAT | O_TRUNC, 0600);
+                    if (p->cacheFd < 0) {
+                        free(cachePath);
+                        sqlite3_free(p->zBlobName);
+                        p->zBlobName = NULL;
+                        return SQLITE_CANTOPEN;
+                    }
+                    p->zCachePath = cachePath;
+                    p->cacheReuse = 1;
+                } else {
+                    /* buildCachePath failed — fall through to mkstemp */
+                    goto create_mkstemp;
+                }
+            } else {
+                create_mkstemp: ;
+                char *cacheTemplate2 = buildCacheTemplate(cacheDir);
+                if (!cacheTemplate2) {
+                    sqlite3_free(p->zBlobName);
+                    p->zBlobName = NULL;
+                    return SQLITE_NOMEM;
+                }
+                p->cacheFd = mkstemp(cacheTemplate2);
+                if (p->cacheFd < 0) {
+                    free(cacheTemplate2);
+                    sqlite3_free(p->zBlobName);
+                    p->zBlobName = NULL;
+                    return SQLITE_CANTOPEN;
+                }
+                p->zCachePath = cacheTemplate2;
             }
-            p->cacheFd = mkstemp(cacheTemplate2);
-            if (p->cacheFd < 0) {
-                free(cacheTemplate2);
-                sqlite3_free(p->zBlobName);
-                p->zBlobName = NULL;
-                return SQLITE_CANTOPEN;
-            }
-            p->zCachePath = cacheTemplate2;  /* mkstemp modified it in place */
             
             p->nData = 0;
         } else if (!blobExists) {

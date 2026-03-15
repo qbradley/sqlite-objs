@@ -109,6 +109,18 @@ int sqlite_objs_vfs_register_with_ops(azure_ops_t *ops, void *ctx,
 */
 int sqlite_objs_vfs_register_uri(int makeDefault);
 
+/*
+** Custom file-control op code for querying the blob download counter.
+** Usage:
+**   int count = 0;
+**   sqlite3_file_control(db, "main", SQLITE_OBJS_FCNTL_DOWNLOAD_COUNT, &count);
+**
+** Writes the number of full blob downloads performed on the MAIN_DB file
+** into *pArg (int*).  ETag cache hits do not increment this counter.
+** Op code chosen in the user-defined range (starting at 100+).
+*/
+#define SQLITE_OBJS_FCNTL_DOWNLOAD_COUNT 200
+
 #ifdef __cplusplus
 }
 #endif

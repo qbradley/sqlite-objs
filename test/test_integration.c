@@ -793,9 +793,10 @@ TEST(integ_uri_two_containers) {
     ASSERT_OK(rc);
     ASSERT_NOT_NULL(db2);
 
-    /* Insert different data */
+    /* Insert different data (use DROP IF EXISTS for idempotency with persistent Azurite) */
     char *errmsg = NULL;
     rc = sqlite3_exec(db1,
+        "DROP TABLE IF EXISTS t;"
         "CREATE TABLE t (id INTEGER, val TEXT);"
         "INSERT INTO t VALUES (1, 'container_one');",
         NULL, NULL, &errmsg);
@@ -806,6 +807,7 @@ TEST(integ_uri_two_containers) {
     ASSERT_OK(rc);
 
     rc = sqlite3_exec(db2,
+        "DROP TABLE IF EXISTS t;"
         "CREATE TABLE t (id INTEGER, val TEXT);"
         "INSERT INTO t VALUES (1, 'container_two');",
         NULL, NULL, &errmsg);
@@ -922,6 +924,413 @@ TEST(integ_attach_cross_container) {
 }
 
 /* ================================================================
+ * ETag Cache Reuse Tests
+ *
+ * Verify the cache_reuse URI parameter: when a database was previously
+ * cached locally and the blob's ETag hasn't changed, the VFS skips the
+ * download and reuses the local file.  When the blob changes (different
+ * ETag), the VFS re-downloads.
+ * ================================================================ */
+
+/* Helper: clean leftover cache + etag sidecar files matching a pattern */
+static void cleanup_cache_files(const char *blobName) {
+    /* The VFS stores cache files in /tmp as sqlite-objs-<hash>.cache
+     * and corresponding .etag files.  We brute-force remove them by
+     * scanning /tmp for our prefix.  This is a test-only convenience. */
+    char cmd[256];
+    snprintf(cmd, sizeof(cmd),
+             "rm -f /tmp/sqlite-objs-*.cache /tmp/sqlite-objs-*.etag");
+    (void)system(cmd);
+    (void)blobName;  /* suppress unused warning */
+}
+
+/*
+ * Test: ETag cache hit — reuse cached file
+ *
+ * 1. Open a database via URI with cache_reuse=1
+ * 2. Create a table, insert data, close
+ * 3. Re-open the same URI with cache_reuse=1
+ * 4. Verify data is intact (table + rows)
+ * 5. The re-open should NOT re-download since ETag matches
+ */
+TEST(etag_cache_hit) {
+    const char *db_name = "etag-hit.db";
+    cleanup_blob(db_name);
+    cleanup_blob("etag-hit.db-journal");
+    cleanup_blob("etag-hit.db-wal");
+    cleanup_cache_files(db_name);
+
+    /* Register VFS in URI mode */
+    int rc = sqlite_objs_vfs_register_uri(0);
+    ASSERT_OK(rc);
+
+    /* Build URI with cache_reuse=1 */
+    char uri[1024];
+    snprintf(uri, sizeof(uri),
+        "file:%s?"
+        "azure_account=" AZURITE_ACCOUNT
+        "&azure_container=" AZURITE_CONTAINER
+        "&azure_key=" AZURITE_KEY
+        "&azure_endpoint=" AZURITE_ENDPOINT
+        "&cache_reuse=1",
+        db_name);
+
+    /* --- First open: create schema and data --- */
+    sqlite3 *db = NULL;
+    rc = sqlite3_open_v2(uri, &db,
+        SQLITE_OPEN_URI | SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE,
+        "sqlite-objs");
+    ASSERT_OK(rc);
+    ASSERT_NOT_NULL(db);
+
+    char *errmsg = NULL;
+    rc = sqlite3_exec(db,
+        "CREATE TABLE cache_t (id INTEGER PRIMARY KEY, val TEXT);"
+        "INSERT INTO cache_t VALUES (1, 'cached_alpha');"
+        "INSERT INTO cache_t VALUES (2, 'cached_beta');",
+        NULL, NULL, &errmsg);
+    if (rc != SQLITE_OK) {
+        fprintf(stderr, "  etag_cache_hit setup SQL: %s\n", errmsg ? errmsg : "?");
+        sqlite3_free(errmsg);
+    }
+    ASSERT_OK(rc);
+
+    /* Close — this persists cache file + ETag sidecar */
+    rc = sqlite3_close(db);
+    ASSERT_OK(rc);
+
+    /* --- Second open: cache_reuse should hit ETag match, skip download --- */
+    db = NULL;
+    rc = sqlite3_open_v2(uri, &db,
+        SQLITE_OPEN_URI | SQLITE_OPEN_READWRITE,
+        "sqlite-objs");
+    ASSERT_OK(rc);
+    ASSERT_NOT_NULL(db);
+
+    /* Verify data survived the cache-reuse path */
+    sqlite3_stmt *stmt = NULL;
+    rc = sqlite3_prepare_v2(db, "SELECT COUNT(*) FROM cache_t;", -1, &stmt, NULL);
+    ASSERT_OK(rc);
+    rc = sqlite3_step(stmt);
+    ASSERT_EQ(rc, SQLITE_ROW);
+    ASSERT_EQ(sqlite3_column_int(stmt, 0), 2);
+    sqlite3_finalize(stmt);
+
+    /* Verify actual row values */
+    stmt = NULL;
+    rc = sqlite3_prepare_v2(db,
+        "SELECT val FROM cache_t WHERE id = 1;", -1, &stmt, NULL);
+    ASSERT_OK(rc);
+    rc = sqlite3_step(stmt);
+    ASSERT_EQ(rc, SQLITE_ROW);
+    ASSERT_STR_EQ((const char *)sqlite3_column_text(stmt, 0), "cached_alpha");
+    sqlite3_finalize(stmt);
+
+    /* Verify no blob download occurred on second open (ETag cache hit) */
+    {
+        int dlCount = -1;
+        rc = sqlite3_file_control(db, "main",
+                                  SQLITE_OBJS_FCNTL_DOWNLOAD_COUNT, &dlCount);
+        ASSERT_OK(rc);
+        ASSERT_EQ(dlCount, 0);
+    }
+
+    sqlite3_close(db);
+
+    /* Cleanup */
+    cleanup_blob(db_name);
+    cleanup_blob("etag-hit.db-journal");
+    cleanup_cache_files(db_name);
+}
+
+/*
+ * Test: ETag cache miss — blob changed, must re-download
+ *
+ * 1. Open database, create table, insert data, close (cache + ETag saved)
+ * 2. Open a SECOND connection to the same blob, modify data, close
+ *    — this changes the Azure ETag
+ * 3. Re-open original with cache_reuse — ETag won't match, forces download
+ * 4. Verify the modified data is visible
+ */
+TEST(etag_cache_miss) {
+    const char *db_name = "etag-miss.db";
+    cleanup_blob(db_name);
+    cleanup_blob("etag-miss.db-journal");
+    cleanup_blob("etag-miss.db-wal");
+    cleanup_cache_files(db_name);
+
+    int rc = sqlite_objs_vfs_register_uri(0);
+    ASSERT_OK(rc);
+
+    char uri[1024];
+    snprintf(uri, sizeof(uri),
+        "file:%s?"
+        "azure_account=" AZURITE_ACCOUNT
+        "&azure_container=" AZURITE_CONTAINER
+        "&azure_key=" AZURITE_KEY
+        "&azure_endpoint=" AZURITE_ENDPOINT
+        "&cache_reuse=1",
+        db_name);
+
+    /* --- First open: seed the database --- */
+    sqlite3 *db = NULL;
+    rc = sqlite3_open_v2(uri, &db,
+        SQLITE_OPEN_URI | SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE,
+        "sqlite-objs");
+    ASSERT_OK(rc);
+    ASSERT_NOT_NULL(db);
+
+    char *errmsg = NULL;
+    rc = sqlite3_exec(db,
+        "CREATE TABLE miss_t (id INTEGER PRIMARY KEY, val TEXT);"
+        "INSERT INTO miss_t VALUES (1, 'original');",
+        NULL, NULL, &errmsg);
+    if (rc != SQLITE_OK) {
+        fprintf(stderr, "  etag_cache_miss setup SQL: %s\n", errmsg ? errmsg : "?");
+        sqlite3_free(errmsg);
+    }
+    ASSERT_OK(rc);
+
+    rc = sqlite3_close(db);
+    ASSERT_OK(rc);
+
+    /* --- Modify blob via a second connection (no cache_reuse) ---
+     * This writes new data to Azure, changing the blob's ETag.  The
+     * locally cached .cache + .etag from the first connection will be
+     * stale after this. */
+    char uri_no_cache[1024];
+    snprintf(uri_no_cache, sizeof(uri_no_cache),
+        "file:%s?"
+        "azure_account=" AZURITE_ACCOUNT
+        "&azure_container=" AZURITE_CONTAINER
+        "&azure_key=" AZURITE_KEY
+        "&azure_endpoint=" AZURITE_ENDPOINT,
+        db_name);
+
+    db = NULL;
+    rc = sqlite3_open_v2(uri_no_cache, &db,
+        SQLITE_OPEN_URI | SQLITE_OPEN_READWRITE,
+        "sqlite-objs");
+    ASSERT_OK(rc);
+    ASSERT_NOT_NULL(db);
+
+    rc = sqlite3_exec(db,
+        "UPDATE miss_t SET val = 'modified' WHERE id = 1;"
+        "INSERT INTO miss_t VALUES (2, 'new_row');",
+        NULL, NULL, &errmsg);
+    if (rc != SQLITE_OK) {
+        fprintf(stderr, "  etag_cache_miss modify SQL: %s\n", errmsg ? errmsg : "?");
+        sqlite3_free(errmsg);
+    }
+    ASSERT_OK(rc);
+
+    rc = sqlite3_close(db);
+    ASSERT_OK(rc);
+
+    /* --- Third open: cache_reuse=1 but ETag has changed → re-download --- */
+    db = NULL;
+    rc = sqlite3_open_v2(uri, &db,
+        SQLITE_OPEN_URI | SQLITE_OPEN_READWRITE,
+        "sqlite-objs");
+    ASSERT_OK(rc);
+    ASSERT_NOT_NULL(db);
+
+    /* The VFS should have detected the ETag mismatch, re-downloaded,
+     * and we should see the MODIFIED data, not the original. */
+    sqlite3_stmt *stmt = NULL;
+    rc = sqlite3_prepare_v2(db,
+        "SELECT val FROM miss_t WHERE id = 1;", -1, &stmt, NULL);
+    ASSERT_OK(rc);
+    rc = sqlite3_step(stmt);
+    ASSERT_EQ(rc, SQLITE_ROW);
+    ASSERT_STR_EQ((const char *)sqlite3_column_text(stmt, 0), "modified");
+    sqlite3_finalize(stmt);
+
+    /* Also verify the new row from the second connection */
+    stmt = NULL;
+    rc = sqlite3_prepare_v2(db,
+        "SELECT COUNT(*) FROM miss_t;", -1, &stmt, NULL);
+    ASSERT_OK(rc);
+    rc = sqlite3_step(stmt);
+    ASSERT_EQ(rc, SQLITE_ROW);
+    ASSERT_EQ(sqlite3_column_int(stmt, 0), 2);
+    sqlite3_finalize(stmt);
+
+    /* Verify that a blob download DID occur (ETag mismatch → re-download) */
+    {
+        int dlCount = -1;
+        rc = sqlite3_file_control(db, "main",
+                                  SQLITE_OBJS_FCNTL_DOWNLOAD_COUNT, &dlCount);
+        ASSERT_OK(rc);
+        ASSERT_EQ(dlCount, 1);
+    }
+
+    sqlite3_close(db);
+
+    /* Cleanup */
+    cleanup_blob(db_name);
+    cleanup_blob("etag-miss.db-journal");
+    cleanup_cache_files(db_name);
+}
+
+/*
+ * Test: Cache reuse with WAL mode
+ *
+ * WAL files are stored as block blobs (separate from the page-blob main db).
+ * Verify that cache_reuse works correctly when WAL mode is active:
+ * 1. Open database in WAL mode, create table, insert data, close
+ * 2. Re-open with cache_reuse — data must survive
+ * 3. Insert more data via WAL, close, re-open — still intact
+ */
+TEST(etag_cache_reuse_wal) {
+    const char *db_name = "etag-wal.db";
+    cleanup_blob(db_name);
+    cleanup_blob("etag-wal.db-journal");
+    cleanup_blob("etag-wal.db-wal");
+    cleanup_cache_files(db_name);
+
+    int rc = sqlite_objs_vfs_register_uri(0);
+    ASSERT_OK(rc);
+
+    char uri[1024];
+    snprintf(uri, sizeof(uri),
+        "file:%s?"
+        "azure_account=" AZURITE_ACCOUNT
+        "&azure_container=" AZURITE_CONTAINER
+        "&azure_key=" AZURITE_KEY
+        "&azure_endpoint=" AZURITE_ENDPOINT
+        "&cache_reuse=1",
+        db_name);
+
+    /* --- First open: switch to WAL mode, create schema + data --- */
+    sqlite3 *db = NULL;
+    rc = sqlite3_open_v2(uri, &db,
+        SQLITE_OPEN_URI | SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE,
+        "sqlite-objs");
+    ASSERT_OK(rc);
+    ASSERT_NOT_NULL(db);
+
+    char *errmsg = NULL;
+    /* WAL on a remote VFS requires exclusive locking mode */
+    rc = sqlite3_exec(db, "PRAGMA locking_mode=EXCLUSIVE;", NULL, NULL, &errmsg);
+    if (rc != SQLITE_OK) {
+        fprintf(stderr, "  etag_wal locking_mode: %s\n", errmsg ? errmsg : "?");
+        sqlite3_free(errmsg);
+    }
+    ASSERT_OK(rc);
+
+    /* Enable WAL journal mode */
+    rc = sqlite3_exec(db, "PRAGMA journal_mode=WAL;", NULL, NULL, &errmsg);
+    if (rc != SQLITE_OK) {
+        fprintf(stderr, "  etag_wal PRAGMA failed: %s\n", errmsg ? errmsg : "?");
+        sqlite3_free(errmsg);
+    }
+    ASSERT_OK(rc);
+
+    /* Verify WAL mode is active */
+    sqlite3_stmt *stmt = NULL;
+    rc = sqlite3_prepare_v2(db, "PRAGMA journal_mode;", -1, &stmt, NULL);
+    ASSERT_OK(rc);
+    rc = sqlite3_step(stmt);
+    ASSERT_EQ(rc, SQLITE_ROW);
+    const char *jmode = (const char *)sqlite3_column_text(stmt, 0);
+    ASSERT_STR_EQ(jmode, "wal");
+    sqlite3_finalize(stmt);
+
+    rc = sqlite3_exec(db,
+        "CREATE TABLE wal_t (id INTEGER PRIMARY KEY, val TEXT);"
+        "INSERT INTO wal_t VALUES (1, 'wal_first');",
+        NULL, NULL, &errmsg);
+    if (rc != SQLITE_OK) {
+        fprintf(stderr, "  etag_wal setup SQL: %s\n", errmsg ? errmsg : "?");
+        sqlite3_free(errmsg);
+    }
+    ASSERT_OK(rc);
+
+    /* Checkpoint to flush WAL to main db before close */
+    rc = sqlite3_exec(db, "PRAGMA wal_checkpoint(TRUNCATE);", NULL, NULL, &errmsg);
+    if (rc != SQLITE_OK) {
+        fprintf(stderr, "  etag_wal checkpoint: %s\n", errmsg ? errmsg : "?");
+        sqlite3_free(errmsg);
+    }
+    ASSERT_OK(rc);
+
+    rc = sqlite3_close(db);
+    ASSERT_OK(rc);
+
+    /* --- Second open: cache_reuse should hit ETag match --- */
+    db = NULL;
+    rc = sqlite3_open_v2(uri, &db,
+        SQLITE_OPEN_URI | SQLITE_OPEN_READWRITE,
+        "sqlite-objs");
+    ASSERT_OK(rc);
+    ASSERT_NOT_NULL(db);
+
+    /* WAL mode persists in the db header — must set exclusive locking first */
+    rc = sqlite3_exec(db, "PRAGMA locking_mode=EXCLUSIVE;", NULL, NULL, &errmsg);
+    ASSERT_OK(rc);
+
+    /* Data from first session must be visible */
+    stmt = NULL;
+    rc = sqlite3_prepare_v2(db,
+        "SELECT val FROM wal_t WHERE id = 1;", -1, &stmt, NULL);
+    ASSERT_OK(rc);
+    rc = sqlite3_step(stmt);
+    ASSERT_EQ(rc, SQLITE_ROW);
+    ASSERT_STR_EQ((const char *)sqlite3_column_text(stmt, 0), "wal_first");
+    sqlite3_finalize(stmt);
+
+    /* Insert more data in WAL mode */
+    rc = sqlite3_exec(db,
+        "INSERT INTO wal_t VALUES (2, 'wal_second');",
+        NULL, NULL, &errmsg);
+    if (rc != SQLITE_OK) {
+        fprintf(stderr, "  etag_wal insert2: %s\n", errmsg ? errmsg : "?");
+        sqlite3_free(errmsg);
+    }
+    ASSERT_OK(rc);
+
+    /* Checkpoint + close */
+    rc = sqlite3_exec(db, "PRAGMA wal_checkpoint(TRUNCATE);", NULL, NULL, &errmsg);
+    if (rc != SQLITE_OK) {
+        fprintf(stderr, "  etag_wal checkpoint2: %s\n", errmsg ? errmsg : "?");
+        sqlite3_free(errmsg);
+    }
+    ASSERT_OK(rc);
+
+    rc = sqlite3_close(db);
+    ASSERT_OK(rc);
+
+    /* --- Third open: should cache-reuse again, see both rows --- */
+    db = NULL;
+    rc = sqlite3_open_v2(uri, &db,
+        SQLITE_OPEN_URI | SQLITE_OPEN_READWRITE,
+        "sqlite-objs");
+    ASSERT_OK(rc);
+    ASSERT_NOT_NULL(db);
+
+    rc = sqlite3_exec(db, "PRAGMA locking_mode=EXCLUSIVE;", NULL, NULL, &errmsg);
+    ASSERT_OK(rc);
+
+    stmt = NULL;
+    rc = sqlite3_prepare_v2(db,
+        "SELECT COUNT(*) FROM wal_t;", -1, &stmt, NULL);
+    ASSERT_OK(rc);
+    rc = sqlite3_step(stmt);
+    ASSERT_EQ(rc, SQLITE_ROW);
+    ASSERT_EQ(sqlite3_column_int(stmt, 0), 2);
+    sqlite3_finalize(stmt);
+
+    sqlite3_close(db);
+
+    /* Cleanup */
+    cleanup_blob(db_name);
+    cleanup_blob("etag-wal.db-journal");
+    cleanup_blob("etag-wal.db-wal");
+    cleanup_cache_files(db_name);
+}
+
+/* ================================================================
  * Main runner
  * ================================================================ */
 
@@ -959,6 +1368,13 @@ int main(void) {
     RUN_TEST(integ_multi_db_independent);
     RUN_TEST(integ_uri_two_containers);
     RUN_TEST(integ_attach_cross_container);
+    TEST_SUITE_END();
+
+    /* Run ETag cache-reuse tests */
+    TEST_SUITE_BEGIN("ETag Cache Reuse (SQLite on Azurite)");
+    RUN_TEST(etag_cache_hit);
+    RUN_TEST(etag_cache_miss);
+    RUN_TEST(etag_cache_reuse_wal);
     TEST_SUITE_END();
 
     /* Cleanup */
