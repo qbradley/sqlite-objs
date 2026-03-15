@@ -537,3 +537,14 @@ file:mydb.db?cache_dir=/var/cache/myapp
 - Library builds without binary dependencies
 
 **Pattern for future binaries:** Use optional deps + feature flag + required-features to keep utilities separate from core library.
+
+### WAL Sync: Append Blobs → Block Blobs (2026-07)
+
+Replaced WAL sync path from append blobs (DELETE + CREATE + N×APPEND) to block blobs (single PUT via `block_blob_upload`). Key changes:
+
+- **`src/sqlite_objs_vfs.c`:** WAL sync reduced from ~100 lines to ~20. Removed `nWalSynced` and `walNeedFullResync` state from `sqliteObjsFile` struct. xWrite simplified (no overwrite tracking). xTruncate uses `blob_delete` instead of append_blob_delete/create. xOpen checks `block_blob_upload/download` instead of append_blob_*.
+- **`test/test_wal.c`:** All 18 WAL tests updated for block blob assertions. "Full Resync Chunking" suite replaced with "Large WAL Upload" suite (no chunking needed with block blobs). Tests renamed (e.g., `wal_open_creates_append_blob` → `wal_open_and_sync_uploads_block_blob`).
+- **`test/test_vfs.c`:** WAL rejection test updated to null `block_blob_download` instead of append_blob ops.
+- **`rust/sqlite-objs-sys/csrc/`:** Synced with src/.
+- Kept `append_blob_*` vtable entries in `azure_ops_t` — zero cost, potential future use.
+- 242 unit tests pass, Rust tests pass, TCL tests pass.

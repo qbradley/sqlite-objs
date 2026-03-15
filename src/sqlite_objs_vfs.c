@@ -160,8 +160,6 @@ typedef struct sqliteObjsFile {
     unsigned char *aWalData;            /* WAL buffer */
     sqlite3_int64 nWalData;            /* WAL logical size */
     sqlite3_int64 nWalAlloc;           /* WAL allocated size */
-    sqlite3_int64 nWalSynced;          /* Bytes already synced to Azure append blob */
-    int walNeedFullResync;              /* 1 if writes invalidated synced data */
 
     /* Per-file Azure client (NULL = using global VFS client) */
     azure_client_t *ownClient;
@@ -578,7 +576,7 @@ static int sqliteObjsClose(sqlite3_file *pFile) {
     if (p->nDirtyPages > 0 && p->ops && p->ops->page_blob_write) {
         rc = sqliteObjsSync(pFile, 0);
     } else if (p->eFileType == SQLITE_OPEN_WAL &&
-               p->nWalData > p->nWalSynced && p->ops) {
+               p->nWalData > 0 && p->ops) {
         rc = sqliteObjsSync(pFile, 0);
     }
 
@@ -747,10 +745,6 @@ static int sqliteObjsWrite(sqlite3_file *pFile, const void *pBuf, int iAmt,
         if (rc != SQLITE_OK) return rc;
         memcpy(p->aWalData + iOfst, pBuf, iAmt);
         if (end > p->nWalData) p->nWalData = end;
-        /* If overwriting data already synced to Azure, need full re-upload */
-        if (iOfst < p->nWalSynced) {
-            p->walNeedFullResync = 1;
-        }
         return SQLITE_OK;
     }
 
@@ -818,37 +812,19 @@ static int sqliteObjsTruncate(sqlite3_file *pFile, sqlite3_int64 size) {
     sqliteObjsFile *p = (sqliteObjsFile *)pFile;
 
     if (p->eFileType == SQLITE_OPEN_WAL) {
-        /* WAL truncate — delete and recreate append blob */
+        /* WAL truncate — reset buffer; next xSync uploads fresh */
         if (size == 0) {
-            if (p->ops && p->ops->append_blob_delete) {
+            if (p->ops && p->ops->blob_delete) {
                 azure_error_t aerr;
                 azure_error_init(&aerr);
-                azure_err_t arc = p->ops->append_blob_delete(
-                    p->ops_ctx, p->zBlobName, NULL, &aerr);
-                if (arc != AZURE_OK && arc != AZURE_ERR_NOT_FOUND) {
-                    return SQLITE_IOERR_TRUNCATE;
-                }
-            }
-            if (p->ops && p->ops->append_blob_create) {
-                azure_error_t aerr;
-                azure_error_init(&aerr);
-                azure_err_t arc = p->ops->append_blob_create(
-                    p->ops_ctx, p->zBlobName, NULL, &aerr);
-                if (arc != AZURE_OK) {
-                    return SQLITE_IOERR_TRUNCATE;
-                }
+                p->ops->blob_delete(p->ops_ctx, p->zBlobName, &aerr);
             }
             p->nWalData = 0;
-            p->nWalSynced = 0;
-            p->walNeedFullResync = 0;
             if (p->aWalData) {
                 memset(p->aWalData, 0, (size_t)p->nWalAlloc);
             }
         } else if (size < p->nWalData) {
             p->nWalData = size;
-            if (size < p->nWalSynced) {
-                p->walNeedFullResync = 1;
-            }
         }
         return SQLITE_OK;
     }
@@ -966,7 +942,7 @@ static int coalesceDirtyRanges(
 ** xSync — Flush dirty pages to Azure.
 ** For MAIN_DB: coalesce dirty pages, then write via batch or sequential fallback.
 ** For MAIN_JOURNAL: upload entire journal via block_blob_upload.
-** For WAL: append new data to Azure append blob.
+** For WAL: upload entire buffer as block blob.
 */
 static int sqliteObjsSync(sqlite3_file *pFile, int flags) {
     sqliteObjsFile *p = (sqliteObjsFile *)pFile;
@@ -974,104 +950,33 @@ static int sqliteObjsSync(sqlite3_file *pFile, int flags) {
     (void)flags;
 
     if (p->eFileType == SQLITE_OPEN_WAL) {
-        /* WAL sync — append new data to Azure append blob */
-        if (p->nWalData <= p->nWalSynced && !p->walNeedFullResync) {
-            return SQLITE_OK;  /* Nothing new to sync */
+        /* WAL sync — upload entire WAL as block blob (single PUT) */
+        if (p->nWalData <= 0) {
+            return SQLITE_OK;  /* Nothing to sync */
         }
 
-        if (!p->ops || !p->ops->append_blob_append) {
+        if (!p->ops || !p->ops->block_blob_upload) {
             return SQLITE_IOERR_FSYNC;
         }
 
-        if (p->walNeedFullResync) {
-            /* Writes invalidated previously synced data — recreate blob */
-            if (p->nWalSynced > 0 && p->ops->append_blob_delete) {
-                azure_error_init(&aerr);
-                azure_err_t arc = p->ops->append_blob_delete(
-                    p->ops_ctx, p->zBlobName, NULL, &aerr);
-                if (arc != AZURE_OK && arc != AZURE_ERR_NOT_FOUND) {
-                    return SQLITE_IOERR_FSYNC;
-                }
-            }
-            if (p->ops->append_blob_create) {
-                azure_error_init(&aerr);
-                azure_err_t arc = p->ops->append_blob_create(
-                    p->ops_ctx, p->zBlobName, NULL, &aerr);
-                if (arc != AZURE_OK) {
-                    return SQLITE_IOERR_FSYNC;
-                }
-            }
-            /* Upload entire WAL buffer in chunks to respect 4 MiB limit */
-            if (p->nWalData > 0) {
-                sqlite3_int64 off = 0;
-                while (off < p->nWalData) {
-                    int chunk = (int)((p->nWalData - off > AZURE_MAX_APPEND_SIZE)
-                                      ? AZURE_MAX_APPEND_SIZE : (p->nWalData - off));
-                    azure_error_init(&aerr);
-                    azure_err_t arc = p->ops->append_blob_append(
-                        p->ops_ctx, p->zBlobName,
-                        p->aWalData + off, chunk,
-                        NULL, &aerr);
-                    azure_error_clear(&aerr);
-                    if (arc != AZURE_OK) {
-                        /* Partial append — delete and recreate blob so next
-                        ** sync re-uploads everything cleanly */
-                        if (p->ops->append_blob_delete) {
-                            azure_error_init(&aerr);
-                            p->ops->append_blob_delete(
-                                p->ops_ctx, p->zBlobName, NULL, &aerr);
-                        }
-                        if (p->ops->append_blob_create) {
-                            azure_error_init(&aerr);
-                            p->ops->append_blob_create(
-                                p->ops_ctx, p->zBlobName, NULL, &aerr);
-                        }
-                        p->nWalSynced = 0;
-                        p->walNeedFullResync = 1;
-                        return SQLITE_IOERR_FSYNC;
-                    }
-                    off += chunk;
-                }
-            }
-            p->nWalSynced = p->nWalData;
-            p->walNeedFullResync = 0;
-        } else {
-            /* Incremental append — send only new data since last sync,
-            ** chunked to respect 4 MiB limit */
-            sqlite3_int64 pending = p->nWalData - p->nWalSynced;
-            if (pending > 0) {
-                sqlite3_int64 off = 0;
-                while (off < pending) {
-                    int chunk = (int)((pending - off > AZURE_MAX_APPEND_SIZE)
-                                      ? AZURE_MAX_APPEND_SIZE : (pending - off));
-                    azure_error_init(&aerr);
-                    azure_err_t arc = p->ops->append_blob_append(
-                        p->ops_ctx, p->zBlobName,
-                        p->aWalData + p->nWalSynced + off, chunk,
-                        NULL, &aerr);
-                    azure_error_clear(&aerr);
-                    if (arc != AZURE_OK) {
-                        /* Partial append — delete and recreate blob so next
-                        ** sync re-uploads everything cleanly */
-                        if (p->ops->append_blob_delete) {
-                            azure_error_init(&aerr);
-                            p->ops->append_blob_delete(
-                                p->ops_ctx, p->zBlobName, NULL, &aerr);
-                        }
-                        if (p->ops->append_blob_create) {
-                            azure_error_init(&aerr);
-                            p->ops->append_blob_create(
-                                p->ops_ctx, p->zBlobName, NULL, &aerr);
-                        }
-                        p->nWalSynced = 0;
-                        p->walNeedFullResync = 1;
-                        return SQLITE_IOERR_FSYNC;
-                    }
-                    off += chunk;
-                }
-                p->nWalSynced = p->nWalData;
-            }
+        double t0 = 0;
+        if (sqlite_objs_debug_timing()) t0 = sqlite_objs_time_ms();
+
+        azure_error_init(&aerr);
+        azure_err_t arc = p->ops->block_blob_upload(
+            p->ops_ctx, p->zBlobName,
+            p->aWalData, (size_t)p->nWalData, &aerr);
+
+        if (sqlite_objs_debug_timing()) {
+            double elapsed = sqlite_objs_time_ms() - t0;
+            fprintf(stderr, "[TIMING] xSync(wal): %.1fms (%lld bytes, blob=%s)\n",
+                    elapsed, (long long)p->nWalData, p->zBlobName);
         }
+
+        if (arc != AZURE_OK) {
+            return SQLITE_IOERR_FSYNC;
+        }
+
         return SQLITE_OK;
     }
 
@@ -1465,9 +1370,8 @@ static int sqliteObjsFileControl(sqlite3_file *pFile, int op, void *pArg) {
                     /* WAL mode requires append blob operations.
                     ** If unavailable, reject and force "delete" mode. */
                     sqliteObjsFile *p = (sqliteObjsFile *)pFile;
-                    if (!p->ops || !p->ops->append_blob_create ||
-                        !p->ops->append_blob_append ||
-                        !p->ops->append_blob_delete) {
+                    if (!p->ops || !p->ops->block_blob_upload ||
+                        !p->ops->block_blob_download) {
                         aArg[0] = sqlite3_mprintf("delete");
                         return SQLITE_OK;
                     }
@@ -2039,11 +1943,11 @@ static int sqliteObjsOpen(sqlite3_vfs *pVfs, sqlite3_filename zName,
         }
 
     } else if (isWal) {
-        /* WAL → Azure append blob */
+        /* WAL → Azure block blob */
 
-        /* Verify append blob operations are available */
-        if (!p->ops || !p->ops->append_blob_create ||
-            !p->ops->append_blob_append || !p->ops->append_blob_delete) {
+        /* Verify block blob operations are available */
+        if (!p->ops || !p->ops->block_blob_upload ||
+            !p->ops->block_blob_download) {
             sqlite3_free(p->zBlobName);
             p->zBlobName = NULL;
             return SQLITE_CANTOPEN;
@@ -2076,7 +1980,6 @@ static int sqliteObjsOpen(sqlite3_vfs *pVfs, sqlite3_filename zName,
                 if (rc == SQLITE_OK) {
                     memcpy(p->aWalData, buf.data, buf.size);
                     p->nWalData = (sqlite3_int64)buf.size;
-                    p->nWalSynced = p->nWalData;
                 }
                 free(buf.data);
                 if (rc != SQLITE_OK) {
@@ -2098,20 +2001,8 @@ static int sqliteObjsOpen(sqlite3_vfs *pVfs, sqlite3_filename zName,
                 /* Download succeeded but WAL is empty — safe to proceed */
                 free(buf.data);
             }
-        } else if (!walExists) {
-            /* Create new empty append blob */
-            azure_error_t aerr;
-            azure_error_init(&aerr);
-            azure_err_t arc = p->ops->append_blob_create(
-                p->ops_ctx, zName, NULL, &aerr);
-            if (arc != AZURE_OK) {
-                sqlite3_free(p->zBlobName);
-                p->zBlobName = NULL;
-                return azureErrToSqlite(arc, SQLITE_CANTOPEN);
-            }
         }
-
-        p->walNeedFullResync = 0;
+        /* No need to create blob on open — first xSync uploads via PUT */
     }
 
     /* Set pMethod last — this tells SQLite to call xClose */

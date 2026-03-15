@@ -1996,11 +1996,10 @@ TEST(vfs_sync_resize_failure_before_flush) {
 TEST(vfs_wal_mode_returns_delete) {
     setup();
 
-    /* Temporarily clear append blob ops to test rejection path */
+    /* Temporarily clear block_blob_download to test WAL rejection path.
+    ** Keep block_blob_upload intact so journal sync still works. */
     azure_ops_t saved_ops = *g_ops;
-    g_ops->append_blob_create = NULL;
-    g_ops->append_blob_append = NULL;
-    g_ops->append_blob_delete = NULL;
+    g_ops->block_blob_download = NULL;
 
     sqlite3 *db = open_test_db(g_ctx);
     ASSERT_NOT_NULL(db);
@@ -2009,7 +2008,7 @@ TEST(vfs_wal_mode_returns_delete) {
     sqlite3_prepare_v2(db, "PRAGMA journal_mode=WAL;", -1, &stmt, NULL);
     ASSERT_EQ(sqlite3_step(stmt), SQLITE_ROW);
     const char *mode = (const char *)sqlite3_column_text(stmt, 0);
-    /* WAL must be rejected without append blob ops — stays "delete" */
+    /* WAL must be rejected without block blob ops — stays "delete" */
     ASSERT_STR_EQ(mode, "delete");
     sqlite3_finalize(stmt);
 
@@ -2024,7 +2023,7 @@ TEST(vfs_wal_mode_case_insensitive) {
     sqlite3 *db = open_test_db(g_ctx);
     ASSERT_NOT_NULL(db);
 
-    /* Test case variants of WAL — all should be accepted with append blob ops */
+    /* Test case variants of WAL — all should be accepted with block blob ops */
     const char *wal_variants[] = {"WAL", "wal", "Wal", NULL};
     for (int i = 0; wal_variants[i]; i++) {
         char sql[64];
