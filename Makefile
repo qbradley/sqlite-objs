@@ -201,6 +201,22 @@ $(BUILD_DIR)/test_integration: $(TEST_DIR)/test_integration.c $(TEST_DIR)/test_h
 
 test: test-unit test-integration
 
+# ---------- TCL Test Suite (official SQLite tests) ----------
+
+.PHONY: test-tcl test-tcl-build test-tcl-quick
+
+test-tcl-build:
+	@echo "=== Building testfixture-objs ==="
+	@bash test/tcl/build-testfixture.sh
+
+test-tcl: test-tcl-build
+	@echo "=== Running TCL test suite (sqlite-objs VFS) ==="
+	@bash test/tcl/run-tcl-tests.sh
+
+test-tcl-quick: test-tcl-build
+	@echo "=== Running TCL test suite (quick) ==="
+	@bash test/tcl/run-tcl-tests.sh --quick
+
 # ---------- Clean ----------
 
 clean:
@@ -250,6 +266,9 @@ help:
 	@echo "  test-unit        Run unit tests"
 	@echo "  test-integration Run integration tests (requires Azurite)"
 	@echo "  test             Run all tests"
+	@echo "  test-tcl         Run SQLite TCL test suite (sqlite-objs VFS)"
+	@echo "  test-tcl-quick   Run quick TCL test subset (~5 tests)"
+	@echo "  test-tcl-build   Build testfixture-objs only"
 	@echo "  sanitize         Run unit tests with ASan + UBSan"
 	@echo "  coverage         Generate code coverage report"
 	@echo "  clean            Remove all build artifacts"

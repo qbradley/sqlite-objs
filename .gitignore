@@ -33,3 +33,6 @@ research/azure-poc/azure_poc
 .squad/sessions/
 # Squad: SubSquad activation file (local to this machine)
 .squad-workstream
+
+# SQLite full source tree (cloned for TCL test suite)
+test/sqlite-src/
