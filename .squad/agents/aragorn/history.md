@@ -548,3 +548,39 @@ Replaced WAL sync path from append blobs (DELETE + CREATE + N×APPEND) to block 
 - **`rust/sqlite-objs-sys/csrc/`:** Synced with src/.
 - Kept `append_blob_*` vtable entries in `azure_ops_t` — zero cost, potential future use.
 - 242 unit tests pass, Rust tests pass, TCL tests pass.
+
+### Parallel WAL Upload — Put Block + Put Block List (2026-07)
+
+Implemented parallel WAL sync using Azure Block Blob staged upload (Put Block + Put Block List) to replace single PUT for large WAL buffers.
+
+**Changes:**
+- **`src/azure_client.h`:** Added `block_blob_upload_parallel` function pointer to `azure_ops_t` vtable.
+- **`src/azure_client.c`:** Implemented `az_block_blob_upload_parallel()` (~500 lines). Phase 1: splits data into chunks, uploads via curl_multi with retry logic. Phase 2: commits with Put Block List XML. Reuses persistent CURLM handle from `ensure_multi_handle()`. Falls back to single PUT for < 256 KiB.
+- **`src/sqlite_objs_vfs.c`:** Added `walParallelUpload` and `walChunkSize` to `sqliteObjsVfsData` (VFS-level, not per-file). PRAGMA `sqlite_objs_wal_parallel=ON/OFF` and `sqlite_objs_wal_chunk_size=<bytes>`. WAL sync path branches on flag.
+- **`test/mock_azure_ops.c`:** Added `OP_BLOCK_BLOB_UPLOAD_PARALLEL` with call tracking. Mock implementation identical to `mock_block_blob_upload` (no actual chunking).
+- **`test/test_wal.c`:** 5 new tests (PRAGMA toggle, basic upload, custom chunk size, round-trip, error propagation). Total: 247 unit tests.
+
+**Key design decisions:**
+- VFS-level config (not per-file) because WAL files inherit ops from VFS data, and PRAGMA executes on main DB file while sync happens on WAL file.
+- No env vars per UD7 — PRAGMA only.
+- Block IDs: "block-NNNN" base64-encoded (10 chars raw → constant base64 length).
+- Default OFF for A/B comparison; 1 MiB default chunk size.
+- Threshold: 256 KiB minimum for parallel (below that, single PUT is cheaper).
+- Forward-declared `ensure_multi_handle()` to avoid reordering the batch write section.
+
+### Download Counter & FCNTL Interface (2026-03-11)
+
+- Added `nDownloads` field to `sqliteObjsFile` struct (per-file, not global) — incremented only at `cache_download:` label when actual blob GET occurs.
+- Exposed via `SQLITE_OBJS_FCNTL_DOWNLOAD_COUNT` (op code 200) defined in `sqlite_objs.h`. Tests query via `sqlite3_file_control(db, "main", SQLITE_OBJS_FCNTL_DOWNLOAD_COUNT, &count)`.
+- Custom FCNTL op codes should live in `sqlite_objs.h` (public header) since both VFS and tests include it. SQLite reserves codes below ~100 for internal use; our custom codes start at 200.
+- **Bug fix:** CREATE path wasn't setting up persistent cache when `cache_reuse=1`. It used mkstemp (random name) and left `p->cacheReuse=0`, so ETag sidecar was never written on close. Fixed by calling `buildCachePath()` on CREATE when `cacheReuse` URI param is set, and setting `p->cacheReuse=1`. This was discovered because the download counter showed dlCount=1 where 0 was expected.
+- Pattern: `memset(p, 0, sizeof(sqliteObjsFile))` in xOpen zeroes all fields including new counters — no separate initialization needed.
+- ETag flow: xOpen captures ETag from `blob_get_properties`, xSync updates ETag from write responses, xClose writes ETag sidecar if `cacheReuse && etag[0] && !dirtyHasAny`. Second open compares stored vs live ETag.
+
+### ETag Cache Reuse Bug Fix — Batch Write Wipes ETag (2025-07-25)
+
+- **Root cause:** `az_page_blob_write_batch()` called `azure_error_init(err)` on success (line ~2090 in azure_client.c), which zeroed the entire `azure_error_t` struct — including `err->etag`. The VFS xSync checked `aerr.etag[0] != '\0'` after batch writes and found it empty, so `p->etag` was never updated past the initial value from xOpen. The sidecar always contained the open-time ETag, which was stale after any writes.
+- **Two-part fix:** (1) Primary: `sqliteObjsClose` now does a HEAD request via `blob_get_properties` to get the definitive current ETag before writing the sidecar. Only runs when `cacheReuse` is enabled and while the lease is still held. (2) Secondary: batch write captures ETag from last successful PUT response and restores it after the `azure_error_init` call.
+- **Key pattern:** `azure_error_init()` is a full memset-zero. Any code that calls it on success paths must re-populate any fields the caller needs (like ETag). This is a trap when adding new metadata fields to `azure_error_t`.
+- **Testing:** All 247 unit tests + 17 integration tests pass, including `etag_cache_hit`, `etag_cache_miss`, `etag_cache_reuse_wal`. Zero warnings.
+- **Files changed:** `src/azure_client.c`, `src/sqlite_objs_vfs.c`, plus csrc/ mirror.

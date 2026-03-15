@@ -180,3 +180,30 @@ Completed orchestration summary:
   - `mock_append_blob_delete_impl`: Removes blob from array (same logic as `mock_blob_delete_impl`).
   - Accessor functions: `mock_get_append_data()`, `mock_get_append_size()`, `mock_reset_append_data()`.
 - **Build:** Stub and production compile clean. All 207 unit tests pass.
+
+### WAL Blob Strategy Research: Append → Block Blob (2026-03-11)
+
+- **Problem:** WAL xSync using append blobs requires DELETE + CREATE(empty) + N×APPEND(4MiB chunks) = 2+N API calls per full resync. The body=0 PUT (create empty) and DELETE add ~57ms fixed overhead per resync.
+- **Key Azure API finding — Put Blob for append blobs cannot include body:** `Put Blob` with `x-ms-blob-type: AppendBlob` requires Content-Length: 0. No way to combine create + first append. Two calls minimum.
+- **Key Azure API finding — No truncate for append blobs:** Cannot reset, overwrite, or truncate an append blob. Only option is DELETE + CREATE.
+- **Key Azure API finding — Put Blob overwrites across blob types:** `Put Blob` with `x-ms-blob-type: BlockBlob` will overwrite ANY existing blob at the same path (including append blobs), replacing it with a block blob containing the provided data. This is atomic.
+- **Key Azure API finding — Block blob Put Blob size limit:** 5,000 MiB (4.88 GiB) per single `Put Blob` call. More than sufficient for WAL files (typically 1–50 MiB).
+- **Key Azure API finding — Same operation cost:** Both append and block blob write operations cost $0.05 per 10K operations. No cost difference.
+- **Recommendation:** Switch WAL from append blobs to block blobs. Every xSync becomes a single `Put Blob` call. Full resync: 2+N calls → 1 call. Incremental sync: N calls → 1 call. ~23% latency reduction for large WALs, ~62% for small WALs.
+- **Code impact:** `sqliteObjsSync` WAL path simplifies from ~100 lines to ~10 lines. `nWalSynced` and `walNeedFullResync` state tracking eliminated. Already have `block_blob_upload` in vtable and mock.
+- **Page blobs rejected for WAL:** 512-byte alignment adds unnecessary complexity; no advantage over block blobs for sequential/append workloads.
+- **No migration concerns:** First sync after code change automatically overwrites any existing append blob WAL with a block blob.
+- **Full analysis:** `.squad/decisions/inbox/frodo-wal-blob-strategy.md`
+
+### HTTP/2 Multiplexing Enabled (2026-06-13)
+
+- **Corrects earlier research:** Azure Parallel Write Research noted "HTTP/2: Dead end — Azure Blob Storage only supports HTTP/1.1." This was wrong; Azure Blob Storage does support HTTP/2 via TLS ALPN negotiation.
+- **Changes made to `src/azure_client.c`** (4 locations):
+  1. `execute_single()`: Added `CURLOPT_HTTP_VERSION = CURL_HTTP_VERSION_2TLS` after `curl_easy_reset()`. All single HTTP requests now negotiate HTTP/2 over TLS.
+  2. `ensure_multi_handle()`: Added `CURLMOPT_PIPELINING = CURLPIPE_MULTIPLEX` on the persistent CURLM handle. Enables true HTTP/2 stream multiplexing for batch operations.
+  3. `batch_init_easy()` (write batch): Added `CURLOPT_HTTP_VERSION = CURL_HTTP_VERSION_2TLS` and `CURLOPT_PIPEWAIT = 1L` on each easy handle. PIPEWAIT tells curl to wait for an existing multiplexed connection.
+  4. `read_batch_init_easy()` (read batch): Same HTTP/2 + PIPEWAIT settings as write batch.
+- **Graceful fallback:** `CURL_HTTP_VERSION_2TLS` means negotiate HTTP/2 via ALPN during TLS handshake; if server or libcurl doesn't support it, silently falls back to HTTP/1.1. No crash, no error.
+- **nghttp2 dependency:** HTTP/2 requires libcurl built with nghttp2. macOS Homebrew curl includes it. If absent, curl falls back silently.
+- **Synced to `rust/sqlite-objs-sys/csrc/azure_client.c`.**
+- **Build:** Zero warnings. All 242 unit tests pass.

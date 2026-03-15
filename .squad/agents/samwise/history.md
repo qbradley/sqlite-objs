@@ -326,3 +326,21 @@ All 6 failures are **platform/config issues, not VFS bugs:**
 - **15 empty-output tests** include 4 Windows-only (`win32*`), 2 zipfile extension tests, and various meta-runners (`mallocAll`, `memleak`, `permutations`, `soak`).
 - **Tests must be run sequentially in the same bld directory.** Parallel execution causes shared-state corruption.
 
+
+### ETag Cache Reuse Integration Tests (2026-03-10)
+
+- **3 new integration tests added** to `test/test_integration.c`, all passing against Azurite. Total: 17 integration tests.
+- **Tests written:**
+  1. `etag_cache_hit` — Open DB with `cache_reuse=1`, write data, close. Re-open same URI; verifies data survives ETag-matched cache reuse (no re-download).
+  2. `etag_cache_miss` — Seed DB with `cache_reuse=1`, close. Modify blob via separate connection (changes ETag). Re-open with cache_reuse; verifies MODIFIED data visible (forced re-download on ETag mismatch).
+  3. `etag_cache_reuse_wal` — WAL mode with cache_reuse: set exclusive locking + WAL, insert data, checkpoint, close. Re-open with cache_reuse, verify data, add more data, checkpoint, close. Third open verifies all rows survive.
+- **Key discovery: WAL requires `PRAGMA locking_mode=EXCLUSIVE` on EVERY open** — the VFS's xShmMap stub rejects shared-memory WAL. This must be set before any query that triggers WAL replay, including on re-open of a WAL-mode database.
+- **Cache reuse feature details:**
+  - URI parameter: `cache_reuse=1` (boolean, parsed via `sqlite3_uri_boolean`)
+  - Requires URI mode (`SQLITE_OPEN_URI`) with `azure_account` and `azure_container` params
+  - Cache file: `/tmp/sqlite-objs-{fnv1a_hash}.cache`, ETag sidecar: `.etag`
+  - `buildCachePath()` hashes `account:container:blobName` for deterministic naming
+  - On close: persists cache + writes ETag sidecar only if cache is clean and ETag valid
+  - On re-open: reads stored ETag, compares to blob's current ETag via `blob_get_properties()`
+  - Match → skip download, reuse `.cache` file. Mismatch → truncate + fresh download.
+- **Zero new compiler warnings** from the new test code (used `(const char *)` cast on `sqlite3_column_text` to avoid `-Wpointer-sign`).
