@@ -296,3 +296,33 @@ Root cause unclear - needs investigation into SQLite URI parameter API usage.
 - **TCL test suite is the gold standard** - 500+ tests covering edge cases we'd never think of
 - **VFS compatibility is a spectrum** - some tests will fail due to fundamental differences (locking model), others should pass
 
+### TCL Test Expansion — Full Sweep (2026-03-14)
+
+- **Completed full sweep of all 1,187 SQLite TCL test files against testfixture-objs.**
+- **Results:** 1,151 pass (0 errors), 6 fail (platform issues), 15 timeout (>30s), 15 empty output.
+- **Updated runner** (`test/tcl/run-tcl-tests.sh`) from 78 to 1,151 tests. Added `rm -rf testdir` cleanup between test runs to prevent cascading failures from stale state.
+- **Updated status doc** (`test/tcl-test-status.md`) with full categorized results, ~720K assertions.
+- **~1,073 newly passing tests** — crash recovery, corruption detection, FTS3/FTS4, WAL, window functions, CTEs, virtual tables, regression tickets, and many more all pass clean.
+- **Quick test subset** expanded from 5 to 10 tests (added join, fkey1, wal, json102, window1).
+
+#### Failure Investigation (Phase 2)
+
+All 6 failures are **platform/config issues, not VFS bugs:**
+
+1. **func.test (9/15,031):** `Inf` vs `inf` — macOS libc lowercases infinity in printf. Tests expect glibc behavior.
+2. **json101.test (2/278):** Same `Inf` vs `inf` printf issue in JSON infinity tests.
+3. **json501.test (3/185):** Same `Inf` vs `inf` printf issue in JSONB infinity tests.
+4. **literal.test (9/97):** Same `Inf` vs `inf` printf issue in literal typeof() tests.
+5. **loadext.test (2/52):** macOS dlopen error message format changed — test regex expects old `image.*found` format but modern macOS lists all searched paths.
+6. **types3.test (1/19):** TCL 8.5 returns `string text` for `tcl_objtype` where test expects `text`. Cascading failures (5 more) from initial state corruption.
+
+**Key insight:** Zero VFS-related failures. All are macOS platform or TCL version differences.
+
+#### Sweep Learnings
+
+- **Stale testdir causes cascading failures.** Tests that leave behind `testdir/` corrupt subsequent tests. Must `rm -rf testdir` between runs. Added this to the runner.
+- **Some tests delete the testfixture binary** (likely a clean-all test). The initial sweep lost the binary partway through, causing ~80 tests to show as EMPTY. Re-sweep of affected tests recovered 78 more passes.
+- **15 timeout tests** are mostly meta-runners (`all`, `quick`, `full`, `veryquick`, `extraquick`) that recursively run other tests, plus heavy fault injection tests (`pagerfault`, `sortfault`, `backup_ioerr`).
+- **15 empty-output tests** include 4 Windows-only (`win32*`), 2 zipfile extension tests, and various meta-runners (`mallocAll`, `memleak`, `permutations`, `soak`).
+- **Tests must be run sequentially in the same bld directory.** Parallel execution causes shared-state corruption.
+
