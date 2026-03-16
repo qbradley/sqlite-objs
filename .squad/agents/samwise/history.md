@@ -344,3 +344,13 @@ All 6 failures are **platform/config issues, not VFS bugs:**
   - On re-open: reads stored ETag, compares to blob's current ETag via `blob_get_properties()`
   - Match → skip download, reuse `.cache` file. Mismatch → truncate + fresh download.
 - **Zero new compiler warnings** from the new test code (used `(const char *)` cast on `sqlite3_column_text` to avoid `-Wpointer-sign`).
+
+### ETag Batch Write Regression Test Improvement (2026-03-14)
+
+- **Rewrote `etag_cache_reuse_wal`** in `test/test_integration.c` to exercise the `az_page_blob_write_batch()` curl_multi code path that was previously untested.
+- **Root cause of original bug:** `az_page_blob_write_batch()` called `azure_error_init(err)` on success, zeroing the ETag. The ETag sidecar always had a stale value, so cache reuse never worked for batch-written databases.
+- **Test strategy:** WAL mode + `PRAGMA wal_autocheckpoint=10` (low threshold) + 300 rows × 200-byte payloads in 6 batches of 50. Each COMMIT can trigger an autocheckpoint that flushes ~10+ dirty pages through `write_batch` (nRanges > 1 → curl_multi path).
+- **Critical assertion added:** `SQLITE_OBJS_FCNTL_DOWNLOAD_COUNT == 0` on second open — proves the ETag sidecar correctly matches the blob's current ETag after batch writes.
+- **Also verifies:** data integrity (all 300 rows present, correct payload lengths).
+- **Key insight for future tests:** To exercise `az_page_blob_write_batch` in tests, you need nRanges > 1 (i.e., multiple dirty pages in a single checkpoint). A low `wal_autocheckpoint` threshold combined with bulk inserts forces this path. Single-row tests never hit the batch code.
+- **Zero new compiler warnings.** All 17 integration tests pass.

@@ -1183,6 +1183,17 @@ TEST(etag_cache_miss) {
  * 3. Insert more data via WAL, close, re-open — still intact
  */
 TEST(etag_cache_reuse_wal) {
+    /*
+     * Regression test for the batch-write ETag bug: az_page_blob_write_batch()
+     * used to call azure_error_init(err) on success, zeroing the ETag. This
+     * caused the ETag sidecar to always hold a stale ETag, so cache reuse
+     * NEVER worked for databases that went through the batch write path.
+     *
+     * Strategy: use WAL mode with a low autocheckpoint threshold and insert
+     * enough data to force multiple checkpoint cycles that each flush many
+     * dirty pages through az_page_blob_write_batch() (curl_multi path).
+     * After close, reopen with cache_reuse=1 and assert download_count == 0.
+     */
     const char *db_name = "etag-wal.db";
     cleanup_blob(db_name);
     cleanup_blob("etag-wal.db-journal");
@@ -1202,7 +1213,15 @@ TEST(etag_cache_reuse_wal) {
         "&cache_reuse=1",
         db_name);
 
-    /* --- First open: switch to WAL mode, create schema + data --- */
+    /* Total rows to insert across all batches */
+    const int total_rows = 300;
+    /* Rows per transaction — each commit may trigger an autocheckpoint */
+    const int batch_size = 50;
+    /* 200-byte payload per row to fill pages quickly (4096-byte page ≈ 5-6
+     * rows), giving ~50-60 dirty pages total across checkpoint cycles. */
+    const int payload_len = 200;
+
+    /* --- First open: WAL mode + batch writes via low autocheckpoint --- */
     sqlite3 *db = NULL;
     rc = sqlite3_open_v2(uri, &db,
         SQLITE_OPEN_URI | SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE,
@@ -1222,7 +1241,7 @@ TEST(etag_cache_reuse_wal) {
     /* Enable WAL journal mode */
     rc = sqlite3_exec(db, "PRAGMA journal_mode=WAL;", NULL, NULL, &errmsg);
     if (rc != SQLITE_OK) {
-        fprintf(stderr, "  etag_wal PRAGMA failed: %s\n", errmsg ? errmsg : "?");
+        fprintf(stderr, "  etag_wal journal_mode: %s\n", errmsg ? errmsg : "?");
         sqlite3_free(errmsg);
     }
     ASSERT_OK(rc);
@@ -1237,17 +1256,73 @@ TEST(etag_cache_reuse_wal) {
     ASSERT_STR_EQ(jmode, "wal");
     sqlite3_finalize(stmt);
 
-    rc = sqlite3_exec(db,
-        "CREATE TABLE wal_t (id INTEGER PRIMARY KEY, val TEXT);"
-        "INSERT INTO wal_t VALUES (1, 'wal_first');",
-        NULL, NULL, &errmsg);
+    /* Low autocheckpoint threshold forces frequent batch checkpoints.
+     * With 10 pages, each checkpoint flushes ~10 dirty pages through
+     * az_page_blob_write_batch() using curl_multi handles (nRanges > 1). */
+    rc = sqlite3_exec(db, "PRAGMA wal_autocheckpoint=10;", NULL, NULL, &errmsg);
     if (rc != SQLITE_OK) {
-        fprintf(stderr, "  etag_wal setup SQL: %s\n", errmsg ? errmsg : "?");
+        fprintf(stderr, "  etag_wal autocheckpoint: %s\n", errmsg ? errmsg : "?");
         sqlite3_free(errmsg);
     }
     ASSERT_OK(rc);
 
-    /* Checkpoint to flush WAL to main db before close */
+    /* Create the table */
+    rc = sqlite3_exec(db,
+        "CREATE TABLE wal_t (id INTEGER PRIMARY KEY, val TEXT);",
+        NULL, NULL, &errmsg);
+    if (rc != SQLITE_OK) {
+        fprintf(stderr, "  etag_wal create: %s\n", errmsg ? errmsg : "?");
+        sqlite3_free(errmsg);
+    }
+    ASSERT_OK(rc);
+
+    /* Build a deterministic 200-byte payload: "row_NNNN_AAAAAA..." */
+    char payload[201];
+    memset(payload, 'X', payload_len);
+    payload[payload_len] = '\0';
+
+    /* Prepare INSERT statement for binding in the loop */
+    sqlite3_stmt *ins = NULL;
+    rc = sqlite3_prepare_v2(db,
+        "INSERT INTO wal_t VALUES (?, ?);", -1, &ins, NULL);
+    ASSERT_OK(rc);
+
+    /* Insert rows in batches — each COMMIT may trigger an autocheckpoint
+     * that flushes dirty pages through the batch write path. */
+    for (int base = 1; base <= total_rows; base += batch_size) {
+        rc = sqlite3_exec(db, "BEGIN;", NULL, NULL, &errmsg);
+        if (rc != SQLITE_OK) {
+            fprintf(stderr, "  etag_wal BEGIN: %s\n", errmsg ? errmsg : "?");
+            sqlite3_free(errmsg);
+        }
+        ASSERT_OK(rc);
+
+        int end = base + batch_size;
+        if (end > total_rows + 1) end = total_rows + 1;
+        for (int i = base; i < end; i++) {
+            /* Make each payload unique for data-integrity verification */
+            snprintf(payload, sizeof(payload), "row_%04d_", i);
+            memset(payload + 9, 'A' + (i % 26), (size_t)(payload_len - 9));
+            payload[payload_len] = '\0';
+
+            sqlite3_bind_int(ins, 1, i);
+            sqlite3_bind_text(ins, 2, payload, payload_len, SQLITE_TRANSIENT);
+            rc = sqlite3_step(ins);
+            ASSERT_EQ(rc, SQLITE_DONE);
+            sqlite3_reset(ins);
+        }
+
+        rc = sqlite3_exec(db, "COMMIT;", NULL, NULL, &errmsg);
+        if (rc != SQLITE_OK) {
+            fprintf(stderr, "  etag_wal COMMIT: %s\n", errmsg ? errmsg : "?");
+            sqlite3_free(errmsg);
+        }
+        ASSERT_OK(rc);
+    }
+    sqlite3_finalize(ins);
+
+    /* Final TRUNCATE checkpoint to ensure all WAL content is flushed
+     * to the main DB before close.  This is the last batch write. */
     rc = sqlite3_exec(db, "PRAGMA wal_checkpoint(TRUNCATE);", NULL, NULL, &errmsg);
     if (rc != SQLITE_OK) {
         fprintf(stderr, "  etag_wal checkpoint: %s\n", errmsg ? errmsg : "?");
@@ -1258,7 +1333,7 @@ TEST(etag_cache_reuse_wal) {
     rc = sqlite3_close(db);
     ASSERT_OK(rc);
 
-    /* --- Second open: cache_reuse should hit ETag match --- */
+    /* --- Second open: cache_reuse must hit ETag match (no download) --- */
     db = NULL;
     rc = sqlite3_open_v2(uri, &db,
         SQLITE_OPEN_URI | SQLITE_OPEN_READWRITE,
@@ -1270,55 +1345,51 @@ TEST(etag_cache_reuse_wal) {
     rc = sqlite3_exec(db, "PRAGMA locking_mode=EXCLUSIVE;", NULL, NULL, &errmsg);
     ASSERT_OK(rc);
 
-    /* Data from first session must be visible */
-    stmt = NULL;
-    rc = sqlite3_prepare_v2(db,
-        "SELECT val FROM wal_t WHERE id = 1;", -1, &stmt, NULL);
-    ASSERT_OK(rc);
-    rc = sqlite3_step(stmt);
-    ASSERT_EQ(rc, SQLITE_ROW);
-    ASSERT_STR_EQ((const char *)sqlite3_column_text(stmt, 0), "wal_first");
-    sqlite3_finalize(stmt);
-
-    /* Insert more data in WAL mode */
-    rc = sqlite3_exec(db,
-        "INSERT INTO wal_t VALUES (2, 'wal_second');",
-        NULL, NULL, &errmsg);
-    if (rc != SQLITE_OK) {
-        fprintf(stderr, "  etag_wal insert2: %s\n", errmsg ? errmsg : "?");
-        sqlite3_free(errmsg);
+    /* CRITICAL ASSERTION: download count must be 0 — the ETag sidecar
+     * written after the batch checkpoint must match the blob's current ETag.
+     * Before the fix, az_page_blob_write_batch() zeroed the ETag on success,
+     * making the sidecar stale and forcing a re-download every time. */
+    {
+        int dlCount = -1;
+        rc = sqlite3_file_control(db, "main",
+                                  SQLITE_OBJS_FCNTL_DOWNLOAD_COUNT, &dlCount);
+        ASSERT_OK(rc);
+        if (dlCount != 0) {
+            fprintf(stderr,
+                "  etag_wal FAIL: download_count=%d (expected 0) — "
+                "ETag sidecar was stale after batch write\n", dlCount);
+        }
+        ASSERT_EQ(dlCount, 0);
     }
-    ASSERT_OK(rc);
 
-    /* Checkpoint + close */
-    rc = sqlite3_exec(db, "PRAGMA wal_checkpoint(TRUNCATE);", NULL, NULL, &errmsg);
-    if (rc != SQLITE_OK) {
-        fprintf(stderr, "  etag_wal checkpoint2: %s\n", errmsg ? errmsg : "?");
-        sqlite3_free(errmsg);
-    }
-    ASSERT_OK(rc);
-
-    rc = sqlite3_close(db);
-    ASSERT_OK(rc);
-
-    /* --- Third open: should cache-reuse again, see both rows --- */
-    db = NULL;
-    rc = sqlite3_open_v2(uri, &db,
-        SQLITE_OPEN_URI | SQLITE_OPEN_READWRITE,
-        "sqlite-objs");
-    ASSERT_OK(rc);
-    ASSERT_NOT_NULL(db);
-
-    rc = sqlite3_exec(db, "PRAGMA locking_mode=EXCLUSIVE;", NULL, NULL, &errmsg);
-    ASSERT_OK(rc);
-
+    /* Data integrity: all 300 rows must be present */
     stmt = NULL;
     rc = sqlite3_prepare_v2(db,
         "SELECT COUNT(*) FROM wal_t;", -1, &stmt, NULL);
     ASSERT_OK(rc);
     rc = sqlite3_step(stmt);
     ASSERT_EQ(rc, SQLITE_ROW);
-    ASSERT_EQ(sqlite3_column_int(stmt, 0), 2);
+    ASSERT_EQ(sqlite3_column_int(stmt, 0), total_rows);
+    sqlite3_finalize(stmt);
+
+    /* Spot-check first and last rows */
+    stmt = NULL;
+    rc = sqlite3_prepare_v2(db,
+        "SELECT length(val) FROM wal_t WHERE id = 1;", -1, &stmt, NULL);
+    ASSERT_OK(rc);
+    rc = sqlite3_step(stmt);
+    ASSERT_EQ(rc, SQLITE_ROW);
+    ASSERT_EQ(sqlite3_column_int(stmt, 0), payload_len);
+    sqlite3_finalize(stmt);
+
+    stmt = NULL;
+    rc = sqlite3_prepare_v2(db,
+        "SELECT length(val) FROM wal_t WHERE id = ?;", -1, &stmt, NULL);
+    ASSERT_OK(rc);
+    sqlite3_bind_int(stmt, 1, total_rows);
+    rc = sqlite3_step(stmt);
+    ASSERT_EQ(rc, SQLITE_ROW);
+    ASSERT_EQ(sqlite3_column_int(stmt, 0), payload_len);
     sqlite3_finalize(stmt);
 
     sqlite3_close(db);

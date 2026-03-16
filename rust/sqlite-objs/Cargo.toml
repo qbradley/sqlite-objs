@@ -18,6 +18,8 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"], optional = tr
 [dev-dependencies]
 rusqlite = "0.38"
 tempfile = "3.8"
+uuid = { version = "1", features = ["v4"] }
+dotenvy = "0.15"
 
 [features]
 bin-deps = ["dep:rusqlite", "dep:dotenvy", "dep:tracing-subscriber"]

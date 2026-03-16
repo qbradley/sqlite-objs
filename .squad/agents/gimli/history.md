@@ -281,3 +281,76 @@ code regresses to a shared curl handle without locking, these tests won't direct
 don't use Azure), but they establish the threading contract expected by Rust users. Future Azure
 integration tests will combine this threading pattern with real Azure operations.
 
+### Performance Matrix Test Suite (2025-07)
+
+**Added:** `rust/sqlite-objs/tests/perf_matrix.rs` — 200 independent test functions that reproduce
+the microsoft/duroxide team's performance benchmarking methodology. Tests exercise realistic SQLite
+operations across three backends controlled by `PERF_MODE` env var.
+
+**Three Modes:**
+1. `memory` (default) — `:memory:` databases via `Connection::open_in_memory()` — fastest baseline
+2. `file` — Local temp files via `tempfile::TempDir` — file I/O overhead
+3. `azure` — Azure blob storage via sqlite-objs VFS + `UriBuilder` — network + cloud latency
+
+**Test Distribution (200 tests total):**
+- **Schema CRUD** (30 tests) — CREATE TABLE/INDEX/VIEW/TRIGGER, DROP, ALTER, various constraints
+- **Single-row ops** (40 tests) — INSERT/SELECT/UPDATE/DELETE across all data types, edge cases
+- **Bulk operations** (40 tests) — Batch inserts, complex queries, aggregates, window functions
+- **Transactions** (30 tests) — BEGIN/COMMIT/ROLLBACK, savepoints, isolation levels, conflict resolution
+- **Complex queries** (30 tests) — JOINs, subqueries, CTEs, UNION/INTERSECT/EXCEPT, recursive queries
+- **WAL mode** (15 tests) — Checkpoint operations (PASSIVE/FULL/RESTART/TRUNCATE), autocheckpoint
+- **Provider patterns** (17 tests) — Work-item lifecycle, peek-lock semantics, priority queues, message properties
+
+**Key Implementation Details:**
+
+*Test Generation:* Macro-based test generation (`schema_test!`, `single_row_test!`, etc.) for DRY
+pattern reuse. Each test creates a fresh database with unique UUID blob name for Azure mode.
+
+*VFS Registration:* Lazy one-time VFS registration via `OnceLock` for Azure mode. Loads credentials
+from env vars (`AZURE_STORAGE_ACCOUNT`, `AZURE_STORAGE_CONTAINER`, `AZURE_STORAGE_SAS`).
+
+*PRAGMA Configuration:* All databases configure `journal_mode=WAL`, `synchronous=NORMAL`,
+`busy_timeout=60000` via `configure_pragmas()`. In-memory databases automatically use MEMORY journal
+mode (WAL not supported).
+
+*Mode-Specific Behavior:* WAL checkpoint tests skip in memory mode (return early). Window function
+tests use CTE pattern to avoid WHERE-clause filtering issues with window functions. PRAGMA queries
+use `query_row()` not `execute()` since they return results.
+
+**Customer Context:** The microsoft/duroxide team ran 202 provider-validation tests across three
+backends and measured scaling from `-j1` to `-j28`. Azure blob storage showed strong scaling (20x
+improvement) despite high absolute latency. Our test suite reproduces the test shape (independent
+test functions, fresh databases, CRUD operations) to enable local performance profiling.
+
+**Usage:**
+```bash
+# In-memory (default)
+cd rust && cargo nextest run --test perf_matrix -j 14
+
+# Local file
+cd rust && PERF_MODE=file cargo nextest run --test perf_matrix -j 14
+
+# Azure blob storage
+cd rust && PERF_MODE=azure cargo nextest run --test perf_matrix -j 14
+
+# Performance comparison
+for j in 1 4 14 28; do
+  time PERF_MODE=file cargo nextest run --test perf_matrix -j $j
+done
+```
+
+**Dependencies Added:**
+- `uuid = { version = "1", features = ["v4"] }` in `[dev-dependencies]` for unique blob names
+
+**Verification:** All 200 tests pass in both memory and file modes. Memory mode: 0.05s. File mode:
+0.11s. Azure mode not tested (requires live credentials).
+
+**Learnings:**
+- In-memory databases don't support WAL mode — automatically use MEMORY journal mode
+- Window functions (LEAD/LAG/RANK/ROW_NUMBER) require CTE pattern when filtering results
+- PRAGMA queries return result sets — use `query_row()` not `execute()`
+- PRAGMA synchronous returns i64 (0=OFF, 1=NORMAL, 2=FULL, 3=EXTRA), not string
+- PRAGMA wal_checkpoint returns (i32, i32, i32) tuple — (busy, log pages, checkpointed pages)
+- Each nextest test runs in its own process — full test isolation, safe for parallel execution
+
+
