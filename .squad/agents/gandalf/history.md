@@ -100,3 +100,17 @@ Completed comprehensive design review (D1-D11). Verdict: **APPROVE WITH CONDITIO
 - **Interaction with 1GB default cache:** For databases <1GB, readahead is mostly irrelevant (everything cached after prefetch). For >1GB databases, adaptive readahead is the primary performance lever.
 - **Estimated 3 days to implement** across 4 phases: core state machine, config migration, observability, validation.
 - **Status:** PROPOSED — awaiting Brady's review before implementation.
+
+### Rust VFS Integration Test Architecture (2025-07-18)
+
+- **Produced comprehensive test architecture:** `.squad/decisions/inbox/gandalf-vfs-test-architecture.md` (D-TEST). Designed 54 new Rust integration tests across 6 categories: lifecycle (9), transactions (12), cache reuse (9), threading extensions (5), growth/shrink (11), error recovery (8).
+- **Key design: TestDb fixture + SeededData.** TestDb abstracts over local/Azurite/Azure backends with RAII cleanup. SeededData uses deterministic hash-based generation — given a seed and row index, regenerates expected values at verification time without storing them. No `#[ignore]` — Azure tests auto-skip when credentials absent.
+- **Key design: FCNTL download counter wrapper.** The C VFS exposes `SQLITE_OBJS_FCNTL_DOWNLOAD_COUNT` (op 200). Wrapped via unsafe FFI through rusqlite's raw handle to validate ETag cache reuse: `download_count == 0` means cache hit, `> 0` means fresh download.
+- **Key design: Dirty shutdown via `mem::forget`.** Prevents `Drop` → `sqlite3_close` → `xClose`, simulating process crash. Tests verify committed data survives (synced to Azure) while uncommitted data is lost. Journal hot recovery tested by forgetting mid-transaction.
+- **VFS coverage matrix:** All 18 io_methods mapped to test categories. Only xRandomness/xSleep/xCurrentTime/xDlOpen uncovered (OS-level delegation, no Azure interaction).
+- **File organization:** 6 new test files + shared `common/` module. Existing azure_smoke.rs, threading.rs, perf_matrix.rs unchanged. One file per concern, independently runnable via `cargo test --test <name>`.
+- **Threading model validated:** Rust `Connection` is Send but NOT Sync. Each thread must own its connection. Barrier-based synchronization for coordinated test starts.
+- **No new dependencies required.** All test infrastructure uses std + existing dev-deps (rusqlite, tempfile, uuid, dotenvy).
+- **Implementation estimate:** 4.5 days across 4 phases. Phase 1 (foundation) → Phase 2 (correctness) → Phase 3 (robustness) → Phase 4 (completeness).
+- **5 open questions for Brady:** Thread count for CI, FCNTL wrapper placement (test-only vs crate API), WAL vs journal default, real Azure cadence, Toxiproxy deferral.
+- **Status:** PROPOSED — awaiting Brady's review before implementation.
