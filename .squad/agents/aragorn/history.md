@@ -584,3 +584,23 @@ Implemented parallel WAL sync using Azure Block Blob staged upload (Put Block + 
 - **Key pattern:** `azure_error_init()` is a full memset-zero. Any code that calls it on success paths must re-populate any fields the caller needs (like ETag). This is a trap when adding new metadata fields to `azure_error_t`.
 - **Testing:** All 247 unit tests + 17 integration tests pass, including `etag_cache_hit`, `etag_cache_miss`, `etag_cache_reuse_wal`. Zero warnings.
 - **Files changed:** `src/azure_client.c`, `src/sqlite_objs_vfs.c`, plus csrc/ mirror.
+
+### Stale-Read Race Condition Fix (2026-03-15)
+
+**Bug:** Concurrent clients could read stale data after lease acquisition. Between xOpen (which downloads the blob without a lease) and xLock (which acquires the lease for writes), another client could modify the blob. The local cache from xOpen would be stale, causing lost updates.
+
+**Fix:** Added `revalidateAfterLease()` static function in `sqlite_objs_vfs.c`, called from `sqliteObjsLock()` immediately after successful `lease_acquire()`. The function:
+1. Compares the ETag from the lease_acquire response with the stored ETag from xOpen (fast path — avoids extra HEAD request when ETags match)
+2. If lease response has no ETag, falls back to a HEAD request via `blob_get_properties`
+3. On ETag mismatch, re-downloads the entire blob into the cache file, resets dirty bitmap, updates page size and size tracking
+4. On error, releases the lease before returning the error code to SQLite
+
+**Key patterns:**
+- Fast path via lease response ETag avoids extra HEAD request in the common (no-contention) case
+- Only fires for MAIN_DB files (not journal/WAL), only when transitioning from no-lease to having-lease
+- Defensive check: if dirty pages exist at revalidation time, returns SQLITE_IOERR (should never happen — SQLite doesn't write without RESERVED)
+- On revalidation failure, lease is released to avoid orphaned leases
+
+**Critical discovery:** The Rust test suite (`rust/sqlite-objs/`) compiles C sources from `rust/sqlite-objs-sys/csrc/`, NOT from `src/`. Changes must be applied to BOTH locations. There is no automated sync mechanism. The `cc` crate in `rust/sqlite-objs-sys/build.rs` compiles the csrc files independently of the Makefile.
+
+**Test validated:** `concurrent_client_contention` (20 threads, Azurite) — counter=20 with zero lost updates.

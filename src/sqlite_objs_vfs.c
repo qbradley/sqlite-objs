@@ -1272,6 +1272,169 @@ static int sqliteObjsFileSize(sqlite3_file *pFile, sqlite3_int64 *pSize) {
 }
 
 /*
+** Re-validate the local cache after acquiring an Azure lease.
+**
+** Between xOpen (which downloads the blob without a lease) and xLock
+** (which acquires the lease for writes), another client may have modified
+** the blob.  If the blob's ETag has changed, re-download the entire blob
+** into the cache file so that subsequent reads see the latest data.
+**
+** This prevents the stale-read race condition where a client reads
+** data that was overwritten by a concurrent writer.
+**
+** Parameters:
+**   p          — the open MAIN_DB file
+**   leaseEtag  — ETag returned by the lease_acquire response (may be empty)
+**
+** Returns SQLITE_OK if cache is valid (or successfully refreshed),
+** or an appropriate error code on failure.
+*/
+static int revalidateAfterLease(sqliteObjsFile *p, const char *leaseEtag) {
+    /* Only applies to MAIN_DB files with cache and a stored ETag */
+    if (p->eFileType != SQLITE_OPEN_MAIN_DB) return SQLITE_OK;
+    if (p->cacheFd < 0) return SQLITE_OK;
+    if (p->etag[0] == '\0') return SQLITE_OK;
+    if (!p->ops) return SQLITE_OK;
+
+    /* Fast path: compare ETag from the lease response */
+    if (leaseEtag && leaseEtag[0] != '\0') {
+        if (strcmp(p->etag, leaseEtag) == 0) {
+            return SQLITE_OK;  /* Cache is still valid */
+        }
+    }
+
+    /* Either no ETag from lease, or ETag mismatch — do a HEAD to confirm
+    ** and get the current blob size (needed for re-download). */
+    if (!p->ops->blob_get_properties) return SQLITE_OK;
+
+    int64_t blobSize = 0;
+    azure_error_t aerr;
+    azure_error_init(&aerr);
+    azure_err_t arc = p->ops->blob_get_properties(
+        p->ops_ctx, p->zBlobName, &blobSize, NULL, NULL, &aerr);
+    if (arc != AZURE_OK) {
+        return azureErrToSqlite(arc, SQLITE_IOERR_READ);
+    }
+
+    /* Compare ETags */
+    if (aerr.etag[0] == '\0' || strcmp(p->etag, aerr.etag) == 0) {
+        return SQLITE_OK;  /* Cache is still valid */
+    }
+
+    /* ETag mismatch — blob has changed since xOpen.  Re-download. */
+    double t0 = 0;
+    if (sqlite_objs_debug_timing()) {
+        t0 = sqlite_objs_time_ms();
+        fprintf(stderr, "[TIMING] revalidateAfterLease: ETag mismatch "
+                "(cached=%.32s, current=%.32s, blob=%s) — re-downloading\n",
+                p->etag, aerr.etag, p->zBlobName);
+    }
+
+    /* Defensive: if dirty pages exist something is very wrong — SQLite should
+    ** not write without RESERVED, and we just acquired RESERVED now. */
+    if (dirtyHasAny(p)) {
+        return SQLITE_IOERR_READ;
+    }
+
+    /* Update stored ETag */
+    memcpy(p->etag, aerr.etag, sizeof(p->etag));
+
+    if (blobSize <= 0) {
+        /* Blob was truncated to empty */
+        if (ftruncate(p->cacheFd, 0) != 0) return SQLITE_IOERR;
+        p->nData = 0;
+        dirtyClearAll(p);
+        p->lastSyncedSize = 0;
+        return SQLITE_OK;
+    }
+
+    /* Download the fresh blob contents */
+    unsigned char *tempBuf = (unsigned char *)malloc(blobSize);
+    if (!tempBuf) return SQLITE_NOMEM;
+
+    azure_error_init(&aerr);
+    if (p->ops->page_blob_read_multi) {
+        arc = p->ops->page_blob_read_multi(
+            p->ops_ctx, p->zBlobName, blobSize, tempBuf, &aerr);
+    } else if (p->ops->page_blob_read) {
+        azure_buffer_t buf = {0};
+        arc = p->ops->page_blob_read(p->ops_ctx, p->zBlobName,
+                                      0, (size_t)blobSize, &buf, &aerr);
+        if (arc == AZURE_OK) {
+            if (!buf.data || buf.size == 0) {
+                arc = AZURE_ERR_INVALID_ARG;
+            } else {
+                int64_t copyLen = (int64_t)buf.size;
+                if (copyLen > blobSize) copyLen = blobSize;
+                memcpy(tempBuf, buf.data, (size_t)copyLen);
+            }
+        }
+        free(buf.data);
+    } else {
+        free(tempBuf);
+        return SQLITE_IOERR;
+    }
+
+    if (arc != AZURE_OK) {
+        free(tempBuf);
+        return azureErrToSqlite(arc, SQLITE_IOERR_READ);
+    }
+
+    /* Rewrite cache file with fresh data */
+    if (lseek(p->cacheFd, 0, SEEK_SET) != 0) {
+        free(tempBuf);
+        return SQLITE_IOERR;
+    }
+    if (ftruncate(p->cacheFd, 0) != 0) {
+        free(tempBuf);
+        return SQLITE_IOERR;
+    }
+
+    ssize_t totalWritten = 0;
+    while (totalWritten < blobSize) {
+        ssize_t nWritten = write(p->cacheFd, tempBuf + totalWritten,
+                                blobSize - totalWritten);
+        if (nWritten <= 0) {
+            free(tempBuf);
+            return SQLITE_IOERR;
+        }
+        totalWritten += nWritten;
+    }
+
+    if (fsync(p->cacheFd) != 0) {
+        free(tempBuf);
+        return SQLITE_IOERR;
+    }
+
+    free(tempBuf);
+
+    p->nData = blobSize;
+    p->nDownloads++;
+
+    /* Re-detect page size from fresh data */
+    unsigned char header[100];
+    ssize_t nRead = pread(p->cacheFd, header, sizeof(header), 0);
+    if (nRead == (ssize_t)sizeof(header)) {
+        int detected = detectPageSize(header, sizeof(header));
+        if (detected > 0) p->pageSize = detected;
+    }
+
+    /* Reset dirty bitmap and size tracking */
+    dirtyEnsureCapacity(p);
+    dirtyClearAll(p);
+    p->lastSyncedSize = p->nData;
+
+    if (sqlite_objs_debug_timing()) {
+        double elapsed = sqlite_objs_time_ms() - t0;
+        fprintf(stderr, "[TIMING] revalidateAfterLease: re-download complete "
+                "%.1fms (%lld bytes, blob=%s)\n",
+                elapsed, (long long)blobSize, p->zBlobName);
+    }
+
+    return SQLITE_OK;
+}
+
+/*
 ** xLock — Upgrade the lock level.
 ** Two-level lease model from Decision 3:
 **   SHARED: no-op (reads don't need a lease)
@@ -1326,6 +1489,23 @@ static int sqliteObjsLock(sqlite3_file *pFile, int eLock) {
         }
         p->leaseAcquiredAt = time(NULL);
         p->leaseDuration = duration;
+
+        /* Re-validate: if the blob changed since xOpen, re-download
+        ** before SQLite reads any data under this new lease. */
+        int rv = revalidateAfterLease(p, aerr.etag);
+        if (rv != SQLITE_OK) {
+            /* Re-validation failed — release the lease we just acquired
+            ** so we don't hold it while returning an error. */
+            if (p->ops->lease_release) {
+                azure_error_t releaseErr;
+                azure_error_init(&releaseErr);
+                p->ops->lease_release(p->ops_ctx, p->zBlobName,
+                                       p->leaseId, &releaseErr);
+            }
+            p->leaseId[0] = '\0';
+            p->leaseAcquiredAt = 0;
+            return rv;
+        }
     }
 
     p->eLock = eLock;
