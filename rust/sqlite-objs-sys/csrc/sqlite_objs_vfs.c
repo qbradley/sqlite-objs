@@ -144,6 +144,7 @@ typedef struct sqliteObjsFile {
 
     /* ETag tracking for cache invalidation */
     char etag[128];                     /* Current blob ETag */
+    char snapshot[128];                 /* Last blob snapshot datetime (for incremental diff) */
     int cacheReuse;                     /* 1 = persistent cache with ETag validation */
 
     /* File type */
@@ -430,6 +431,210 @@ static void unlinkEtagFile(const char *cachePath) {
 }
 
 /*
+** Build the snapshot sidecar path: replace .cache with .snapshot
+*/
+static char *buildSnapshotPath(const char *cachePath) {
+    if (!cachePath) return NULL;
+    size_t len = strlen(cachePath);
+    const char *suffix = ".cache";
+    size_t suffixLen = 6;
+    if (len >= suffixLen && strcmp(cachePath + len - suffixLen, suffix) == 0) {
+        size_t baseLen = len - suffixLen;
+        char *path = (char *)malloc(baseLen + 10);  /* ".snapshot\0" */
+        if (!path) return NULL;
+        memcpy(path, cachePath, baseLen);
+        memcpy(path + baseLen, ".snapshot", 10);
+        return path;
+    }
+    char *path = (char *)malloc(len + 10);
+    if (!path) return NULL;
+    memcpy(path, cachePath, len);
+    memcpy(path + len, ".snapshot", 10);
+    return path;
+}
+
+/*
+** Read stored snapshot datetime from sidecar file.
+** Returns 0 on success, -1 on failure.
+*/
+static int readSnapshotFile(const char *cachePath, char *buf, size_t bufSize) {
+    if (!cachePath || !buf || bufSize == 0) return -1;
+    char *snapPath = buildSnapshotPath(cachePath);
+    if (!snapPath) return -1;
+    int fd = open(snapPath, O_RDONLY);
+    free(snapPath);
+    if (fd < 0) return -1;
+    ssize_t n = read(fd, buf, bufSize - 1);
+    close(fd);
+    if (n <= 0) return -1;
+    while (n > 0 && (buf[n-1] == '\n' || buf[n-1] == '\r' || buf[n-1] == ' '))
+        n--;
+    buf[n] = '\0';
+    return 0;
+}
+
+/*
+** Write snapshot datetime to sidecar file.
+** Returns 0 on success, -1 on failure.
+*/
+static int writeSnapshotFile(const char *cachePath, const char *snapshot) {
+    if (!cachePath || !snapshot || !snapshot[0]) return -1;
+    char *snapPath = buildSnapshotPath(cachePath);
+    if (!snapPath) return -1;
+    int fd = open(snapPath, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    if (fd < 0) { free(snapPath); return -1; }
+    size_t len = strlen(snapshot);
+    ssize_t nw = write(fd, snapshot, len);
+    fsync(fd);
+    close(fd);
+    free(snapPath);
+    return (nw == (ssize_t)len) ? 0 : -1;
+}
+
+/*
+** Remove the snapshot sidecar file.
+*/
+static void unlinkSnapshotFile(const char *cachePath) {
+    if (!cachePath) return;
+    char *snapPath = buildSnapshotPath(cachePath);
+    if (snapPath) {
+        unlink(snapPath);
+        free(snapPath);
+    }
+}
+
+/* Forward declaration */
+static int detectPageSize(const unsigned char *aData, sqlite3_int64 nData);
+
+/*
+** Apply incremental diff from a previous snapshot to the local cache file.
+** Downloads only the changed page ranges rather than re-downloading the full blob.
+**
+** Parameters:
+**   p          — the open MAIN_DB file (must have cacheFd, ops, snapshot set)
+**   blobSize   — the current blob size from Azure
+**   label      — label for timing messages (e.g. "xOpen" or "revalidateAfterLease")
+**
+** Returns SQLITE_OK on success, or negative on failure (caller should fall back
+** to full re-download).
+*/
+static int applyIncrementalDiff(sqliteObjsFile *p, int64_t blobSize, const char *label) {
+    if (p->snapshot[0] == '\0') return -1;
+    if (!p->ops || !p->ops->blob_get_page_ranges_diff || !p->ops->page_blob_read) return -1;
+
+    double t0 = 0;
+    if (sqlite_objs_debug_timing()) t0 = sqlite_objs_time_ms();
+
+    azure_diff_range_t *diffRanges = NULL;
+    int diffCount = 0;
+    azure_error_t aerr;
+    azure_error_init(&aerr);
+
+    azure_err_t arc = p->ops->blob_get_page_ranges_diff(
+        p->ops_ctx, p->zBlobName, p->snapshot,
+        &diffRanges, &diffCount, &aerr);
+
+    if (arc != AZURE_OK) {
+        free(diffRanges);
+        if (sqlite_objs_debug_timing()) {
+            fprintf(stderr, "[TIMING] %s: page ranges diff failed (code=%d) "
+                    "— falling back to full re-download (blob=%s)\n",
+                    label, arc, p->zBlobName);
+        }
+        return -1;
+    }
+
+    int diffOk = 1;
+    int64_t totalDiffBytes = 0;
+
+    /* Resize cache file if blob grew */
+    if (blobSize > p->nData) {
+        if (ftruncate(p->cacheFd, (off_t)blobSize) != 0) {
+            diffOk = 0;
+        }
+    }
+
+    /* Apply each changed/cleared range to the cache file */
+    for (int i = 0; i < diffCount && diffOk; i++) {
+        int64_t rangeStart = diffRanges[i].start;
+        int64_t rangeLen = diffRanges[i].end - rangeStart + 1;
+        if (rangeLen <= 0) continue;
+        totalDiffBytes += rangeLen;
+
+        if (diffRanges[i].is_clear) {
+            /* ClearRange: write zeros */
+            unsigned char *zeros = (unsigned char *)calloc(1, (size_t)rangeLen);
+            if (!zeros) { diffOk = 0; break; }
+            ssize_t nw = pwrite(p->cacheFd, zeros, (size_t)rangeLen,
+                                (off_t)rangeStart);
+            free(zeros);
+            if (nw != (ssize_t)rangeLen) { diffOk = 0; break; }
+        } else {
+            /* PageRange: download and patch */
+            azure_buffer_t rbuf;
+            azure_buffer_init(&rbuf);
+            azure_error_t rerr;
+            azure_error_init(&rerr);
+
+            azure_err_t rrc = p->ops->page_blob_read(
+                p->ops_ctx, p->zBlobName,
+                rangeStart, (size_t)rangeLen, &rbuf, &rerr);
+
+            if (rrc != AZURE_OK || !rbuf.data || (int64_t)rbuf.size < rangeLen) {
+                azure_buffer_free(&rbuf);
+                diffOk = 0;
+                break;
+            }
+
+            ssize_t nw = pwrite(p->cacheFd, rbuf.data, (size_t)rangeLen,
+                                (off_t)rangeStart);
+            azure_buffer_free(&rbuf);
+            if (nw != (ssize_t)rangeLen) { diffOk = 0; break; }
+        }
+    }
+
+    free(diffRanges);
+
+    if (!diffOk) {
+        if (sqlite_objs_debug_timing()) {
+            fprintf(stderr, "[TIMING] %s: incremental diff failed "
+                    "— falling back to full re-download (blob=%s)\n",
+                    label, p->zBlobName);
+        }
+        return -1;
+    }
+
+    /* Truncate if blob shrank */
+    if (blobSize < p->nData) {
+        ftruncate(p->cacheFd, (off_t)blobSize);
+    }
+    fsync(p->cacheFd);
+    p->nData = blobSize;
+    p->nDownloads++;
+
+    /* Re-detect page size */
+    unsigned char header[100];
+    ssize_t nRead = pread(p->cacheFd, header, sizeof(header), 0);
+    if (nRead == (ssize_t)sizeof(header)) {
+        int detected = detectPageSize(header, sizeof(header));
+        if (detected > 0) p->pageSize = detected;
+    }
+
+    dirtyEnsureCapacity(p);
+    dirtyClearAll(p);
+    p->lastSyncedSize = p->nData;
+
+    if (sqlite_objs_debug_timing()) {
+        double elapsed = sqlite_objs_time_ms() - t0;
+        fprintf(stderr, "[TIMING] %s: incremental diff "
+                "%.1fms (%d ranges, %lld diff bytes, %lld total bytes, blob=%s)\n",
+                label, elapsed, diffCount, (long long)totalDiffBytes,
+                (long long)blobSize, p->zBlobName);
+    }
+    return SQLITE_OK;
+}
+
+/*
 ** Ensure journal buffer has room for at least newSize bytes.
 */
 static int jrnlBufferEnsure(sqliteObjsFile *p, sqlite3_int64 newSize) {
@@ -629,11 +834,16 @@ static int sqliteObjsClose(sqlite3_file *pFile) {
         if (p->cacheReuse && p->etag[0] != '\0' && !dirtyHasAny(p)) {
             /* Cache is clean and we have a valid ETag — persist for reuse */
             writeEtagFile(p->zCachePath, p->etag);
+            /* Persist snapshot for incremental diff on reconnect */
+            if (p->snapshot[0] != '\0') {
+                writeSnapshotFile(p->zCachePath, p->snapshot);
+            }
             /* DON'T unlink the cache file */
         } else {
             /* Default behavior: clean up */
             unlink(p->zCachePath);
             unlinkEtagFile(p->zCachePath);
+            unlinkSnapshotFile(p->zCachePath);
         }
         free(p->zCachePath);
         p->zCachePath = NULL;
@@ -1200,7 +1410,7 @@ static int sqliteObjsSync(sqlite3_file *pFile, int flags) {
             memcpy(p->etag, aerr.etag, sizeof(p->etag));
         }
         dirtyClearAll(p);
-        return SQLITE_OK;
+        goto sync_create_snapshot;
     }
 
     /* Sequential fallback — write each coalesced range */
@@ -1253,6 +1463,28 @@ static int sqliteObjsSync(sqlite3_file *pFile, int flags) {
     sqlite3_free(rangeDataBuf);
     if (ranges != stackRanges) sqlite3_free(ranges);
     dirtyClearAll(p);
+
+sync_create_snapshot:
+    /* Create a blob snapshot after successful upload for incremental diff.
+    ** This is best-effort — failure does not fail the sync. */
+    if (p->cacheReuse && p->ops && p->ops->blob_snapshot_create) {
+        char snap[128];
+        azure_error_t snap_err;
+        azure_error_init(&snap_err);
+        azure_err_t snap_rc = p->ops->blob_snapshot_create(
+            p->ops_ctx, p->zBlobName, snap, sizeof(snap), &snap_err);
+        if (snap_rc == AZURE_OK && snap[0] != '\0') {
+            memcpy(p->snapshot, snap, sizeof(p->snapshot));
+            if (sqlite_objs_debug_timing()) {
+                fprintf(stderr, "[TIMING] xSync: created snapshot %s for blob=%s\n",
+                        p->snapshot, p->zBlobName);
+            }
+        } else if (sqlite_objs_debug_timing()) {
+            fprintf(stderr, "[TIMING] xSync: snapshot creation failed (code=%d) "
+                    "for blob=%s — incremental diff unavailable\n",
+                    snap_rc, p->zBlobName);
+        }
+    }
     return SQLITE_OK;
 }
 
@@ -1343,12 +1575,19 @@ static int revalidateAfterLease(sqliteObjsFile *p, const char *leaseEtag) {
         /* Blob was truncated to empty */
         if (ftruncate(p->cacheFd, 0) != 0) return SQLITE_IOERR;
         p->nData = 0;
+        p->snapshot[0] = '\0';
         dirtyClearAll(p);
         p->lastSyncedSize = 0;
         return SQLITE_OK;
     }
 
-    /* Download the fresh blob contents */
+    /* ---- Incremental diff path: use snapshot to download only changed pages ---- */
+    if (applyIncrementalDiff(p, blobSize, "revalidateAfterLease") == SQLITE_OK) {
+        return SQLITE_OK;
+    }
+    p->snapshot[0] = '\0';  /* Clear stale snapshot */
+
+    /* ---- Full re-download path (original behavior) ---- */
     unsigned char *tempBuf = (unsigned char *)malloc(blobSize);
     if (!tempBuf) return SQLITE_NOMEM;
 
@@ -1965,6 +2204,9 @@ static int sqliteObjsOpen(sqlite3_vfs *pVfs, sqlite3_filename zName,
                                 }
                                 dirtyEnsureCapacity(p);
                                 p->lastSyncedSize = p->nData;
+                                /* Load stored snapshot for incremental diff */
+                                readSnapshotFile(cachePath, p->snapshot,
+                                                 sizeof(p->snapshot));
                                 free(etagPath);
                                 goto cache_ready;
                             }
@@ -1972,7 +2214,40 @@ static int sqliteObjsOpen(sqlite3_vfs *pVfs, sqlite3_filename zName,
                         }
                     }
                     free(etagPath);
-                    /* Cache miss — use deterministic name for fresh download */
+                    /* Cache miss (ETag mismatch) — try incremental diff first
+                    ** if we have a stored snapshot from a previous session. */
+                    {
+                        char storedSnapshot[128] = {0};
+                        int hasSnapshot = (readSnapshotFile(cachePath, storedSnapshot,
+                                                            sizeof(storedSnapshot)) == 0
+                                           && storedSnapshot[0] != '\0');
+                        if (hasSnapshot) {
+                            /* Open existing cache file WITHOUT truncating */
+                            int fd = open(cachePath, O_RDWR);
+                            if (fd >= 0) {
+                                off_t cachedSize = lseek(fd, 0, SEEK_END);
+                                p->cacheFd = fd;
+                                p->zCachePath = cachePath;
+                                p->cacheReuse = 1;
+                                p->nData = (sqlite3_int64)cachedSize;
+                                memcpy(p->snapshot, storedSnapshot, sizeof(p->snapshot));
+                                dirtyEnsureCapacity(p);
+                                p->lastSyncedSize = p->nData;
+                                if (applyIncrementalDiff(p, blobSize, "xOpen") == SQLITE_OK) {
+                                    /* Success — cache is now up-to-date */
+                                    goto cache_ready;
+                                }
+                                /* Incremental diff failed — fall through to full download.
+                                ** Truncate the cache file and proceed. */
+                                ftruncate(p->cacheFd, 0);
+                                lseek(p->cacheFd, 0, SEEK_SET);
+                                p->nData = 0;
+                                p->snapshot[0] = '\0';
+                                goto cache_download;
+                            }
+                        }
+                    }
+                    /* No snapshot or couldn't open — full download with fresh file */
                     p->cacheFd = open(cachePath, O_RDWR | O_CREAT | O_TRUNC, 0600);
                     if (p->cacheFd < 0) {
                         free(cachePath);

@@ -74,6 +74,7 @@ typedef struct {
     char    request_id[64];
     char    error_code[128];
     char    etag[128];           /* ETag header value */
+    char    snapshot[128];       /* x-ms-snapshot datetime (from snapshot creation) */
     int64_t content_length;
     int     lease_time;          /* x-ms-lease-time (break lease remaining) */
     int     retry_after;         /* Retry-After header in seconds (-1 = not present) */

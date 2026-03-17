@@ -122,6 +122,14 @@ typedef struct azure_page_range {
     size_t len;              /* Must be 512-byte aligned, max 4 MiB */
 } azure_page_range_t;
 
+/* A diff range returned by Get Page Ranges (prevsnapshot).
+** Represents either a changed range (is_clear=0) or a cleared range (is_clear=1). */
+typedef struct azure_diff_range {
+    int64_t start;           /* Start offset (512-byte aligned) */
+    int64_t end;             /* End offset inclusive (512-byte aligned - 1) */
+    int is_clear;            /* 1 = ClearRange (zeros), 0 = PageRange (data changed) */
+} azure_diff_range_t;
+
 /* Maximum bytes per append_blob_append call (Azure limit) */
 #define AZURE_MAX_APPEND_SIZE (4 * 1024 * 1024)
 
@@ -292,6 +300,27 @@ struct azure_ops {
         void *ctx, const char *name,
         const uint8_t *data, size_t len,
         size_t chunk_size,
+        azure_error_t *err);
+
+    /* ---- Snapshot & Incremental Page Range Operations ---- */
+
+    /* Create a blob snapshot. On success, writes the snapshot datetime
+    ** string to snapshot_out (e.g. "2024-01-15T16:48:32.0000000Z").
+    ** snapshot_out must have room for at least snapshot_out_size bytes.
+    ** Returns AZURE_OK on 201 Created. */
+    azure_err_t (*blob_snapshot_create)(
+        void *ctx, const char *blob_name,
+        char *snapshot_out, size_t snapshot_out_size,
+        azure_error_t *err);
+
+    /* Get changed/cleared page ranges relative to a previous snapshot.
+    ** On success, allocates *ranges_out (caller must free()) and sets *count_out.
+    ** Each range has start/end offsets and is_clear flag.
+    ** Returns AZURE_OK on success. */
+    azure_err_t (*blob_get_page_ranges_diff)(
+        void *ctx, const char *blob_name,
+        const char *prev_snapshot,
+        azure_diff_range_t **ranges_out, int *count_out,
         azure_error_t *err);
 };
 
