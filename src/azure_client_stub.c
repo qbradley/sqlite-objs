@@ -196,7 +196,9 @@ static azure_ops_t g_stubOps = {
     NULL  /* append_blob_create — not implemented in stub */,
     NULL  /* append_blob_append — not implemented in stub */,
     NULL  /* append_blob_delete — not implemented in stub */,
-    NULL  /* block_blob_upload_parallel — not implemented in stub */
+    NULL  /* block_blob_upload_parallel — not implemented in stub */,
+    NULL  /* blob_snapshot_create — not implemented in stub */,
+    NULL  /* blob_get_page_ranges_diff — not implemented in stub */
 };
 
 /* ---- Public functions ---- */

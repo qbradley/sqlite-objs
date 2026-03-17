@@ -182,6 +182,7 @@ static size_t curl_header_cb(char *buffer, size_t size, size_t nitems,
     CAPTURE_HEADER("x-ms-request-id",   15, h->request_id)
     CAPTURE_HEADER("x-ms-error-code",   15, h->error_code)
     CAPTURE_HEADER("etag",               4, h->etag)
+    CAPTURE_HEADER("x-ms-snapshot",     13, h->snapshot)
 
     #undef CAPTURE_HEADER
 
@@ -2671,6 +2672,196 @@ static azure_err_t az_append_blob_delete(void *ctx, const char *blob_name,
 }
 
 /* ================================================================
+ * SNAPSHOT & INCREMENTAL PAGE RANGE OPERATIONS
+ * ================================================================ */
+
+/*
+ * Create a blob snapshot.
+ * PUT ?comp=snapshot — returns snapshot datetime in x-ms-snapshot header.
+ */
+static azure_err_t az_blob_snapshot_create(void *ctx, const char *blob_name,
+                                           char *snapshot_out,
+                                           size_t snapshot_out_size,
+                                           azure_error_t *err)
+{
+    azure_client_t *c = (azure_client_t *)ctx;
+
+    if (!snapshot_out || snapshot_out_size == 0) {
+        err->code = AZURE_ERR_INVALID_ARG;
+        snprintf(err->error_message, sizeof(err->error_message),
+                 "snapshot_out must be non-NULL with size > 0");
+        return AZURE_ERR_INVALID_ARG;
+    }
+    snapshot_out[0] = '\0';
+
+    azure_response_headers_t rh;
+    azure_err_t rc = execute_with_retry(c, "PUT", blob_name, "comp=snapshot",
+                                        NULL, NULL, NULL, 0, NULL,
+                                        NULL, &rh, err);
+    if (rc != AZURE_OK) return rc;
+
+    if (rh.snapshot[0] == '\0') {
+        err->code = AZURE_ERR_UNKNOWN;
+        snprintf(err->error_message, sizeof(err->error_message),
+                 "Snapshot created but x-ms-snapshot header missing");
+        return AZURE_ERR_UNKNOWN;
+    }
+
+    size_t slen = strlen(rh.snapshot);
+    if (slen >= snapshot_out_size) slen = snapshot_out_size - 1;
+    memcpy(snapshot_out, rh.snapshot, slen);
+    snapshot_out[slen] = '\0';
+    return AZURE_OK;
+}
+
+/*
+ * Parse Azure XML page ranges diff response.
+ * Expected format:
+ *   <?xml ...?><PageList>
+ *     <PageRange><Start>0</Start><End>511</End></PageRange>
+ *     <ClearRange><Start>512</Start><End>1023</End></ClearRange>
+ *   </PageList>
+ */
+static int parse_page_ranges_xml(const char *xml, size_t xml_len,
+                                 azure_diff_range_t **ranges_out,
+                                 int *count_out)
+{
+    int capacity = 64;
+    int count = 0;
+    azure_diff_range_t *ranges = (azure_diff_range_t *)malloc(
+        (size_t)capacity * sizeof(azure_diff_range_t));
+    if (!ranges) return -1;
+
+    const char *p = xml;
+    const char *end = xml + xml_len;
+
+    while (p < end) {
+        /* Look for <PageRange> or <ClearRange> */
+        const char *pr = NULL;
+        int is_clear = 0;
+
+        const char *page_tag = strstr(p, "<PageRange>");
+        const char *clear_tag = strstr(p, "<ClearRange>");
+
+        if (!page_tag && !clear_tag) break;
+
+        if (page_tag && (!clear_tag || page_tag < clear_tag)) {
+            pr = page_tag + 11; /* strlen("<PageRange>") */
+            is_clear = 0;
+        } else {
+            pr = clear_tag + 12; /* strlen("<ClearRange>") */
+            is_clear = 1;
+        }
+
+        /* Parse <Start>N</Start> */
+        const char *start_tag = strstr(pr, "<Start>");
+        if (!start_tag || start_tag >= end) break;
+        int64_t start_val = strtoll(start_tag + 7, NULL, 10);
+
+        /* Parse <End>N</End> */
+        const char *end_tag = strstr(pr, "<End>");
+        if (!end_tag || end_tag >= end) break;
+        int64_t end_val = strtoll(end_tag + 5, NULL, 10);
+
+        /* Grow array if needed */
+        if (count >= capacity) {
+            capacity *= 2;
+            azure_diff_range_t *tmp = (azure_diff_range_t *)realloc(
+                ranges, (size_t)capacity * sizeof(azure_diff_range_t));
+            if (!tmp) { free(ranges); return -1; }
+            ranges = tmp;
+        }
+
+        ranges[count].start = start_val;
+        ranges[count].end = end_val;
+        ranges[count].is_clear = is_clear;
+        count++;
+
+        /* Advance past the closing tag */
+        const char *close_tag = is_clear
+            ? strstr(pr, "</ClearRange>")
+            : strstr(pr, "</PageRange>");
+        if (!close_tag || close_tag >= end) break;
+        p = close_tag + (is_clear ? 13 : 12);
+    }
+
+    *ranges_out = ranges;
+    *count_out = count;
+    return 0;
+}
+
+/*
+ * Get page ranges changed since a previous snapshot.
+ * GET ?comp=pagelist&prevsnapshot={datetime}
+ * Returns array of azure_diff_range_t (caller must free).
+ */
+static azure_err_t az_blob_get_page_ranges_diff(
+    void *ctx, const char *blob_name,
+    const char *prev_snapshot,
+    azure_diff_range_t **ranges_out, int *count_out,
+    azure_error_t *err)
+{
+    azure_client_t *c = (azure_client_t *)ctx;
+
+    if (!prev_snapshot || prev_snapshot[0] == '\0') {
+        err->code = AZURE_ERR_INVALID_ARG;
+        snprintf(err->error_message, sizeof(err->error_message),
+                 "prev_snapshot must be non-empty");
+        return AZURE_ERR_INVALID_ARG;
+    }
+    if (!ranges_out || !count_out) {
+        err->code = AZURE_ERR_INVALID_ARG;
+        snprintf(err->error_message, sizeof(err->error_message),
+                 "ranges_out and count_out must be non-NULL");
+        return AZURE_ERR_INVALID_ARG;
+    }
+    *ranges_out = NULL;
+    *count_out = 0;
+
+    /* URL-encode the snapshot datetime for the query string */
+    char encoded_snapshot[512];
+    if (uri_encode(prev_snapshot, encoded_snapshot, sizeof(encoded_snapshot)) < 0) {
+        snprintf(encoded_snapshot, sizeof(encoded_snapshot), "%s", prev_snapshot);
+    }
+
+    char query[768];
+    snprintf(query, sizeof(query), "comp=pagelist&prevsnapshot=%s",
+             encoded_snapshot);
+
+    azure_buffer_t body;
+    azure_buffer_init(&body);
+
+    azure_err_t rc = execute_with_retry(c, "GET", blob_name, query,
+                                        NULL, NULL, NULL, 0, NULL,
+                                        &body, NULL, err);
+    if (rc != AZURE_OK) {
+        azure_buffer_free(&body);
+        return rc;
+    }
+
+    if (!body.data || body.size == 0) {
+        azure_buffer_free(&body);
+        /* Empty response = no changes */
+        *ranges_out = NULL;
+        *count_out = 0;
+        return AZURE_OK;
+    }
+
+    /* Parse the XML response */
+    if (parse_page_ranges_xml((const char *)body.data, body.size,
+                              ranges_out, count_out) != 0) {
+        azure_buffer_free(&body);
+        err->code = AZURE_ERR_UNKNOWN;
+        snprintf(err->error_message, sizeof(err->error_message),
+                 "Failed to parse page ranges XML response");
+        return AZURE_ERR_UNKNOWN;
+    }
+
+    azure_buffer_free(&body);
+    return AZURE_OK;
+}
+
+/* ================================================================
  * Static vtable instance — populated with all production functions
  * ================================================================ */
 
@@ -2702,6 +2893,9 @@ static const azure_ops_t azure_production_ops = {
     .append_blob_delete = az_append_blob_delete,
     /* Block blob parallel upload — WAL acceleration */
     .block_blob_upload_parallel = az_block_blob_upload_parallel,
+    /* Snapshot & incremental page ranges */
+    .blob_snapshot_create = az_blob_snapshot_create,
+    .blob_get_page_ranges_diff = az_blob_get_page_ranges_diff,
 };
 
 /* ================================================================

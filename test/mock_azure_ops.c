@@ -854,6 +854,9 @@ static azure_ops_t mock_ops = {
     .append_blob_delete = mock_append_blob_delete_impl,
     /* Block blob parallel upload — WAL acceleration */
     .block_blob_upload_parallel = mock_block_blob_upload_parallel,
+    /* Snapshot & incremental page ranges — not implemented in mock */
+    .blob_snapshot_create = NULL,
+    .blob_get_page_ranges_diff = NULL,
 };
 
 /* ══════════════════════════════════════════════════════════════════════
