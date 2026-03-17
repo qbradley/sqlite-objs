@@ -230,10 +230,12 @@ clean:
 SANITIZE_CFLAGS  = -fsanitize=address,undefined -fno-omit-frame-pointer -O1 -g \
                    -fno-sanitize-recover=all
 SANITIZE_LDFLAGS = -fsanitize=address,undefined
+SANITIZE_BUILD_DIR = $(BUILD_DIR)/sanitize
 
-sanitize: clean
+sanitize:
 	@echo "=== Building with AddressSanitizer + UBSan ==="
 	$(MAKE) test-unit \
+		BUILD_DIR="$(SANITIZE_BUILD_DIR)" \
 		CFLAGS="$(CFLAGS) $(SANITIZE_CFLAGS)" \
 		LDFLAGS="$(LDFLAGS) $(SANITIZE_LDFLAGS)"
 	@echo "=== Sanitizer tests passed ==="
