@@ -1444,6 +1444,12 @@ static sqlite3 *open_azurite_db(const char *db_name, const char *extra_params,
         if (db) sqlite3_close(db);
         return NULL;
     }
+    
+    /* Set busy timeout to handle lease contention in multi-client scenarios.
+    ** Azure blob leases may take a moment to be released/acquired, so give
+    ** SQLite time to retry instead of returning SQLITE_BUSY immediately. */
+    sqlite3_busy_timeout(db, 10000);  /* 10 seconds */
+    
     return db;
 }
 

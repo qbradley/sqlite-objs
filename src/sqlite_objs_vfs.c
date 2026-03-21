@@ -1928,7 +1928,9 @@ static int sqliteObjsSync(sqlite3_file *pFile, int flags) {
             p->ops_ctx, p->zBlobName,
             ranges, nRanges,
             hasLease(p) ? p->leaseId : NULL,
-            p->etag[0] ? p->etag : NULL,
+            /* Don't send If-Match when we hold a lease — the lease provides
+            ** exclusive access, and Azurite may reject If-Match + lease combo */
+            (hasLease(p) || !p->etag[0]) ? NULL : p->etag,
             &aerr);
 
         if (sqlite_objs_debug_timing()) {
@@ -1958,6 +1960,10 @@ static int sqliteObjsSync(sqlite3_file *pFile, int flags) {
         p->lastSyncDirtyCount = dirtyCountBeforeSync;
         if (aerr.etag[0] != '\0') {
             memcpy(p->etag, aerr.etag, sizeof(p->etag));
+            /* Persist ETag immediately for cache reuse after checkpoint */
+            if (p->cacheReuse && p->zCachePath) {
+                writeEtagFile(p->zCachePath, p->etag);
+            }
         }
         bitmapClearAll(&p->dirty);
         goto sync_create_snapshot;
@@ -1983,7 +1989,8 @@ static int sqliteObjsSync(sqlite3_file *pFile, int flags) {
             p->ops_ctx, p->zBlobName,
             ranges[i].offset, ranges[i].data, ranges[i].len,
             hasLease(p) ? p->leaseId : NULL,
-            p->etag[0] ? p->etag : NULL,
+            /* Don't send If-Match when we hold a lease */
+            (hasLease(p) || !p->etag[0]) ? NULL : p->etag,
             &aerr);
 
         if (arc != AZURE_OK) {
@@ -2014,6 +2021,10 @@ static int sqliteObjsSync(sqlite3_file *pFile, int flags) {
     p->lastSyncDirtyCount = dirtyCountBeforeSync;
     if (aerr.etag[0] != '\0') {
         memcpy(p->etag, aerr.etag, sizeof(p->etag));
+        /* Persist ETag immediately for cache reuse after checkpoint */
+        if (p->cacheReuse && p->zCachePath) {
+            writeEtagFile(p->zCachePath, p->etag);
+        }
     }
 
     sqlite3_free(rangeDataBuf);
