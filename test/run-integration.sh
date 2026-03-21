@@ -66,7 +66,14 @@ if [ ! -f "$TEST_BINARY" ]; then
     exit 1
 fi
 
+# Clean stale Azurite state from previous runs so tests are idempotent
+rm -rf __azurite_db_*.json __blobstorage__/ __queuestorage__/ AzuriteConfig 2>/dev/null
+
 echo "🚀  Starting Azurite on port ${AZURITE_PORT}..."
+
+# Kill any stale Azurite on our port
+lsof -ti :"$AZURITE_PORT" | xargs kill 2>/dev/null || true
+sleep 1
 
 # Start Azurite in the background
 if [ "$AZURITE_SILENT" = "1" ]; then
