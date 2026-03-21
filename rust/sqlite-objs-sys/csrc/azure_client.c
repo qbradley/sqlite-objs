@@ -1425,6 +1425,21 @@ static azure_err_t az_blob_delete(void *ctx, const char *name,
 }
 
 /*
+ * Undelete a soft-deleted blob.
+ * PUT ?comp=undelete — recovers a blob within the retention window.
+ * Requires account-level soft delete to be enabled.
+ */
+static azure_err_t az_blob_undelete(void *ctx, const char *name,
+                                    azure_error_t *err)
+{
+    azure_client_t *c = (azure_client_t *)ctx;
+
+    return execute_with_retry(c, "PUT", name, "comp=undelete",
+                              NULL, NULL, NULL, 0, NULL,
+                              NULL, NULL, NULL, err);
+}
+
+/*
  * Check if a blob exists.
  * HEAD request: 2xx = exists, 404 = doesn't exist, others = error.
  */
@@ -2877,6 +2892,7 @@ static const azure_ops_t azure_production_ops = {
     /* Common */
     .blob_get_properties = az_blob_get_properties,
     .blob_delete         = az_blob_delete,
+    .blob_undelete       = az_blob_undelete,
     .blob_exists         = az_blob_exists,
     /* Leases */
     .lease_acquire = az_lease_acquire,

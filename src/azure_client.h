@@ -162,10 +162,13 @@ struct azure_ops {
 
     /* Write data to a page blob at the given offset.
     ** offset and len must be 512-byte aligned.
-    ** lease_id may be NULL if no lease is held. */
+    ** lease_id may be NULL if no lease is held.
+    ** if_match may be NULL; when set, adds If-Match header for
+    ** optimistic concurrency (412 Precondition Failed on mismatch). */
     azure_err_t (*page_blob_write)(void *ctx, const char *name,
                                    int64_t offset, const uint8_t *data,
                                    size_t len, const char *lease_id,
+                                   const char *if_match,
                                    azure_error_t *err);
 
     /* Read data from a page blob at the given offset. */
@@ -205,6 +208,11 @@ struct azure_ops {
     azure_err_t (*blob_delete)(void *ctx, const char *name,
                                 azure_error_t *err);
 
+    /* Undelete a soft-deleted blob (requires account-level soft delete).
+    ** PUT ?comp=undelete — recovers a blob within the retention window. */
+    azure_err_t (*blob_undelete)(void *ctx, const char *name,
+                                  azure_error_t *err);
+
     /* Check if a blob exists (lightweight HEAD). */
     azure_err_t (*blob_exists)(void *ctx, const char *name,
                                 int *exists, azure_error_t *err);
@@ -236,11 +244,13 @@ struct azure_ops {
 
     /* Write multiple page ranges in parallel.
     ** NULL = VFS falls back to sequential page_blob_write().
+    ** if_match may be NULL; when set, adds If-Match header.
     ** Returns AZURE_OK only if ALL writes succeed. */
     azure_err_t (*page_blob_write_batch)(
         void *ctx, const char *name,
         const azure_page_range_t *ranges, int nRanges,
-        const char *lease_id, azure_error_t *err);
+        const char *lease_id, const char *if_match,
+        azure_error_t *err);
 
     /* ---- Parallel Read (chunked download via curl_multi) ---- */
 

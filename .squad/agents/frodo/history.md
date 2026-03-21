@@ -18,6 +18,14 @@
 
 <!-- Append new learnings below. Each entry is something lasting about the project. -->
 
+### Phase 1 Immediate Wins (2026-07)
+
+- **If-Match conditional headers:** Added `if_match` parameter to `page_blob_write` and `page_blob_write_batch` vtable signatures. `If-Match` header is included in SharedKey StringToSign (line 9 — between If-Modified-Since and If-None-Match). `execute_single` and `execute_with_retry` now accept and thread `if_match` through. `batch_init_easy` includes it in both signing and HTTP headers. 412 → `AZURE_ERR_PRECONDITION` → `SQLITE_BUSY` (non-retryable). VFS passes `p->etag` during xSync writes for belt-and-suspenders concurrency with leases.
+- **Undelete Blob API:** Added `az_blob_undelete()` → `PUT ?comp=undelete`. Added `blob_undelete` to `azure_ops_t` vtable. Requires account-level soft delete enablement (portal/CLI, not our code).
+- **Last Access Time:** Account-level setting only, zero code changes needed. Document as deployment recommendation.
+- **Vtable changes affect ALL callers:** Adding a parameter to `page_blob_write` required updating the stub (`azure_client_stub.c`), mock (`mock_azure_ops.c`), and all 44+ test call sites. Use designated initializers in vtable structs to avoid positional mismatches.
+- **If-Match is a standard HTTP header (not x-ms-\*):** It goes in the StringToSign at a fixed position (line 9), NOT in canonicalized headers. The `extra_x_ms` mechanism is only for `x-ms-*` headers.
+
 
 ## Core Context Summary
 
@@ -72,3 +80,36 @@ Lazy cache implementation completed. HTTP layer implications:
 - **Caching implications:** Valid bitmap persistence in `.state` file allows reconnect scenario: no need to re-fetch pages already in cache if state file exists. ETag matching guarantees file unchanged.
 
 **Testing:** Integration tests validate `page_blob_read` offset/length contracts at HTTP mock layer.
+
+### Azure Capabilities Research (2026-01-15)
+
+Comprehensive analysis of Azure Blob Storage features we're not using vs. what we currently leverage. Key findings:
+
+**What we use (19 operations):**
+- Page blobs: Create, Put Page (single + batch), Get Page Ranges, Resize, Get Page Ranges (diff), Snapshot
+- Block blobs: Put Blob, Get Blob, Put Block + Put Block List (parallel upload)
+- Append blobs: Create, Append Block (WAL mode)
+- Common: Get Properties, Delete, HEAD (exists check)
+- Leases: Acquire, Renew, Release, Break
+- HTTP/2 multiplexing, connection pooling, retry logic with backoff
+
+**High-priority opportunities:**
+1. **Put Page From URL** — Server-side page copy between blobs (snapshot recovery without bandwidth cost)
+2. **Conditional headers (If-Match)** — Optimistic concurrency for multi-writer scenarios (trivial add)
+3. **Blob index tags** — Queryable metadata for multi-tenant discovery (10 tags per blob, free)
+4. **Last access time tracking** — Enables automated tiering policies (Cool/Archive)
+5. **Soft delete** — Accidental deletion recovery (7-day retention typical)
+6. **Incremental Copy Blob** — Differential page blob backups (only changed pages)
+
+**Medium-priority:**
+- Blob versioning (automatic vs manual snapshots), change feed (audit log), access tier management, customer-managed keys (CMK), object replication (cross-region for block blobs only)
+
+**Not recommended:**
+- HNS/ADLS Gen2 (breaks page blob versioning compatibility)
+- CDN/Query Acceleration (not applicable to transactional DB workloads)
+- Customer-provided keys (too risky vs CMK)
+
+**Immediate wins (low effort):**
+- Enable soft delete at account level, add If-Match headers to Put Page, enable last access time tracking
+
+Full analysis: `.squad/decisions/inbox/frodo-azure-capabilities.md`

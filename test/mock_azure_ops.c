@@ -286,9 +286,11 @@ static azure_err_t mock_page_blob_create(void *vctx, const char *name,
 static azure_err_t mock_page_blob_write(void *vctx, const char *name,
                                          int64_t offset, const uint8_t *data,
                                          size_t len, const char *lease_id,
+                                         const char *if_match,
                                          azure_error_t *err) {
     mock_azure_ctx_t *ctx = (mock_azure_ctx_t *)vctx;
     (void)lease_id;  /* Mock does not enforce lease on writes */
+    (void)if_match;  /* Mock does not enforce ETag matching */
     azure_err_t rc = pre_call(ctx, OP_PAGE_BLOB_WRITE, err);
     if (rc != AZURE_OK) return rc;
 
@@ -839,6 +841,7 @@ static azure_ops_t mock_ops = {
     .block_blob_download = mock_block_blob_download,
     .blob_get_properties = mock_blob_get_properties,
     .blob_delete        = mock_blob_delete_impl,
+    .blob_undelete      = NULL,  /* Soft delete not simulated in mock */
     .blob_exists        = mock_blob_exists_impl,
     .lease_acquire      = mock_lease_acquire_impl,
     .lease_renew        = mock_lease_renew_impl,

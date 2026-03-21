@@ -143,7 +143,7 @@ TEST(timeout_error) {
     mock_set_fail_operation(g_ctx, "page_blob_write", AZURE_ERR_TIMEOUT);
 
     uint8_t data[512] = {0};
-    azure_err_t rc = g_ops->page_blob_write(g_ctx, "test.db", 0, data, 512, NULL, &err);
+    azure_err_t rc = g_ops->page_blob_write(g_ctx, "test.db", 0, data, 512, NULL, NULL, &err);
     ASSERT_AZURE_ERR(rc, AZURE_ERR_TIMEOUT);
 }
 
@@ -269,7 +269,7 @@ TEST(buffer_growth_on_read) {
     /* Write different amounts to verify buffer grows */
     uint8_t data[4096];
     memset(data, 0xAA, sizeof(data));
-    g_ops->page_blob_write(g_ctx, "test.db", 0, data, 4096, NULL, &err);
+    g_ops->page_blob_write(g_ctx, "test.db", 0, data, 4096, NULL, NULL, &err);
 
     azure_buffer_t buf;
     azure_buffer_init(&buf);
@@ -567,7 +567,7 @@ TEST(mock_transient_error_not_retried) {
     mock_set_fail_operation(g_ctx, "page_blob_write", AZURE_ERR_THROTTLE);
 
     uint8_t data[512] = {0};
-    g_ops->page_blob_write(g_ctx, "test.db", 0, data, 512, NULL, &err);
+    g_ops->page_blob_write(g_ctx, "test.db", 0, data, 512, NULL, NULL, &err);
     ASSERT_EQ(mock_get_call_count(g_ctx, "page_blob_write"), 1);
 }
 
@@ -639,7 +639,7 @@ TEST(write_read_many_pages_sequentially) {
         uint8_t data[4096];
         memset(data, (uint8_t)(i & 0xFF), sizeof(data));
         g_ops->page_blob_write(g_ctx, "big.db",
-                               (int64_t)(i * 4096), data, 4096, NULL, &err);
+                               (int64_t)(i * 4096), data, 4096, NULL, NULL, &err);
     }
 
     for (int i = 0; i < num_pages; i++) {
@@ -836,7 +836,7 @@ TEST(page_blob_write_large_offset_grows_safely) {
     /* Write at 64KB offset — should auto-grow */
     int64_t offset = 64 * 1024;
     azure_err_t rc = g_ops->page_blob_write(g_ctx, "test.db",
-                                             offset, data, 512, NULL, &err);
+                                             offset, data, 512, NULL, NULL, &err);
     ASSERT_AZURE_OK(rc);
 
     /* Verify blob grew */
@@ -858,7 +858,7 @@ TEST(page_blob_write_offset_plus_len_near_int64_max) {
     int64_t large_offset = 1024 * 1024 * 10;  /* 10MB - reasonable for test */
     large_offset = (large_offset + 511) & ~(int64_t)511;  /* Align to 512 */
     azure_err_t rc = g_ops->page_blob_write(g_ctx, "test.db",
-                                             large_offset, data, 512, NULL, &err);
+                                             large_offset, data, 512, NULL, NULL, &err);
     /* Should succeed - mock handles reasonable sizes */
     ASSERT_AZURE_OK(rc);
     
@@ -933,7 +933,7 @@ TEST(page_blob_write_returns_nomem_on_grow_failure) {
     ** Use the failure injection to simulate realloc failure. */
     mock_set_fail_operation(g_ctx, "page_blob_write", AZURE_ERR_NOMEM);
     azure_err_t rc = g_ops->page_blob_write(g_ctx, "test.db",
-                                             4096, data, 512, NULL, &err);
+                                             4096, data, 512, NULL, NULL, &err);
     /* Should return the injected NOMEM error */
     ASSERT_AZURE_ERR(rc, AZURE_ERR_NOMEM);
     mock_clear_failures(g_ctx);
@@ -1052,18 +1052,18 @@ TEST(fail_operation_at_specific_call) {
 
     /* First two writes should succeed */
     azure_err_t rc;
-    rc = g_ops->page_blob_write(g_ctx, "test.db", 0, data, 512, NULL, &err);
+    rc = g_ops->page_blob_write(g_ctx, "test.db", 0, data, 512, NULL, NULL, &err);
     ASSERT_AZURE_OK(rc);
 
-    rc = g_ops->page_blob_write(g_ctx, "test.db", 512, data, 512, NULL, &err);
+    rc = g_ops->page_blob_write(g_ctx, "test.db", 512, data, 512, NULL, NULL, &err);
     ASSERT_AZURE_OK(rc);
 
     /* Third write should fail */
-    rc = g_ops->page_blob_write(g_ctx, "test.db", 1024, data, 512, NULL, &err);
+    rc = g_ops->page_blob_write(g_ctx, "test.db", 1024, data, 512, NULL, NULL, &err);
     ASSERT_AZURE_ERR(rc, AZURE_ERR_NETWORK);
 
     /* Fourth write should succeed (one-shot failure) */
-    rc = g_ops->page_blob_write(g_ctx, "test.db", 1536, data, 512, NULL, &err);
+    rc = g_ops->page_blob_write(g_ctx, "test.db", 1536, data, 512, NULL, NULL, &err);
     ASSERT_AZURE_OK(rc);
 }
 
@@ -1105,13 +1105,13 @@ TEST(fail_operation_at_independent_of_other_ops) {
     azure_buffer_init(&buf);
 
     azure_err_t rc;
-    rc = g_ops->page_blob_write(g_ctx, "test.db", 0, data, 512, NULL, &err);
+    rc = g_ops->page_blob_write(g_ctx, "test.db", 0, data, 512, NULL, NULL, &err);
     ASSERT_AZURE_OK(rc); /* 1st write OK */
 
     rc = g_ops->page_blob_read(g_ctx, "test.db", 0, 512, &buf, &err);
     ASSERT_AZURE_OK(rc); /* read is a different op, doesn't count */
 
-    rc = g_ops->page_blob_write(g_ctx, "test.db", 512, data, 512, NULL, &err);
+    rc = g_ops->page_blob_write(g_ctx, "test.db", 512, data, 512, NULL, NULL, &err);
     ASSERT_AZURE_ERR(rc, AZURE_ERR_SERVER); /* 2nd write fails */
 
     azure_buffer_free(&buf);

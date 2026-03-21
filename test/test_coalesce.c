@@ -600,8 +600,9 @@ static int mock_batch_nranges_seen  = 0;   /* nRanges from last call */
 static azure_err_t mock_page_blob_write_batch(
     void *ctx, const char *name,
     const azure_page_range_t *ranges, int nRanges,
-    const char *lease_id, azure_error_t *err)
+    const char *lease_id, const char *if_match, azure_error_t *err)
 {
+    (void)if_match;
     mock_batch_call_count++;
     mock_batch_nranges_seen = nRanges;
     azure_error_init(err);
@@ -616,7 +617,7 @@ static azure_err_t mock_page_blob_write_batch(
         /* Delegate to real mock page_blob_write for data integrity */
         azure_err_t arc = co_ops->page_blob_write(
             ctx, name, ranges[i].offset, ranges[i].data,
-            ranges[i].len, lease_id, err);
+            ranges[i].len, lease_id, NULL, err);
         if (arc != AZURE_OK) return arc;
     }
     return AZURE_OK;

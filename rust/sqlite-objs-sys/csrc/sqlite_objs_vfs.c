@@ -1927,7 +1927,9 @@ static int sqliteObjsSync(sqlite3_file *pFile, int flags) {
         azure_err_t arc = p->ops->page_blob_write_batch(
             p->ops_ctx, p->zBlobName,
             ranges, nRanges,
-            hasLease(p) ? p->leaseId : NULL, &aerr);
+            hasLease(p) ? p->leaseId : NULL,
+            p->etag[0] ? p->etag : NULL,
+            &aerr);
 
         if (sqlite_objs_debug_timing()) {
             double write_ms = sqlite_objs_time_ms() - wt0;
@@ -1948,6 +1950,7 @@ static int sqliteObjsSync(sqlite3_file *pFile, int flags) {
         if (ranges != stackRanges) sqlite3_free(ranges);
         if (arc != AZURE_OK) {
             p->metrics.azure_errors++;
+            if (arc == AZURE_ERR_PRECONDITION) return SQLITE_BUSY;
             return SQLITE_IOERR_FSYNC;
         }
         p->metrics.blob_writes++;
@@ -1979,12 +1982,15 @@ static int sqliteObjsSync(sqlite3_file *pFile, int flags) {
         azure_err_t arc = p->ops->page_blob_write(
             p->ops_ctx, p->zBlobName,
             ranges[i].offset, ranges[i].data, ranges[i].len,
-            hasLease(p) ? p->leaseId : NULL, &aerr);
+            hasLease(p) ? p->leaseId : NULL,
+            p->etag[0] ? p->etag : NULL,
+            &aerr);
 
         if (arc != AZURE_OK) {
             p->metrics.azure_errors++;
             sqlite3_free(rangeDataBuf);
             if (ranges != stackRanges) sqlite3_free(ranges);
+            if (arc == AZURE_ERR_PRECONDITION) return SQLITE_BUSY;
             return SQLITE_IOERR_FSYNC;
         }
         p->metrics.blob_writes++;

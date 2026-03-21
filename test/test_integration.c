@@ -122,7 +122,7 @@ TEST(page_blob_lifecycle) {
     for (int i = 0; i < 512; i++) {
         write_data[i] = (uint8_t)(i % 256);
     }
-    rc = g_ops->page_blob_write(g_ctx, blob_name, 0, write_data, 512, NULL, &err);
+    rc = g_ops->page_blob_write(g_ctx, blob_name, 0, write_data, 512, NULL, NULL, &err);
     ASSERT_AZURE_OK(rc);
 
     /* Read back those 512 bytes */
@@ -282,12 +282,12 @@ TEST(page_blob_alignment) {
     /* Write at offset 512 (aligned) */
     uint8_t data[512];
     memset(data, 0xAB, 512);
-    rc = g_ops->page_blob_write(g_ctx, blob_name, 512, data, 512, NULL, &err);
+    rc = g_ops->page_blob_write(g_ctx, blob_name, 512, data, 512, NULL, NULL, &err);
     ASSERT_AZURE_OK(rc);
 
     /* Write at offset 1024 (aligned) */
     memset(data, 0xCD, 512);
-    rc = g_ops->page_blob_write(g_ctx, blob_name, 1024, data, 512, NULL, &err);
+    rc = g_ops->page_blob_write(g_ctx, blob_name, 1024, data, 512, NULL, NULL, &err);
     ASSERT_AZURE_OK(rc);
 
     /* Read back and verify */
