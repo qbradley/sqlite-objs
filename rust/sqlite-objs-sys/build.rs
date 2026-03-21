@@ -4,8 +4,23 @@ use std::process::Command;
 
 fn main() {
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
-    // Use the canonical C sources from the repo root — no copies needed
-    let src_dir = manifest_dir.join("../../src");
+
+    // Prefer canonical repo sources (../../src/) for local dev.
+    // Fall back to bundled csrc/ for `cargo publish` (the tarball doesn't
+    // include files outside the crate root).
+    let repo_src = manifest_dir.join("../../src");
+    let bundled_src = manifest_dir.join("csrc");
+    let src_dir = if repo_src.join("sqlite_objs_vfs.c").exists() {
+        repo_src
+    } else if bundled_src.join("sqlite_objs_vfs.c").exists() {
+        bundled_src
+    } else {
+        panic!(
+            "C sources not found. Expected either {} or {}",
+            repo_src.display(),
+            bundled_src.display()
+        );
+    };
 
     // Get SQLite include path from libsqlite3-sys (set via its `links` metadata)
     let sqlite_include = env::var("DEP_SQLITE3_INCLUDE")

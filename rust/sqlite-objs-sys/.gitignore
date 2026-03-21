@@ -1,0 +1,3 @@
+# Temporary C source copies created by scripts/cargo-publish.sh
+# These only exist during `cargo publish` packaging — not in the repo.
+csrc/

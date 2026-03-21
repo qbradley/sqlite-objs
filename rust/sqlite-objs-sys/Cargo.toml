@@ -10,6 +10,9 @@ rust-version.workspace = true
 
 links = "sqlite-objs"
 build = "build.rs"
+# csrc/ is populated by scripts/cargo-publish.sh before packaging.
+# The explicit include overrides .gitignore so cargo bundles them.
+include = ["build.rs", "src/**", "csrc/**", "Cargo.toml", "LICENSE*", "README*"]
 
 [dependencies]
 libc.workspace = true
