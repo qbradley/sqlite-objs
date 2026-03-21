@@ -187,6 +187,9 @@ typedef struct sqliteObjsFile {
     ** ETag-based cache hits do NOT increment this. */
     int nDownloads;
 
+    /* Per-connection VFS activity metrics (zeroed by memset in xOpen) */
+    sqlite_objs_metrics metrics;
+
     /* Per-file Azure client (NULL = using global VFS client) */
     azure_client_t *ownClient;
 } sqliteObjsFile;
@@ -871,6 +874,7 @@ static int fetchPagesFromAzure(sqliteObjsFile *p, int pageIdx) {
         startOffset, fetchLen, &rbuf, &aerr);
 
     if (arc != AZURE_OK) {
+        p->metrics.azure_errors++;
         azure_buffer_free(&rbuf);
         return SQLITE_IOERR_READ;
     }
@@ -880,6 +884,9 @@ static int fetchPagesFromAzure(sqliteObjsFile *p, int pageIdx) {
         return SQLITE_IOERR_READ;
     }
 
+    p->metrics.blob_reads++;
+    p->metrics.blob_bytes_read += (sqlite3_int64)rbuf.size;
+
     /* Write to cache file */
     size_t writeLen = rbuf.size < fetchLen ? rbuf.size : fetchLen;
     ssize_t nw = pwrite(p->cacheFd, rbuf.data, writeLen, (off_t)startOffset);
@@ -888,6 +895,9 @@ static int fetchPagesFromAzure(sqliteObjsFile *p, int pageIdx) {
     if (nw < 0 || (size_t)nw != writeLen) {
         return SQLITE_IOERR_WRITE;
     }
+
+    p->metrics.disk_writes++;
+    p->metrics.disk_bytes_written += (sqlite3_int64)writeLen;
 
     /* Mark fetched pages valid */
     validMarkRange(p, startOffset, startOffset + (sqlite3_int64)writeLen);
@@ -943,6 +953,7 @@ static int prefetchInvalidPages(sqliteObjsFile *p) {
             startOffset, fetchLen, &rbuf, &aerr);
 
         if (arc != AZURE_OK) {
+            p->metrics.azure_errors++;
             azure_buffer_free(&rbuf);
             return SQLITE_IOERR_READ;
         }
@@ -950,6 +961,9 @@ static int prefetchInvalidPages(sqliteObjsFile *p) {
             azure_buffer_free(&rbuf);
             return SQLITE_IOERR_READ;
         }
+
+        p->metrics.blob_reads++;
+        p->metrics.blob_bytes_read += (sqlite3_int64)rbuf.size;
 
         size_t writeLen = rbuf.size < fetchLen ? rbuf.size : fetchLen;
         ssize_t nw = pwrite(p->cacheFd, rbuf.data, writeLen, (off_t)startOffset);
@@ -959,7 +973,11 @@ static int prefetchInvalidPages(sqliteObjsFile *p) {
             return SQLITE_IOERR_WRITE;
         }
 
+        p->metrics.disk_writes++;
+        p->metrics.disk_bytes_written += (sqlite3_int64)writeLen;
+
         validMarkRange(p, startOffset, startOffset + (sqlite3_int64)writeLen);
+        p->metrics.prefetch_pages += (rangeEnd - rangeStart);
         fetchCount++;
     }
 
@@ -1034,6 +1052,8 @@ static int applyIncrementalDiff(sqliteObjsFile *p, int64_t blobSize, const char 
                                 (off_t)rangeStart);
             free(zeros);
             if (nw != (ssize_t)rangeLen) { diffOk = 0; break; }
+            p->metrics.disk_writes++;
+            p->metrics.disk_bytes_written += rangeLen;
             /* Mark these pages valid (they contain the correct zeros) */
             if (p->valid.data) {
                 validMarkRange(p, rangeStart, rangeStart + rangeLen);
@@ -1050,15 +1070,21 @@ static int applyIncrementalDiff(sqliteObjsFile *p, int64_t blobSize, const char 
                 rangeStart, (size_t)rangeLen, &rbuf, &rerr);
 
             if (rrc != AZURE_OK || !rbuf.data || (int64_t)rbuf.size < rangeLen) {
+                if (rrc != AZURE_OK) p->metrics.azure_errors++;
                 azure_buffer_free(&rbuf);
                 diffOk = 0;
                 break;
             }
 
+            p->metrics.blob_reads++;
+            p->metrics.blob_bytes_read += (sqlite3_int64)rbuf.size;
+
             ssize_t nw = pwrite(p->cacheFd, rbuf.data, (size_t)rangeLen,
                                 (off_t)rangeStart);
             azure_buffer_free(&rbuf);
             if (nw != (ssize_t)rangeLen) { diffOk = 0; break; }
+            p->metrics.disk_writes++;
+            p->metrics.disk_bytes_written += rangeLen;
             /* Mark these pages valid (freshly downloaded) */
             if (p->valid.data) {
                 validMarkRange(p, rangeStart, rangeStart + rangeLen);
@@ -1162,8 +1188,10 @@ static int leaseRenewIfNeeded(sqliteObjsFile *p) {
     azure_err_t rc = p->ops->lease_renew(p->ops_ctx, p->zBlobName,
                                           p->leaseId, &aerr);
     if (rc != AZURE_OK) {
+        p->metrics.azure_errors++;
         return SQLITE_IOERR_LOCK;
     }
+    p->metrics.lease_renewals++;
     p->leaseAcquiredAt = now;
     return SQLITE_OK;
 }
@@ -1400,8 +1428,14 @@ static int sqliteObjsRead(sqlite3_file *pFile, void *pBuf, int iAmt,
         if (readEnd > p->nData) readEnd = p->nData;
         int startPage = (int)(iOfst / p->pageSize);
         int endPage = (int)((readEnd + p->pageSize - 1) / p->pageSize);
+        int hadMiss = 0;
         for (int pg = startPage; pg < endPage; pg++) {
             if (!bitmapTestBit(&p->valid, pg)) {
+                if (!hadMiss) {
+                    p->metrics.cache_misses++;
+                    hadMiss = 1;
+                }
+                p->metrics.cache_miss_pages++;
                 int rc = fetchPagesFromAzure(p, pg);
                 if (rc != SQLITE_OK) {
                     memset(pBuf, 0, iAmt);
@@ -1409,6 +1443,7 @@ static int sqliteObjsRead(sqlite3_file *pFile, void *pBuf, int iAmt,
                 }
             }
         }
+        if (!hadMiss) p->metrics.cache_hits++;
     }
     
     sqlite3_int64 avail = p->nData - iOfst;
@@ -1416,6 +1451,8 @@ static int sqliteObjsRead(sqlite3_file *pFile, void *pBuf, int iAmt,
     
     if (toRead > 0) {
         ssize_t nRead = pread(p->cacheFd, pBuf, toRead, (off_t)iOfst);
+        p->metrics.disk_reads++;
+        p->metrics.disk_bytes_read += (nRead > 0) ? nRead : 0;
         if (nRead < 0) {
             memset(pBuf, 0, iAmt);
             return SQLITE_IOERR_READ;
@@ -1497,6 +1534,8 @@ static int sqliteObjsWrite(sqlite3_file *pFile, const void *pBuf, int iAmt,
         p->nData = prevNData;
         return SQLITE_IOERR_WRITE;
     }
+    p->metrics.disk_writes++;
+    p->metrics.disk_bytes_written += iAmt;
 
     /* Renew lease if needed during long write sequences */
     if (hasLease(p)) {
@@ -1719,9 +1758,14 @@ static int sqliteObjsSync(sqlite3_file *pFile, int flags) {
         }
 
         if (arc != AZURE_OK) {
+            p->metrics.azure_errors++;
             return SQLITE_IOERR_FSYNC;
         }
 
+        p->metrics.wal_uploads++;
+        p->metrics.wal_bytes_uploaded += p->nWalData;
+        p->metrics.blob_writes++;
+        p->metrics.blob_bytes_written += p->nWalData;
         return SQLITE_OK;
     }
 
@@ -1743,8 +1787,14 @@ static int sqliteObjsSync(sqlite3_file *pFile, int flags) {
             }
 
             if (arc != AZURE_OK) {
+                p->metrics.azure_errors++;
                 return SQLITE_IOERR_FSYNC;
             }
+
+            p->metrics.journal_uploads++;
+            p->metrics.journal_bytes_uploaded += p->nJrnlData;
+            p->metrics.blob_writes++;
+            p->metrics.blob_bytes_written += p->nJrnlData;
 
             /* R1: Journal blob now exists in Azure */
             {
@@ -1762,11 +1812,14 @@ static int sqliteObjsSync(sqlite3_file *pFile, int flags) {
     if (p->dirty.nSet == 0) return SQLITE_OK;
     if (!p->ops || !p->ops->page_blob_write) return SQLITE_IOERR_FSYNC;
 
+    p->metrics.syncs++;
+
     double sync_t0 = 0;
     if (sqlite_objs_debug_timing()) sync_t0 = sqlite_objs_time_ms();
 
     /* Record dirty page count for lease duration heuristic */
     int dirtyCountBeforeSync = p->dirty.nSet;
+    p->metrics.dirty_pages_synced += dirtyCountBeforeSync;
 
     /* Renew lease before flushing */
     int rc = leaseRenewIfNeeded(p);
@@ -1789,8 +1842,10 @@ static int sqliteObjsSync(sqlite3_file *pFile, int flags) {
         if (sqlite_objs_debug_timing()) resize_ms = sqlite_objs_time_ms() - rt0;
 
         if (arc != AZURE_OK) {
+            p->metrics.azure_errors++;
             return SQLITE_IOERR_FSYNC;
         }
+        p->metrics.blob_resizes++;
         p->lastSyncedSize = p->nData;
     }
 
@@ -1847,6 +1902,8 @@ static int sqliteObjsSync(sqlite3_file *pFile, int flags) {
         unsigned char *bufPos = rangeDataBuf;
         for (int i = 0; i < nRanges; i++) {
             ssize_t nRead = pread(p->cacheFd, bufPos, ranges[i].len, (off_t)ranges[i].offset);
+            p->metrics.disk_reads++;
+            p->metrics.disk_bytes_read += (nRead > 0) ? nRead : 0;
             if (nRead < 0) {
                 sqlite3_free(rangeDataBuf);
                 if (ranges != stackRanges) sqlite3_free(ranges);
@@ -1889,7 +1946,12 @@ static int sqliteObjsSync(sqlite3_file *pFile, int flags) {
 
         sqlite3_free(rangeDataBuf);
         if (ranges != stackRanges) sqlite3_free(ranges);
-        if (arc != AZURE_OK) return SQLITE_IOERR_FSYNC;
+        if (arc != AZURE_OK) {
+            p->metrics.azure_errors++;
+            return SQLITE_IOERR_FSYNC;
+        }
+        p->metrics.blob_writes++;
+        p->metrics.blob_bytes_written += (sqlite3_int64)totalRangeBytes;
         p->lastSyncDirtyCount = dirtyCountBeforeSync;
         if (aerr.etag[0] != '\0') {
             memcpy(p->etag, aerr.etag, sizeof(p->etag));
@@ -1920,10 +1982,13 @@ static int sqliteObjsSync(sqlite3_file *pFile, int flags) {
             hasLease(p) ? p->leaseId : NULL, &aerr);
 
         if (arc != AZURE_OK) {
+            p->metrics.azure_errors++;
             sqlite3_free(rangeDataBuf);
             if (ranges != stackRanges) sqlite3_free(ranges);
             return SQLITE_IOERR_FSYNC;
         }
+        p->metrics.blob_writes++;
+        p->metrics.blob_bytes_written += (sqlite3_int64)ranges[i].len;
     } {
         double write_ms = sqlite_objs_time_ms() - write_t0;
         double total_ms = sqlite_objs_time_ms() - sync_t0;
@@ -2020,6 +2085,8 @@ static int revalidateAfterLease(sqliteObjsFile *p, const char *leaseEtag) {
     if (p->etag[0] == '\0') return SQLITE_OK;
     if (!p->ops) return SQLITE_OK;
 
+    p->metrics.revalidations++;
+
     /* Fast path: compare ETag from the lease response */
     if (leaseEtag && leaseEtag[0] != '\0') {
         if (strcmp(p->etag, leaseEtag) == 0) {
@@ -2037,6 +2104,7 @@ static int revalidateAfterLease(sqliteObjsFile *p, const char *leaseEtag) {
     azure_err_t arc = p->ops->blob_get_properties(
         p->ops_ctx, p->zBlobName, &blobSize, NULL, NULL, &aerr);
     if (arc != AZURE_OK) {
+        p->metrics.azure_errors++;
         return azureErrToSqlite(arc, SQLITE_IOERR_READ);
     }
 
@@ -2122,6 +2190,8 @@ static int revalidateAfterLease(sqliteObjsFile *p, const char *leaseEtag) {
                 bitmapsEnsureCapacity(p);
                 bitmapClearAll(&p->dirty);
                 p->lastSyncedSize = p->nData;
+                p->metrics.revalidation_diffs++;
+                p->metrics.pages_invalidated += nChangedPages;
                 if (sqlite_objs_debug_timing()) {
                     double elapsed = sqlite_objs_time_ms() - t0;
                     fprintf(stderr, "[TIMING] revalidateAfterLease(lazy): "
@@ -2139,6 +2209,7 @@ static int revalidateAfterLease(sqliteObjsFile *p, const char *leaseEtag) {
     /* ---- Incremental diff path (prefetch=all): download changed pages ---- */
     if (p->prefetchMode == SQLITE_OBJS_PREFETCH_ALL) {
         if (applyIncrementalDiff(p, blobSize, "revalidateAfterLease") == SQLITE_OK) {
+            p->metrics.revalidation_diffs++;
             /* All pages now valid after full diff apply */
             if (p->valid.data) {
                 bitmapEnsureCapacity(&p->valid, p->nData, p->pageSize);
@@ -2150,6 +2221,7 @@ static int revalidateAfterLease(sqliteObjsFile *p, const char *leaseEtag) {
     }
 
     /* ---- Full re-download path (original behavior) ---- */
+    p->metrics.revalidation_downloads++;
     unsigned char *tempBuf = (unsigned char *)malloc(blobSize);
     if (!tempBuf) return SQLITE_NOMEM;
 
@@ -2177,9 +2249,13 @@ static int revalidateAfterLease(sqliteObjsFile *p, const char *leaseEtag) {
     }
 
     if (arc != AZURE_OK) {
+        p->metrics.azure_errors++;
         free(tempBuf);
         return azureErrToSqlite(arc, SQLITE_IOERR_READ);
     }
+
+    p->metrics.blob_reads++;
+    p->metrics.blob_bytes_read += blobSize;
 
     /* Rewrite cache file with fresh data */
     if (lseek(p->cacheFd, 0, SEEK_SET) != 0) {
@@ -2289,11 +2365,14 @@ static int sqliteObjsLock(sqlite3_file *pFile, int eLock) {
         }
 
         if (arc == AZURE_ERR_CONFLICT) {
+            p->metrics.azure_errors++;
             return SQLITE_BUSY;
         }
         if (arc != AZURE_OK) {
+            p->metrics.azure_errors++;
             return azureErrToSqlite(arc, SQLITE_IOERR_LOCK);
         }
+        p->metrics.lease_acquires++;
         p->leaseAcquiredAt = time(NULL);
         p->leaseDuration = duration;
 
@@ -2338,7 +2417,7 @@ static int sqliteObjsUnlock(sqlite3_file *pFile, int eLock) {
             azure_error_init(&aerr);
             p->ops->lease_release(p->ops_ctx, p->zBlobName,
                                    p->leaseId, &aerr);
-
+            p->metrics.lease_releases++;
             if (sqlite_objs_debug_timing()) {
                 double elapsed = sqlite_objs_time_ms() - t0;
                 fprintf(stderr, "[TIMING] lease_release: %.1fms (blob=%s)\n",
@@ -2387,6 +2466,69 @@ static int sqliteObjsCheckReservedLock(sqlite3_file *pFile, int *pResOut) {
 
     *pResOut = 0;
     return SQLITE_OK;
+}
+
+/*
+** Format all metrics as a key=value string (one per line).
+** Returns a sqlite3_malloc'd string.  Caller must sqlite3_free().
+*/
+static char *formatMetrics(const sqlite_objs_metrics *m) {
+    return sqlite3_mprintf(
+        "disk_reads=%lld\n"
+        "disk_writes=%lld\n"
+        "disk_bytes_read=%lld\n"
+        "disk_bytes_written=%lld\n"
+        "blob_reads=%lld\n"
+        "blob_writes=%lld\n"
+        "blob_bytes_read=%lld\n"
+        "blob_bytes_written=%lld\n"
+        "cache_hits=%lld\n"
+        "cache_misses=%lld\n"
+        "cache_miss_pages=%lld\n"
+        "prefetch_pages=%lld\n"
+        "lease_acquires=%lld\n"
+        "lease_renewals=%lld\n"
+        "lease_releases=%lld\n"
+        "syncs=%lld\n"
+        "dirty_pages_synced=%lld\n"
+        "blob_resizes=%lld\n"
+        "revalidations=%lld\n"
+        "revalidation_downloads=%lld\n"
+        "revalidation_diffs=%lld\n"
+        "pages_invalidated=%lld\n"
+        "journal_uploads=%lld\n"
+        "journal_bytes_uploaded=%lld\n"
+        "wal_uploads=%lld\n"
+        "wal_bytes_uploaded=%lld\n"
+        "azure_errors=%lld",
+        (long long)m->disk_reads,
+        (long long)m->disk_writes,
+        (long long)m->disk_bytes_read,
+        (long long)m->disk_bytes_written,
+        (long long)m->blob_reads,
+        (long long)m->blob_writes,
+        (long long)m->blob_bytes_read,
+        (long long)m->blob_bytes_written,
+        (long long)m->cache_hits,
+        (long long)m->cache_misses,
+        (long long)m->cache_miss_pages,
+        (long long)m->prefetch_pages,
+        (long long)m->lease_acquires,
+        (long long)m->lease_renewals,
+        (long long)m->lease_releases,
+        (long long)m->syncs,
+        (long long)m->dirty_pages_synced,
+        (long long)m->blob_resizes,
+        (long long)m->revalidations,
+        (long long)m->revalidation_downloads,
+        (long long)m->revalidation_diffs,
+        (long long)m->pages_invalidated,
+        (long long)m->journal_uploads,
+        (long long)m->journal_bytes_uploaded,
+        (long long)m->wal_uploads,
+        (long long)m->wal_bytes_uploaded,
+        (long long)m->azure_errors
+    );
 }
 
 /*
@@ -2466,6 +2608,21 @@ static int sqliteObjsFileControl(sqlite3_file *pFile, int op, void *pArg) {
                 }
                 return SQLITE_OK;
             }
+            /* PRAGMA sqlite_objs_stats — return all metrics as key=value text */
+            if (aArg[1] && sqlite3_stricmp(aArg[1],
+                    "sqlite_objs_stats") == 0) {
+                sqliteObjsFile *p = (sqliteObjsFile *)pFile;
+                aArg[0] = formatMetrics(&p->metrics);
+                return SQLITE_OK;
+            }
+            /* PRAGMA sqlite_objs_stats_reset — zero all metrics counters */
+            if (aArg[1] && sqlite3_stricmp(aArg[1],
+                    "sqlite_objs_stats_reset") == 0) {
+                sqliteObjsFile *p = (sqliteObjsFile *)pFile;
+                memset(&p->metrics, 0, sizeof(p->metrics));
+                aArg[0] = sqlite3_mprintf("ok");
+                return SQLITE_OK;
+            }
             return SQLITE_NOTFOUND;
         }
         case SQLITE_FCNTL_VFSNAME: {
@@ -2475,6 +2632,16 @@ static int sqliteObjsFileControl(sqlite3_file *pFile, int op, void *pArg) {
         case SQLITE_OBJS_FCNTL_DOWNLOAD_COUNT: {
             sqliteObjsFile *p = (sqliteObjsFile *)pFile;
             *(int *)pArg = p->nDownloads;
+            return SQLITE_OK;
+        }
+        case SQLITE_OBJS_FCNTL_STATS: {
+            sqliteObjsFile *p = (sqliteObjsFile *)pFile;
+            *(char **)pArg = formatMetrics(&p->metrics);
+            return SQLITE_OK;
+        }
+        case SQLITE_OBJS_FCNTL_STATS_RESET: {
+            sqliteObjsFile *p = (sqliteObjsFile *)pFile;
+            memset(&p->metrics, 0, sizeof(p->metrics));
             return SQLITE_OK;
         }
         default:
@@ -2924,6 +3091,7 @@ static int sqliteObjsOpen(sqlite3_vfs *pVfs, sqlite3_filename zName,
                 arc = p->ops->page_blob_read(
                     p->ops_ctx, zName, 0, bootstrapLen, &bbuf, &berr);
                 if (arc != AZURE_OK || !bbuf.data || bbuf.size == 0) {
+                    if (arc != AZURE_OK) p->metrics.azure_errors++;
                     azure_buffer_free(&bbuf);
                     close(p->cacheFd);
                     if (p->zCachePath) { unlink(p->zCachePath); free(p->zCachePath); }
@@ -2935,8 +3103,14 @@ static int sqliteObjsOpen(sqlite3_vfs *pVfs, sqlite3_filename zName,
                 }
 
                 size_t writeLen = bbuf.size < bootstrapLen ? bbuf.size : bootstrapLen;
+                p->metrics.blob_reads++;
+                p->metrics.blob_bytes_read += (sqlite3_int64)writeLen;
                 ssize_t nw = pwrite(p->cacheFd, bbuf.data, writeLen, 0);
                 azure_buffer_free(&bbuf);
+                if (nw >= 0) {
+                    p->metrics.disk_writes++;
+                    p->metrics.disk_bytes_written += nw;
+                }
                 if (nw < 0 || (size_t)nw != writeLen) {
                     close(p->cacheFd);
                     if (p->zCachePath) { unlink(p->zCachePath); free(p->zCachePath); }
@@ -3006,6 +3180,7 @@ static int sqliteObjsOpen(sqlite3_vfs *pVfs, sqlite3_filename zName,
                 }
 
                 if (arc != AZURE_OK) {
+                    p->metrics.azure_errors++;
                     free(tempBuf);
                     close(p->cacheFd);
                     unlink(p->zCachePath);
@@ -3017,6 +3192,9 @@ static int sqliteObjsOpen(sqlite3_vfs *pVfs, sqlite3_filename zName,
                     p->zBlobName = NULL;
                     return azureErrToSqlite(arc, SQLITE_CANTOPEN);
                 }
+
+                p->metrics.blob_reads++;
+                p->metrics.blob_bytes_read += blobSize;
 
                 /* Write downloaded data to cache file */
                 ssize_t totalWritten = 0;
@@ -3035,6 +3213,8 @@ static int sqliteObjsOpen(sqlite3_vfs *pVfs, sqlite3_filename zName,
                         p->zBlobName = NULL;
                         return SQLITE_IOERR;
                     }
+                    p->metrics.disk_writes++;
+                    p->metrics.disk_bytes_written += nWritten;
                     totalWritten += nWritten;
                 }
                 

@@ -94,3 +94,22 @@ Analyzed Quetzal's lazy cache filling proposal. Verdict: Architecturally sound b
 - **Implementation estimate:** 4 days (2 for xOpen/xRead/xWrite/xSync, 1 for sidecar, 1 for tests).
 - **Vtable contract:** No changes required; all modifications internal to sqlite_objs_vfs.c.
 
+### VFS Bitmap & Code Duplication Refactor (2026-07)
+
+- **Unified Bitmap API:** Introduced `Bitmap` struct (`data/nSet/nAlloc`) replacing 6 loose fields per bitmap. Generic functions (`bitmapSetBit`, `bitmapTestBit`, `bitmapClearBit`, `bitmapClearAll`, `bitmapSetAll`, `bitmapSetRange`, `bitmapHasAny`, `bitmapEnsureCapacity`, `bitmapFree`) replace 12 duplicated dirty/valid functions.
+- **Sidecar path builder:** `buildSidecarPath(cachePath, ext)` replaces 3 identical `buildEtagPath`/`buildSnapshotPath`/`buildStatePath` functions. Similarly `unlinkSidecarFile(cachePath, ext)` replaces 3 unlink wrappers.
+- **Buffer helpers:** `bufferEnsure(ppBuf, pAlloc, newSize)` replaces duplicated `jrnlBufferEnsure`/`walBufferEnsure`. `bufferRead(src, srcLen, pBuf, iAmt, iOfst)` replaces duplicated WAL/journal read logic in xRead.
+- **Result:** -158 net lines, zero regressions (247/247 tests pass). Pure refactor.
+- **Key insight:** The dirty and valid bitmaps were structurally identical — 8 of 12 functions had exactly the same bit-manipulation logic, differing only in which struct fields they operated on. The `Bitmap` type makes this sharing explicit and prevents future drift.
+
+### VFS Activity Metrics with PRAGMA Exposure (2026-07)
+
+- **Added `sqlite_objs_metrics` struct** to `sqlite_objs.h` with 27 `sqlite3_int64` counters: disk I/O (reads/writes/bytes), Azure blob I/O (reads/writes/bytes), cache behavior (hits/misses/miss_pages/prefetch_pages), lease lifecycle (acquires/renewals/releases), sync (count/dirty_pages/resizes), revalidation (count/downloads/diffs/pages_invalidated), journal/WAL uploads (count/bytes), and azure_errors.
+- **Per-connection tracking:** Metrics struct lives in `sqliteObjsFile`, zeroed by `memset` in xOpen. No globals, no allocations, just integer increments.
+- **Instrumented 14 code paths:** `fetchPagesFromAzure`, `prefetchInvalidPages`, `applyIncrementalDiff`, `leaseRenewIfNeeded`, `sqliteObjsRead` (cache hit/miss tracking), `sqliteObjsWrite`, `sqliteObjsSync` (WAL/journal/MAIN_DB paths), `sqliteObjsLock`, `sqliteObjsUnlock`, `revalidateAfterLease` (all 3 sub-paths), and `sqliteObjsOpen` (bootstrap + full download).
+- **Exposed via PRAGMA:** `PRAGMA sqlite_objs_stats` returns all metrics as key=value text (one per line); `PRAGMA sqlite_objs_stats_reset` zeroes all counters. Also available programmatically via `SQLITE_OBJS_FCNTL_STATS` (201) and `SQLITE_OBJS_FCNTL_STATS_RESET` (202).
+- **`formatMetrics()` helper:** Uses `sqlite3_mprintf` to format all 27 counters. Returns caller-freed string. Clean pattern — adding a counter only requires struct field + one `sqlite3_mprintf` format line + one instrumentation increment.
+- **7 new tests:** `metrics_pragma_returns_stats`, `metrics_disk_io_counters`, `metrics_blob_io_counters`, `metrics_sync_counters`, `metrics_reset_clears_counters`, `metrics_pragma_reset`, `metrics_all_fields_present`. All 295 tests pass.
+- **Existing globals preserved:** `g_xread_count` and `g_xread_journal_count` kept for backwards compatibility (used in timing output). New per-connection metrics are the preferred API.
+- **Key design decision:** Single text result via PRAGMA (key=value format) rather than virtual table result set. Simpler implementation, easily parseable, avoids complex sqlite3_stmt machinery. FCNTL provides programmatic access for C callers.
+

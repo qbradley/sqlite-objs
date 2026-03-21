@@ -123,6 +123,77 @@ int sqlite_objs_vfs_register_uri(int makeDefault);
 */
 #define SQLITE_OBJS_FCNTL_DOWNLOAD_COUNT 200
 
+/*
+** Custom file-control op code for querying VFS activity metrics.
+** Usage:
+**   char *zStats = NULL;
+**   sqlite3_file_control(db, "main", SQLITE_OBJS_FCNTL_STATS, &zStats);
+**   // zStats is a sqlite3_malloc'd string; caller must sqlite3_free().
+**
+** Returns all metrics as key=value pairs, one per line.
+** Also available via:  PRAGMA sqlite_objs_stats;
+*/
+#define SQLITE_OBJS_FCNTL_STATS 201
+
+/*
+** Custom file-control op code for resetting VFS activity metrics.
+** Usage:
+**   sqlite3_file_control(db, "main", SQLITE_OBJS_FCNTL_STATS_RESET, NULL);
+**
+** Also available via:  PRAGMA sqlite_objs_stats_reset;
+*/
+#define SQLITE_OBJS_FCNTL_STATS_RESET 202
+
+/*
+** Per-connection VFS activity metrics.
+** All fields are sqlite3_int64 counters — no allocations, no locking.
+** Zeroed automatically at xOpen time (memset in sqliteObjsOpen).
+*/
+typedef struct sqlite_objs_metrics {
+    /* Disk I/O — pread/pwrite to local cache file */
+    sqlite3_int64 disk_reads;
+    sqlite3_int64 disk_writes;
+    sqlite3_int64 disk_bytes_read;
+    sqlite3_int64 disk_bytes_written;
+
+    /* Azure Blob I/O — network operations */
+    sqlite3_int64 blob_reads;
+    sqlite3_int64 blob_writes;
+    sqlite3_int64 blob_bytes_read;
+    sqlite3_int64 blob_bytes_written;
+
+    /* Cache behavior */
+    sqlite3_int64 cache_hits;
+    sqlite3_int64 cache_misses;
+    sqlite3_int64 cache_miss_pages;
+    sqlite3_int64 prefetch_pages;
+
+    /* Lease/lock */
+    sqlite3_int64 lease_acquires;
+    sqlite3_int64 lease_renewals;
+    sqlite3_int64 lease_releases;
+
+    /* Sync */
+    sqlite3_int64 syncs;
+    sqlite3_int64 dirty_pages_synced;
+    sqlite3_int64 blob_resizes;
+
+    /* Revalidation */
+    sqlite3_int64 revalidations;
+    sqlite3_int64 revalidation_downloads;
+    sqlite3_int64 revalidation_diffs;
+    sqlite3_int64 pages_invalidated;
+
+    /* Journal & WAL uploads */
+    sqlite3_int64 journal_uploads;
+    sqlite3_int64 journal_bytes_uploaded;
+    sqlite3_int64 wal_uploads;
+    sqlite3_int64 wal_bytes_uploaded;
+
+    /* Errors & retries */
+    sqlite3_int64 azure_errors;
+} sqlite_objs_metrics;
+
 #ifdef __cplusplus
 }
 #endif
