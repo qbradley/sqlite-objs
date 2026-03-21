@@ -113,3 +113,15 @@ Analyzed Quetzal's lazy cache filling proposal. Verdict: Architecturally sound b
 - **Existing globals preserved:** `g_xread_count` and `g_xread_journal_count` kept for backwards compatibility (used in timing output). New per-connection metrics are the preferred API.
 - **Key design decision:** Single text result via PRAGMA (key=value format) rather than virtual table result set. Simpler implementation, easily parseable, avoids complex sqlite3_stmt machinery. FCNTL provides programmatic access for C callers.
 
+### If-Match / Undelete Phase 1 — Compilation Fixes (2026-07)
+
+- **Fixed 3 compilation errors** in `src/azure_client.c` from Frodo's If-Match / Undelete changes:
+  1. `az_blob_undelete`: 13 args to `execute_with_retry` (expects 12). Removed extra NULL.
+  2. `az_page_blob_write`: Added missing `const char *if_match` parameter to match vtable. Implemented proper `If-Match:` header construction (4 header array variants: both/lease-only/match-only/none).
+  3. `az_page_blob_write_batch`: Added `const char *if_match` parameter. Threaded through to `batch_init_easy` which now emits `If-Match:` header on curl handles.
+- **Also fixed:** `batch_init_easy` signature + call site, and the single-range fallback call within `az_page_blob_write_batch`.
+- **Build:** Zero errors, zero warnings with `-Wall -Wextra -Wpedantic`.
+- **Tests:** All 295 unit tests pass.
+- **Synced** to `rust/sqlite-objs-sys/csrc/azure_client.c`.
+- **Key insight:** When vtable function signatures change in the header, the production client, mock client, and any batch helper functions that call through to those functions must ALL be updated in lockstep. The compiler won't always catch mismatches when function pointers are involved — only when the static function is assigned directly to the vtable struct.
+

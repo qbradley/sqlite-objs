@@ -19,6 +19,20 @@
 
 <!-- Append new learnings below. Each entry is something lasting about the project. -->
 
+### S3 Backend Research (2026-07-15)
+
+- **Produced comprehensive S3 architecture research:** `.squad/decisions/inbox/gandalf-s3-research.md` — covers API mapping, dependency strategy, performance analysis, architecture recommendation, S3-compatible services matrix, and phased implementation plan.
+- **Key finding — write amplification:** S3 lacks page-granularity random writes. Every xSync requires full-object re-upload, creating up to 5000× write amplification for small commits on large databases vs Azure page blobs. This is the fundamental architectural constraint.
+- **Key finding — conditional writes exist:** As of November 2024, S3 supports `If-Match` ETag-based conditional writes on PutObject and CompleteMultipartUpload. This provides multi-writer safety without leases — maps to our existing revalidation pattern.
+- **Key finding — SigV4 is feasible with existing stack:** SigV4 uses HMAC-SHA256 (we already have `azure_hmac_sha256()` in `azure_auth.c:100-110`). Estimated ~400 new lines of C for the S3-specific signing code. All S3-compatible services support SigV4.
+- **Key finding — AWS C SDK is rejected:** 10 separate repositories, requires building aws-lc + s2n-tls, would 10-30× our binary size. Incompatible with zero-SDK philosophy.
+- **Architecture recommendation:** Generalize `azure_ops_t` to `storage_ops_t` abstraction. `write_object()` receives both dirty ranges and full data — Azure backend uploads only dirty ranges, S3 backend uploads full object. VFS stays identical.
+- **Locking without leases:** Recommended two-tier approach: (1) optimistic concurrency via `If-Match` ETag for single-writer, (2) optional DynamoDB lease table for multi-writer deployments.
+- **No incremental diff on S3:** Azure's `blob_get_page_ranges_diff()` has no S3 equivalent. MVP uses full re-download on ETag mismatch; future optimization via application-level page hash metadata.
+- **S3-compatible services:** Byte-range GET, PutObject, multipart upload, ETags, SigV4 are universal. Conditional writes (`If-Match`) are NOT universal — DigitalOcean Spaces lacks it entirely. MinIO and R2 support it fully.
+- **Phased plan:** Phase 0 (SigV4 auth, 1 week) → Phase 1 (read-only S3, 1 week) → Phase 2 (read-write S3, 2 weeks) → Phase 3 (generalize vtable, 1 week) → Phase 4 (optimization, 2 weeks). Total: 5-7 weeks.
+- **Open questions for Quetzal:** Target database size? Multi-writer requirement? Priority S3-compatible services? Sharded storage interest? Project naming? Conditional compilation?
+
 ## Core Context Summary
 
 **Lead Architect & Design Review (2026-03-10 through 2026-07):**
