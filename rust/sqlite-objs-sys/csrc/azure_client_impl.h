@@ -107,6 +107,7 @@ azure_err_t azure_auth_sign_request(
     const char *content_length,
     const char *content_type,
     const char *range,
+    const char *if_match,
     const char *const *x_ms_headers,
     char *auth_header,
     size_t auth_header_size);

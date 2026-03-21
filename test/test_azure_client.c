@@ -452,7 +452,7 @@ TEST(auth_missing_credentials) {
     const char *hdrs[] = { NULL };
     azure_err_t rc = azure_auth_sign_request(
         NULL, "GET", "/container/blob", NULL,
-        "", "", "", hdrs, header, sizeof(header));
+        "", "", "", NULL, hdrs, header, sizeof(header));
     ASSERT_NE(rc, AZURE_OK);
 }
 
@@ -478,7 +478,7 @@ TEST(auth_shared_key_header_format) {
     azure_err_t rc = azure_auth_sign_request(
         &client, "PUT", "/mycontainer/myblob", NULL,
         "512", "application/octet-stream", "",
-        x_ms_headers, header, sizeof(header));
+        NULL, x_ms_headers, header, sizeof(header));
     ASSERT_AZURE_OK(rc);
     /* Should be: SharedKey myaccount:<base64-signature> */
     ASSERT_TRUE(strstr(header, "SharedKey myaccount:") != NULL);

@@ -305,6 +305,7 @@ static azure_err_t execute_single(
     const uint8_t *body,
     size_t body_len,
     const char *range_header,
+    const char *if_match,
     azure_buffer_t *response_body,
     azure_response_headers_t *resp_headers,
     azure_error_t *err)
@@ -387,6 +388,7 @@ static azure_err_t execute_single(
             content_length_str,
             content_type ? content_type : "",
             range_header ? range_header : "",
+            if_match,
             (const char *const *)all_x_ms,
             auth_header, sizeof(auth_header));
         if (rc != AZURE_OK) {
@@ -471,6 +473,13 @@ static azure_err_t execute_single(
             }
             SLIST_APPEND(headers, h_extra);
         }
+    }
+
+    /* Standard If-Match header (not x-ms-*, sent separately after signing) */
+    if (if_match && *if_match) {
+        char h_if_match[512];
+        snprintf(h_if_match, sizeof(h_if_match), "If-Match: %s", if_match);
+        SLIST_APPEND(headers, h_if_match);
     }
 
     curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
@@ -614,6 +623,7 @@ static azure_err_t execute_with_retry(
     const uint8_t *body,
     size_t body_len,
     const char *range_header,
+    const char *if_match,
     azure_buffer_t *response_body,
     azure_response_headers_t *resp_headers,
     azure_error_t *err)
@@ -631,7 +641,7 @@ static azure_err_t execute_with_retry(
             response_body->size = 0;
 
         rc = execute_single(client, method, blob_name, query, extra_x_ms,
-                            content_type, body, body_len, range_header,
+                            content_type, body, body_len, range_header, if_match,
                             response_body, &rh, err);
 
         if (rc == AZURE_OK) {
@@ -696,7 +706,7 @@ static azure_err_t az_page_blob_create(void *ctx, const char *name,
     };
 
     return execute_with_retry(c, "PUT", name, NULL,
-                              extra, NULL, NULL, 0, NULL,
+                              extra, NULL, NULL, 0, NULL, NULL,
                               NULL, NULL, err);
 }
 
@@ -739,58 +749,29 @@ static azure_err_t az_page_blob_write(void *ctx, const char *name,
              (long long)offset, (long long)(offset + (int64_t)len - 1));
 
     char lease_header[128];
-    char if_match_header[256];
-    const char *extra_both[] = {
-        "x-ms-page-write:update",
-        range_header,
-        lease_header,
-        if_match_header,
-        NULL
-    };
-    const char *extra_lease_only[] = {
+    const char *extra_lease[] = {
         "x-ms-page-write:update",
         range_header,
         lease_header,
         NULL
     };
-    const char *extra_match_only[] = {
-        "x-ms-page-write:update",
-        range_header,
-        if_match_header,
-        NULL
-    };
-    const char *extra_none[] = {
+    const char *extra_no_lease[] = {
         "x-ms-page-write:update",
         range_header,
         NULL
     };
 
     int has_lease = (lease_id && lease_id[0] != '\0');
-    int has_match = (if_match && if_match[0] != '\0');
-
     if (has_lease) {
         snprintf(lease_header, sizeof(lease_header),
                  "x-ms-lease-id:%s", lease_id);
     }
-    if (has_match) {
-        snprintf(if_match_header, sizeof(if_match_header),
-                 "If-Match:%s", if_match);
-    }
 
-    const char **extra;
-    if (has_lease && has_match) {
-        extra = extra_both;
-    } else if (has_lease) {
-        extra = extra_lease_only;
-    } else if (has_match) {
-        extra = extra_match_only;
-    } else {
-        extra = extra_none;
-    }
+    const char **extra = has_lease ? extra_lease : extra_no_lease;
 
     return execute_with_retry(c, "PUT", name, "comp=page",
                               extra, "application/octet-stream",
-                              data, len, NULL,
+                              data, len, NULL, if_match,
                               NULL, NULL, err);
 }
 
@@ -824,7 +805,7 @@ static azure_err_t az_page_blob_read(void *ctx, const char *name,
     };
 
     return execute_with_retry(c, "GET", name, NULL,
-                              extra, NULL, NULL, 0, NULL,
+                              extra, NULL, NULL, 0, NULL, NULL,
                               out, NULL, err);
 }
 
@@ -873,7 +854,7 @@ static azure_err_t az_page_blob_resize(void *ctx, const char *name,
     }
 
     return execute_with_retry(c, "PUT", name, "comp=properties",
-                              extra, NULL, NULL, 0, NULL,
+                              extra, NULL, NULL, 0, NULL, NULL,
                               NULL, NULL, err);
 }
 
@@ -898,7 +879,7 @@ static azure_err_t az_block_blob_upload(void *ctx, const char *name,
 
     return execute_with_retry(c, "PUT", name, NULL,
                               extra, "application/octet-stream",
-                              data, len, NULL,
+                              data, len, NULL, NULL,
                               NULL, NULL, err);
 }
 
@@ -920,7 +901,7 @@ static azure_err_t az_block_blob_download(void *ctx, const char *name,
     }
 
     return execute_with_retry(c, "GET", name, NULL,
-                              NULL, NULL, NULL, 0, NULL,
+                              NULL, NULL, NULL, 0, NULL, NULL,
                               out, NULL, err);
 }
 
@@ -1037,6 +1018,7 @@ static azure_err_t block_init_easy(
         azure_err_t rc = azure_auth_sign_request(
             c, "PUT", path, query_params,
             cl_str, "application/octet-stream", "",
+            NULL,
             (const char *const *)xms,
             auth_hdr, sizeof(auth_hdr));
         if (rc != AZURE_OK) {
@@ -1396,7 +1378,7 @@ static azure_err_t az_block_blob_upload_parallel(
     azure_error_init(err);
     result = execute_with_retry(c, "PUT", name, "comp=blocklist",
                                 NULL, "application/xml",
-                                (const uint8_t *)xml, xml_len, NULL,
+                                (const uint8_t *)xml, xml_len, NULL, NULL,
                                 NULL, NULL, err);
     free(xml);
 
@@ -1422,7 +1404,7 @@ static azure_err_t az_blob_get_properties(void *ctx, const char *name,
     azure_response_headers_t rh;
 
     azure_err_t rc = execute_with_retry(c, "HEAD", name, NULL,
-                                        NULL, NULL, NULL, 0, NULL,
+                                        NULL, NULL, NULL, 0, NULL, NULL,
                                         NULL, &rh, err);
     if (rc == AZURE_OK) {
         if (size) *size = rh.content_length;
@@ -1449,7 +1431,7 @@ static azure_err_t az_blob_delete(void *ctx, const char *name,
     azure_client_t *c = (azure_client_t *)ctx;
 
     return execute_with_retry(c, "DELETE", name, NULL,
-                              NULL, NULL, NULL, 0, NULL,
+                              NULL, NULL, NULL, 0, NULL, NULL,
                               NULL, NULL, err);
 }
 
@@ -1464,7 +1446,7 @@ static azure_err_t az_blob_undelete(void *ctx, const char *name,
     azure_client_t *c = (azure_client_t *)ctx;
 
     return execute_with_retry(c, "PUT", name, "comp=undelete",
-                              NULL, NULL, NULL, 0, NULL,
+                              NULL, NULL, NULL, 0, NULL, NULL,
                               NULL, NULL, err);
 }
 
@@ -1536,7 +1518,7 @@ static azure_err_t az_lease_acquire(void *ctx, const char *name,
 
     azure_response_headers_t rh;
     azure_err_t rc = execute_with_retry(c, "PUT", name, "comp=lease",
-                                        extra, NULL, NULL, 0, NULL,
+                                        extra, NULL, NULL, 0, NULL, NULL,
                                         NULL, &rh, err);
     if (rc == AZURE_OK && lease_id_out) {
         strncpy(lease_id_out, rh.lease_id, lease_id_size - 1);
@@ -1574,7 +1556,7 @@ static azure_err_t az_lease_renew(void *ctx, const char *name,
     };
 
     return execute_with_retry(c, "PUT", name, "comp=lease",
-                              extra, NULL, NULL, 0, NULL,
+                              extra, NULL, NULL, 0, NULL, NULL,
                               NULL, NULL, err);
 }
 
@@ -1606,7 +1588,7 @@ static azure_err_t az_lease_release(void *ctx, const char *name,
     };
 
     return execute_with_retry(c, "PUT", name, "comp=lease",
-                              extra, NULL, NULL, 0, NULL,
+                              extra, NULL, NULL, 0, NULL, NULL,
                               NULL, NULL, err);
 }
 
@@ -1636,7 +1618,7 @@ static azure_err_t az_lease_break(void *ctx, const char *name,
 
     azure_response_headers_t rh;
     azure_err_t rc = execute_with_retry(c, "PUT", name, "comp=lease",
-                                        extra, NULL, NULL, 0, NULL,
+                                        extra, NULL, NULL, 0, NULL, NULL,
                                         NULL, &rh, err);
     if (rc == AZURE_OK && remaining_secs)
         *remaining_secs = rh.lease_time;
@@ -1780,6 +1762,7 @@ static azure_err_t batch_init_easy(
         azure_err_t rc = azure_auth_sign_request(
             c, "PUT", path, "comp=page",
             cl_str, "application/octet-stream", "",
+            if_match,
             (const char *const *)xms,
             auth_hdr, sizeof(auth_hdr));
         if (rc != AZURE_OK) {
@@ -2280,6 +2263,7 @@ static azure_err_t read_batch_init_easy(
         azure_err_t rc = azure_auth_sign_request(
             c, "GET", path, NULL,
             "", "", "",
+            NULL,
             (const char *const *)xms,
             auth_hdr, sizeof(auth_hdr));
         if (rc != AZURE_OK) {
@@ -2637,7 +2621,7 @@ static azure_err_t az_append_blob_create(void *ctx, const char *blob_name,
     }
 
     return execute_with_retry(c, "PUT", blob_name, NULL,
-                              extra, NULL, NULL, 0, NULL,
+                              extra, NULL, NULL, 0, NULL, NULL,
                               NULL, NULL, err);
 }
 
@@ -2689,7 +2673,7 @@ static azure_err_t az_append_blob_append(void *ctx, const char *blob_name,
 
     return execute_with_retry(c, "PUT", blob_name, "comp=appendblock",
                               extra, "application/octet-stream",
-                              data, (size_t)data_len, NULL,
+                              data, (size_t)data_len, NULL, NULL,
                               NULL, NULL, err);
 }
 
@@ -2718,7 +2702,7 @@ static azure_err_t az_append_blob_delete(void *ctx, const char *blob_name,
     }
 
     return execute_with_retry(c, "DELETE", blob_name, NULL,
-                              extra, NULL, NULL, 0, NULL,
+                              extra, NULL, NULL, 0, NULL, NULL,
                               NULL, NULL, err);
 }
 
@@ -2747,7 +2731,7 @@ static azure_err_t az_blob_snapshot_create(void *ctx, const char *blob_name,
 
     azure_response_headers_t rh;
     azure_err_t rc = execute_with_retry(c, "PUT", blob_name, "comp=snapshot",
-                                        NULL, NULL, NULL, 0, NULL,
+                                        NULL, NULL, NULL, 0, NULL, NULL,
                                         NULL, &rh, err);
     if (rc != AZURE_OK) return rc;
 
@@ -2883,7 +2867,7 @@ static azure_err_t az_blob_get_page_ranges_diff(
     azure_buffer_init(&body);
 
     azure_err_t rc = execute_with_retry(c, "GET", blob_name, query,
-                                        NULL, NULL, NULL, 0, NULL,
+                                        NULL, NULL, NULL, 0, NULL, NULL,
                                         &body, NULL, err);
     if (rc != AZURE_OK) {
         azure_buffer_free(&body);
@@ -3198,6 +3182,7 @@ azure_err_t azure_container_create(azure_client_t *client,
             "",  /* content_length = "" for zero-length */
             "",  /* content_type */
             "",  /* range */
+            NULL,
             x_ms_headers,
             auth_header, sizeof(auth_header));
         if (rc != AZURE_OK) {

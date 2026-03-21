@@ -159,6 +159,7 @@ azure_err_t azure_auth_sign_request(
     const char *content_length,
     const char *content_type,
     const char *range,
+    const char *if_match,
     const char *const *x_ms_headers,
     char *auth_header,
     size_t auth_header_size)
@@ -190,13 +191,14 @@ azure_err_t azure_auth_sign_request(
             "%s\n"    /* Content-Type */
             "\n"      /* Date (empty — using x-ms-date) */
             "\n"      /* If-Modified-Since */
-            "\n"      /* If-Match */
+            "%s\n"    /* If-Match */
             "\n"      /* If-None-Match */
             "\n"      /* If-Unmodified-Since */
             "%s\n",   /* Range */
             method,
             content_length,
             content_type,
+            if_match ? if_match : "",
             range);
         if (n < 0 || p + n >= end) return AZURE_ERR_INVALID_ARG;
         p += n;
