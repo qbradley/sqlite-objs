@@ -31,11 +31,6 @@ static void setup(void) {
     g_ops = mock_azure_get_ops();
 }
 
-static void teardown(void) {
-    /* Intentionally left alive across tests for efficiency.
-    ** mock_reset in setup() clears state. */
-}
-
 /* ══════════════════════════════════════════════════════════════════════
 ** SECTION 1: Mock Page Blob Operations
 ** ══════════════════════════════════════════════════════════════════════ */
@@ -3011,10 +3006,9 @@ TEST(lazy_state_missing_file) {
     ASSERT_EQ(sqlite3_column_int(stmt, 0), 50);
     sqlite3_finalize(stmt);
 
-    /* Pages beyond bootstrap had to be re-fetched */
-    int reads = mock_get_call_count(g_ctx, "page_blob_read");
-    /* Might be 0 if entire db fits in bootstrap (64KB), so we just
-    ** verify it doesn't crash and data is correct */
+    /* Pages beyond bootstrap may need re-fetching, but if the entire
+    ** db fits in bootstrap (64KB), reads may be 0.  We just verify
+    ** it doesn't crash and data is correct. */
 
     sqlite3_close(db);
     cleanup_lazy_cache_dir(cacheDir);

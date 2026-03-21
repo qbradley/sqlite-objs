@@ -169,7 +169,7 @@ static int test_harness_summary(void) {
 
 #define ASSERT_STR_EQ(a, b) \
     do { \
-        const char *_a = (a), *_b = (b); \
+        const char *_a = (const char *)(a), *_b = (const char *)(b); \
         if (_a == NULL && _b == NULL) break; \
         if (_a == NULL || _b == NULL || strcmp(_a, _b) != 0) \
             TH_FAIL("Expected \"%s\" == \"%s\"", _a ? _a : "(null)", _b ? _b : "(null)"); \
@@ -177,7 +177,7 @@ static int test_harness_summary(void) {
 
 #define ASSERT_STR_NE(a, b) \
     do { \
-        const char *_a = (a), *_b = (b); \
+        const char *_a = (const char *)(a), *_b = (const char *)(b); \
         if (_a != NULL && _b != NULL && strcmp(_a, _b) == 0) \
             TH_FAIL("Expected strings to differ: \"%s\"", _a); \
     } while (0)
