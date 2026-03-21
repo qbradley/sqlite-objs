@@ -183,7 +183,7 @@ $(MOCK_OBJ): $(TEST_DIR)/mock_azure_ops.c $(TEST_DIR)/mock_azure_ops.h $(SRC_DIR
 
 # ---------- Tests ----------
 
-test-unit: $(BUILD_DIR)/test_main
+test-unit: $(LIBRARY) $(BUILD_DIR)/test_main
 	@echo "=== Running unit tests ==="
 	$(BUILD_DIR)/test_main
 	@echo "=== All unit tests passed ==="
