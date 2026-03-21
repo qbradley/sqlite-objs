@@ -18,6 +18,27 @@
 
 <!-- Append new learnings below. Each entry is something lasting about the project. -->
 
+### Lazy Cache Filling Implementation (2026-03-22)
+
+- **Implemented lazy cache filling** in `src/sqlite_objs_vfs.c` — `prefetch=all` (default, full download at xOpen) vs `prefetch=none` (lazy, on-demand page fetches).
+- **New struct fields:** `aValid` bitmap (parallel to `aDirty`), `nValidPages`, `nValidAlloc`, `prefetchMode`.
+- **Valid bitmap helpers:** `validMarkPage`, `validIsPageValid`, `validClearPage`, `validClearAll`, `validMarkAll`, `validEnsureCapacity`, `validMarkRange` — mirrors dirty bitmap API.
+- **State file I/O:** `.state` sidecar with format: SQOS magic + version + pageSize + fileSize + bitmap + CRC32. Atomic rename write (`writeStateFile`), validated read (`readStateFile`), cleanup (`unlinkStateFile`).
+- **CRC32 implementation:** Lookup table-based ISO 3309 CRC32, plus LE32/LE64 read/write helpers for cross-platform binary format.
+- **`fetchPagesFromAzure()`:** 16-page readahead window on cache miss. Single `page_blob_read` call for the window, clamp to file size.
+- **`prefetchInvalidPages()`:** Scans valid bitmap, coalesces contiguous invalid ranges, downloads all at once. Exposed via `PRAGMA sqlite_objs_prefetch`.
+- **xRead:** Before pread, checks validity bitmap for all pages in read range. Fetches missing pages via readahead window.
+- **xWrite:** Marks pages both dirty AND valid simultaneously.
+- **xTruncate:** Clears valid bits for pages beyond new size.
+- **xClose:** Write order: cache fsync → .state file (atomic rename) → .etag file. Frees `aValid`.
+- **xSync:** Persists .state sidecar after successful upload (best-effort).
+- **revalidateAfterLease (lazy mode):** Incremental diff used to MARK pages invalid (not download). If >50% pages changed, falls back to full download. After full re-download, marks all valid.
+- **applyIncrementalDiff:** Now marks downloaded diff ranges as valid in the bitmap.
+- **Constants:** `SQLITE_OBJS_PREFETCH_ALL=0`, `SQLITE_OBJS_PREFETCH_NONE=1`, `SQLITE_OBJS_READAHEAD_PAGES=16`, `SQLITE_OBJS_PAGE1_BOOTSTRAP=65536`, `SQLITE_OBJS_DIFF_THRESHOLD_PCT=50`.
+- **Net new code:** ~500 lines. Zero regression — all 247 unit tests + 17 integration tests pass.
+- **Key design insight:** `bitmapsEnsureCapacity()` wrapper grows both dirty and valid bitmaps together. `cacheEnsureSize()` calls it to keep both in sync when the cache file grows.
+- **Test cleanup:** Updated `cleanup_cache_files()` in test_integration.c to also remove `.state` and `.snapshot` sidecar files.
+
 
 ## Core Context Summary
 

@@ -935,11 +935,12 @@ TEST(integ_attach_cross_container) {
 /* Helper: clean leftover cache + etag sidecar files matching a pattern */
 static void cleanup_cache_files(const char *blobName) {
     /* The VFS stores cache files in /tmp as sqlite-objs-<hash>.cache
-     * and corresponding .etag files.  We brute-force remove them by
-     * scanning /tmp for our prefix.  This is a test-only convenience. */
+     * and corresponding .etag, .state, and .snapshot files.  We brute-force
+     * remove them by scanning /tmp for our prefix.  This is a test-only convenience. */
     char cmd[256];
     snprintf(cmd, sizeof(cmd),
-             "rm -f /tmp/sqlite-objs-*.cache /tmp/sqlite-objs-*.etag");
+             "rm -f /tmp/sqlite-objs-*.cache /tmp/sqlite-objs-*.etag"
+             " /tmp/sqlite-objs-*.state /tmp/sqlite-objs-*.snapshot");
     (void)system(cmd);
     (void)blobName;  /* suppress unused warning */
 }

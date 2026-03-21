@@ -95,6 +95,13 @@ static int sqliteObjsShmUnmap(sqlite3_file*, int);
 /* ---------- Constants ---------- */
 
 #define SQLITE_OBJS_DEFAULT_PAGE_SIZE  4096
+#define SQLITE_OBJS_PREFETCH_ALL       0       /* prefetch=all: full download at xOpen (default) */
+#define SQLITE_OBJS_PREFETCH_NONE      1       /* prefetch=none: lazy cache filling */
+#define SQLITE_OBJS_READAHEAD_PAGES    16      /* pages to fetch on a cache miss */
+#define SQLITE_OBJS_PAGE1_BOOTSTRAP    65536   /* bytes to fetch at xOpen for page size detection */
+#define SQLITE_OBJS_DIFF_THRESHOLD_PCT 50      /* >50% changed pages → full download */
+#define SQLITE_OBJS_STATE_MAGIC        "SQOS"
+#define SQLITE_OBJS_STATE_VERSION      1
 #define SQLITE_OBJS_LEASE_DURATION     30      /* default lease duration (seconds) */
 #define SQLITE_OBJS_LEASE_DURATION_LONG 60     /* extended lease for large flushes */
 #define SQLITE_OBJS_LEASE_RENEW_AFTER  15      /* default renew threshold (unused — see leaseDuration) */
@@ -132,6 +139,12 @@ typedef struct sqliteObjsFile {
     int nDirtyAlloc;                    /* Allocated size of aDirty bitmap */
     int pageSize;                       /* Detected from header or default 4096 */
     int lastSyncDirtyCount;             /* Dirty pages at last xSync (lease heuristic) */
+
+    /* Valid page tracking (lazy cache) — mirrors dirty bitmap structure */
+    unsigned char *aValid;              /* Bitmap: 1 bit per page, 1=cached */
+    int nValidPages;                    /* Count of valid (cached) pages */
+    int nValidAlloc;                    /* Allocated size of aValid bitmap */
+    int prefetchMode;                   /* 0=all (default), 1=none (lazy) */
 
     /* Lock state */
     int eLock;                          /* Current SQLite lock level */
@@ -330,8 +343,110 @@ static int dirtyHasAny(sqliteObjsFile *p) {
 
 
 /* ===================================================================
+** Helper: valid (cached) page bitmap operations — mirrors dirty bitmap
+** =================================================================== */
+
+static void validMarkPage(sqliteObjsFile *p, sqlite3_int64 offset) {
+    if (!p->aValid || p->pageSize <= 0) return;
+    int pageIdx = (int)(offset / p->pageSize);
+    int byteIdx = pageIdx / 8;
+    int bitIdx = pageIdx % 8;
+    if (byteIdx < 0 || byteIdx >= p->nValidAlloc) return;
+    if (!(p->aValid[byteIdx] & (1 << bitIdx))) {
+        p->aValid[byteIdx] |= (1 << bitIdx);
+        p->nValidPages++;
+    }
+}
+
+static int validIsPageValid(sqliteObjsFile *p, int pageIdx) {
+    if (!p->aValid) return 0;
+    int byteIdx = pageIdx / 8;
+    int bitIdx = pageIdx % 8;
+    if (byteIdx < 0 || byteIdx >= p->nValidAlloc) return 0;
+    return (p->aValid[byteIdx] & (1 << bitIdx)) != 0;
+}
+
+static void validClearPage(sqliteObjsFile *p, int pageIdx) {
+    if (!p->aValid) return;
+    int byteIdx = pageIdx / 8;
+    int bitIdx = pageIdx % 8;
+    if (byteIdx < 0 || byteIdx >= p->nValidAlloc) return;
+    if (p->aValid[byteIdx] & (1 << bitIdx)) {
+        p->aValid[byteIdx] &= ~(1 << bitIdx);
+        p->nValidPages--;
+    }
+}
+
+static void validClearAll(sqliteObjsFile *p) {
+    if (p->aValid && p->nValidAlloc > 0) {
+        memset(p->aValid, 0, p->nValidAlloc);
+    }
+    p->nValidPages = 0;
+}
+
+static void validMarkAll(sqliteObjsFile *p) {
+    if (!p->aValid || p->nValidAlloc <= 0 || p->pageSize <= 0) return;
+    int nPages = (int)((p->nData + p->pageSize - 1) / p->pageSize);
+    int fullBytes = nPages / 8;
+    int remainBits = nPages % 8;
+    if (fullBytes > p->nValidAlloc) fullBytes = p->nValidAlloc;
+    if (fullBytes > 0) memset(p->aValid, 0xFF, fullBytes);
+    if (remainBits > 0 && fullBytes < p->nValidAlloc) {
+        p->aValid[fullBytes] = (unsigned char)((1 << remainBits) - 1);
+    }
+    p->nValidPages = nPages;
+}
+
+/*
+** Ensure the valid bitmap is large enough for the current file size.
+** Returns SQLITE_OK or SQLITE_NOMEM.
+*/
+static int validEnsureCapacity(sqliteObjsFile *p) {
+    int needed = dirtyBitmapSize(p->nData, p->pageSize);
+    if (needed <= 0) return SQLITE_OK;
+    if (needed <= p->nValidAlloc) return SQLITE_OK;
+    unsigned char *pNew = (unsigned char *)realloc(p->aValid, needed);
+    if (!pNew) return SQLITE_NOMEM;
+    memset(pNew + p->nValidAlloc, 0, needed - p->nValidAlloc);
+    p->aValid = pNew;
+    p->nValidAlloc = needed;
+    return SQLITE_OK;
+}
+
+/*
+** Mark a range of offsets [startOffset, endOffset) as valid.
+** Used for readahead and bulk prefetch operations.
+*/
+static void validMarkRange(sqliteObjsFile *p, sqlite3_int64 startOffset,
+                           sqlite3_int64 endOffset) {
+    if (!p->aValid || p->pageSize <= 0) return;
+    int startPage = (int)(startOffset / p->pageSize);
+    int endPage = (int)((endOffset + p->pageSize - 1) / p->pageSize);
+    for (int i = startPage; i < endPage; i++) {
+        int byteIdx = i / 8;
+        int bitIdx = i % 8;
+        if (byteIdx < 0 || byteIdx >= p->nValidAlloc) break;
+        if (!(p->aValid[byteIdx] & (1 << bitIdx))) {
+            p->aValid[byteIdx] |= (1 << bitIdx);
+            p->nValidPages++;
+        }
+    }
+}
+
+
+/* ===================================================================
 ** Helper: cache file management for MAIN_DB
 ** =================================================================== */
+
+/* Grow both dirty and valid bitmaps together (convenience wrapper) */
+static int bitmapsEnsureCapacity(sqliteObjsFile *p) {
+    int rc = dirtyEnsureCapacity(p);
+    if (rc != SQLITE_OK) return rc;
+    if (p->prefetchMode == SQLITE_OBJS_PREFETCH_NONE) {
+        rc = validEnsureCapacity(p);
+    }
+    return rc;
+}
 
 /*
 ** Ensure the cache file has room for at least newSize bytes.
@@ -351,7 +466,7 @@ static int cacheEnsureSize(sqliteObjsFile *p, sqlite3_int64 newSize) {
         return SQLITE_IOERR;
     }
     
-    return dirtyEnsureCapacity(p);
+    return bitmapsEnsureCapacity(p);
 }
 
 /* ===================================================================
@@ -503,8 +618,405 @@ static void unlinkSnapshotFile(const char *cachePath) {
     }
 }
 
+
+/* ===================================================================
+** Helper: .state sidecar file — valid bitmap persistence
+**
+** Format: "SQOS" (4) | version (4, LE) | page_size (4, LE) |
+**         file_size (8, LE) | bitmap_size (4, LE) | bitmap (N) |
+**         crc32 (4, LE)
+** =================================================================== */
+
+/*
+** Build the .state sidecar path: replace .cache with .state
+*/
+static char *buildStatePath(const char *cachePath) {
+    if (!cachePath) return NULL;
+    size_t len = strlen(cachePath);
+    const char *suffix = ".cache";
+    size_t suffixLen = 6;
+    if (len >= suffixLen && strcmp(cachePath + len - suffixLen, suffix) == 0) {
+        size_t baseLen = len - suffixLen;
+        char *path = (char *)malloc(baseLen + 7);  /* ".state\0" */
+        if (!path) return NULL;
+        memcpy(path, cachePath, baseLen);
+        memcpy(path + baseLen, ".state", 7);
+        return path;
+    }
+    char *path = (char *)malloc(len + 7);
+    if (!path) return NULL;
+    memcpy(path, cachePath, len);
+    memcpy(path + len, ".state", 7);
+    return path;
+}
+
+/* CRC32 (ISO 3309 / zlib polynomial) for .state file integrity */
+static uint32_t stateCrc32(const unsigned char *data, size_t len) {
+    static const uint32_t table[256] = {
+        0x00000000,0x77073096,0xEE0E612C,0x990951BA,0x076DC419,0x706AF48F,
+        0xE963A535,0x9E6495A3,0x0EDB8832,0x79DCB8A4,0xE0D5E91B,0x97D2D988,
+        0x09B64C2B,0x7EB17CBB,0xE7B82D09,0x90BF1D91,0x1DB71064,0x6AB020F2,
+        0xF3B97148,0x84BE41DE,0x1ADAD47D,0x6DDDE4EB,0xF4D4B551,0x83D385C7,
+        0x136C9856,0x646BA8C0,0xFD62F97A,0x8A65C9EC,0x14015C4F,0x63066CD9,
+        0xFA0F3D63,0x8D080DF5,0x3B6E20C8,0x4C69105E,0xD56041E4,0xA2677172,
+        0x3C03E4D1,0x4B04D447,0xD20D85FD,0xA50AB56B,0x35B5A8FA,0x42B2986C,
+        0xDBBDB8D6,0xACBCBEC8,0x32D86CE3,0x45DF5C75,0xDCD60DCF,0xABD13D59,
+        0x26D930AC,0x51DE003A,0xC8D75180,0xBFD06116,0x21B4F4B5,0x56B3C423,
+        0xCFBA9599,0xB8BDA50F,0x2802B89E,0x5F058808,0xC60CD9B2,0xB10BE924,
+        0x2F6F7C87,0x58684C11,0xC1611DAB,0xB6662D3D,0x76DC4190,0x01DB7106,
+        0x98D220BC,0xEFD5102A,0x71B18589,0x06B6B51F,0x9FBFE4A5,0xE8B8D433,
+        0x7807C9A2,0x0F00F934,0x9609A88E,0xE10E9818,0x7F6A0D69,0x086D3D2B,
+        0x91646C97,0xE6635C01,0x6B6B51F4,0x1C6C6162,0x856530D8,0xF262004E,
+        0x6C0695ED,0x1B01A57B,0x8208F4C1,0xF50FC457,0x65B0D9C6,0x12B7E950,
+        0x8BBEB8EA,0xFCB9887C,0x62DD1DDF,0x15DA2D49,0x8CD37CF3,0xFBD44C65,
+        0x4DB26158,0x3AB551CE,0xA3BC0074,0xD4BB30E2,0x4ADFA541,0x3DD895D7,
+        0xA4D1C46D,0xD3D6F4DB,0x4369E96A,0x346ED9FC,0xAD678846,0xDA60B8D0,
+        0x44042D73,0x33031DE5,0xAA0A4C5F,0xDD0D7822,0x3B6E20C8,0x4C69105E,
+        0xD56041E4,0xA2677172,0x3C03E4D1,0x4B04D447,0xD20D85FD,0xA50AB56B,
+        0x35B5A8FA,0x42B2986C,0xDBBDB8D6,0xACBCBEC8,0x32D86CE3,0x45DF5C75,
+        0xDCD60DCF,0xABD13D59,0x26D930AC,0x51DE003A,0xC8D75180,0xBFD06116,
+        0x21B4F4B5,0x56B3C423,0xCFBA9599,0xB8BDA50F,0x2802B89E,0x5F058808,
+        0xC60CD9B2,0xB10BE924,0x2F6F7C87,0x58684C11,0xC1611DAB,0xB6662D3D,
+        0x76DC4190,0x01DB7106,0x98D220BC,0xEFD5102A,0x71B18589,0x06B6B51F,
+        0x9FBFE4A5,0xE8B8D433,0x7807C9A2,0x0F00F934,0x9609A88E,0xE10E9818,
+        0x7F6A0D69,0x086D3D2B,0x91646C97,0xE6635C01,0x6B6B51F4,0x1C6C6162,
+        0x856530D8,0xF262004E,0x6C0695ED,0x1B01A57B,0x8208F4C1,0xF50FC457,
+        0x65B0D9C6,0x12B7E950,0x8BBEB8EA,0xFCB9887C,0x62DD1DDF,0x15DA2D49,
+        0x8CD37CF3,0xFBD44C65,0x4DB26158,0x3AB551CE,0xA3BC0074,0xD4BB30E2,
+        0x4ADFA541,0x3DD895D7,0xA4D1C46D,0xD3D6F4DB,0x4369E96A,0x346ED9FC,
+        0xAD678846,0xDA60B8D0,0x44042D73,0x33031DE5,0xAA0A4C5F,0xDD0D7822,
+        0x9B64C2B0,0xEC63F226,0x756AA39C,0x026D930A,0x9C0906A9,0xEB0E363F,
+        0x72076785,0x05005713,0x95BF4A82,0xE2B87A14,0x7BB12BAE,0x0CB61B38,
+        0x92D28E9B,0xE5D5BE0D,0x7CDCEFB7,0x0BDBDF21,0x86D3D2D4,0xF1D4E242,
+        0x68DDB3F6,0x1FDA836E,0x81BE16CD,0xF6B9265B,0x6FB077E1,0x18B74777,
+        0x88085AE6,0xFF0F6B70,0x66063BCA,0x11010B5C,0x8F659EFF,0xF862AE69,
+        0x616BFFD3,0x166CCF45,0xA00AE278,0xD70DD2EE,0x4E048354,0x3903B3C2,
+        0xA7672661,0xD06016F7,0x4969474D,0x3E6E77DB,0xAED16A4A,0xD9D65ADC,
+        0x40DF0B66,0x37D83BF0,0xA9BCAE53,0xDEBB9EC5,0x47B2CF7F,0x30B5FFE9,
+        0xBDBDF21C,0xCABAC28A,0x53B39330,0x24B4A3A6,0xBAD03605,0xCDD706FF,
+        0x54DE5729,0x23D967BF,0xB3667A2E,0xC4614AB8,0x5D681B02,0x2A6F2B94,
+        0xB40BBE37,0xC30C8EA1,0x5A05DF1B,0x2D02EF8D
+    };
+    uint32_t crc = 0xFFFFFFFF;
+    for (size_t i = 0; i < len; i++) {
+        crc = table[(crc ^ data[i]) & 0xFF] ^ (crc >> 8);
+    }
+    return crc ^ 0xFFFFFFFF;
+}
+
+/* Little-endian read/write helpers */
+static void writeLE32(unsigned char *p, uint32_t v) {
+    p[0] = (unsigned char)(v);
+    p[1] = (unsigned char)(v >> 8);
+    p[2] = (unsigned char)(v >> 16);
+    p[3] = (unsigned char)(v >> 24);
+}
+static uint32_t readLE32(const unsigned char *p) {
+    return (uint32_t)p[0] | ((uint32_t)p[1]<<8) |
+           ((uint32_t)p[2]<<16) | ((uint32_t)p[3]<<24);
+}
+static void writeLE64(unsigned char *p, uint64_t v) {
+    for (int i = 0; i < 8; i++) {
+        p[i] = (unsigned char)(v >> (i*8));
+    }
+}
+static uint64_t readLE64(const unsigned char *p) {
+    uint64_t v = 0;
+    for (int i = 0; i < 8; i++) {
+        v |= (uint64_t)p[i] << (i*8);
+    }
+    return v;
+}
+
+/*
+** Write .state sidecar file with valid bitmap.
+** Uses atomic rename: write to .state.tmp, fsync, rename to .state.
+** Returns 0 on success, -1 on failure.
+*/
+static int writeStateFile(const char *cachePath, int pageSize,
+                          sqlite3_int64 fileSize,
+                          const unsigned char *aValid, int nValidBytes) {
+    if (!cachePath || !aValid || nValidBytes <= 0) return -1;
+    char *statePath = buildStatePath(cachePath);
+    if (!statePath) return -1;
+
+    /* Build temp path for atomic rename */
+    size_t spLen = strlen(statePath);
+    char *tmpPath = (char *)malloc(spLen + 5);  /* ".tmp\0" */
+    if (!tmpPath) { free(statePath); return -1; }
+    memcpy(tmpPath, statePath, spLen);
+    memcpy(tmpPath + spLen, ".tmp", 5);
+
+    /* Header: magic(4) + version(4) + pageSize(4) + fileSize(8) + bitmapSize(4) = 24 */
+    size_t headerSize = 24;
+    size_t totalSize = headerSize + (size_t)nValidBytes + 4; /* +4 for CRC32 */
+
+    unsigned char *buf = (unsigned char *)malloc(totalSize);
+    if (!buf) { free(tmpPath); free(statePath); return -1; }
+
+    /* Write header */
+    memcpy(buf, SQLITE_OBJS_STATE_MAGIC, 4);
+    writeLE32(buf + 4, SQLITE_OBJS_STATE_VERSION);
+    writeLE32(buf + 8, (uint32_t)pageSize);
+    writeLE64(buf + 12, (uint64_t)fileSize);
+    writeLE32(buf + 20, (uint32_t)nValidBytes);
+
+    /* Write bitmap */
+    memcpy(buf + headerSize, aValid, (size_t)nValidBytes);
+
+    /* Write CRC32 over everything before the CRC field */
+    uint32_t crc = stateCrc32(buf, headerSize + (size_t)nValidBytes);
+    writeLE32(buf + headerSize + (size_t)nValidBytes, crc);
+
+    int fd = open(tmpPath, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    if (fd < 0) { free(buf); free(tmpPath); free(statePath); return -1; }
+
+    ssize_t nw = write(fd, buf, totalSize);
+    free(buf);
+    if (nw != (ssize_t)totalSize) {
+        close(fd);
+        unlink(tmpPath);
+        free(tmpPath);
+        free(statePath);
+        return -1;
+    }
+    if (fsync(fd) != 0) {
+        close(fd);
+        unlink(tmpPath);
+        free(tmpPath);
+        free(statePath);
+        return -1;
+    }
+    close(fd);
+
+    /* Atomic rename */
+    if (rename(tmpPath, statePath) != 0) {
+        unlink(tmpPath);
+        free(tmpPath);
+        free(statePath);
+        return -1;
+    }
+
+    free(tmpPath);
+    free(statePath);
+    return 0;
+}
+
+/*
+** Read .state sidecar file.
+** On success, allocates *aValidOut (caller must free) and fills *nValidOut,
+** *pageSizeOut, *fileSizeOut.
+** Returns 0 on success, -1 on failure (missing, corrupt, version mismatch).
+*/
+static int readStateFile(const char *cachePath, unsigned char **aValidOut,
+                         int *nValidOut, int *pageSizeOut,
+                         sqlite3_int64 *fileSizeOut) {
+    if (!cachePath) return -1;
+    char *statePath = buildStatePath(cachePath);
+    if (!statePath) return -1;
+
+    int fd = open(statePath, O_RDONLY);
+    free(statePath);
+    if (fd < 0) return -1;
+
+    /* Read header (24 bytes) */
+    unsigned char header[24];
+    ssize_t nr = read(fd, header, 24);
+    if (nr != 24) { close(fd); return -1; }
+
+    /* Validate magic */
+    if (memcmp(header, SQLITE_OBJS_STATE_MAGIC, 4) != 0) { close(fd); return -1; }
+
+    /* Validate version */
+    uint32_t version = readLE32(header + 4);
+    if (version != SQLITE_OBJS_STATE_VERSION) { close(fd); return -1; }
+
+    uint32_t ps = readLE32(header + 8);
+    uint64_t fs = readLE64(header + 12);
+    uint32_t bitmapSize = readLE32(header + 20);
+
+    /* Sanity checks */
+    if (ps < 512 || ps > 65536 || (ps & (ps-1)) != 0) { close(fd); return -1; }
+    if (bitmapSize == 0 || bitmapSize > (1024*1024)) { close(fd); return -1; }
+
+    /* Read bitmap + CRC */
+    unsigned char *payload = (unsigned char *)malloc(bitmapSize + 4);
+    if (!payload) { close(fd); return -1; }
+    nr = read(fd, payload, bitmapSize + 4);
+    close(fd);
+    if (nr != (ssize_t)(bitmapSize + 4)) { free(payload); return -1; }
+
+    /* Verify CRC32 */
+    uint32_t storedCrc = readLE32(payload + bitmapSize);
+    /* CRC is over header + bitmap */
+    unsigned char *crcBuf = (unsigned char *)malloc(24 + bitmapSize);
+    if (!crcBuf) { free(payload); return -1; }
+    memcpy(crcBuf, header, 24);
+    memcpy(crcBuf + 24, payload, bitmapSize);
+    uint32_t computedCrc = stateCrc32(crcBuf, 24 + bitmapSize);
+    free(crcBuf);
+
+    if (storedCrc != computedCrc) { free(payload); return -1; }
+
+    /* Success — extract bitmap */
+    unsigned char *bitmap = (unsigned char *)malloc(bitmapSize);
+    if (!bitmap) { free(payload); return -1; }
+    memcpy(bitmap, payload, bitmapSize);
+    free(payload);
+
+    *aValidOut = bitmap;
+    *nValidOut = (int)bitmapSize;
+    *pageSizeOut = (int)ps;
+    *fileSizeOut = (sqlite3_int64)fs;
+    return 0;
+}
+
+/*
+** Remove the .state sidecar file.
+*/
+static void unlinkStateFile(const char *cachePath) {
+    if (!cachePath) return;
+    char *statePath = buildStatePath(cachePath);
+    if (statePath) {
+        unlink(statePath);
+        free(statePath);
+    }
+}
+
 /* Forward declaration */
 static int detectPageSize(const unsigned char *aData, sqlite3_int64 nData);
+
+/*
+** Fetch a window of pages from Azure into the local cache file.
+** Starting at pageIdx, fetches up to SQLITE_OBJS_READAHEAD_PAGES pages
+** (the readahead window).  Writes data to cache file and marks pages valid.
+**
+** Returns SQLITE_OK on success, or SQLITE_IOERR_READ on failure.
+*/
+static int fetchPagesFromAzure(sqliteObjsFile *p, int pageIdx) {
+    if (!p->ops || !p->ops->page_blob_read) return SQLITE_IOERR_READ;
+    if (p->pageSize <= 0 || p->cacheFd < 0) return SQLITE_IOERR_READ;
+
+    int64_t startOffset = (int64_t)pageIdx * p->pageSize;
+    int64_t endOffset = startOffset + (int64_t)SQLITE_OBJS_READAHEAD_PAGES * p->pageSize;
+    if (endOffset > p->nData) endOffset = p->nData;
+    if (startOffset >= p->nData) return SQLITE_OK;  /* Past EOF — nothing to fetch */
+
+    size_t fetchLen = (size_t)(endOffset - startOffset);
+    if (fetchLen == 0) return SQLITE_OK;
+
+    double t0 = 0;
+    if (sqlite_objs_debug_timing()) t0 = sqlite_objs_time_ms();
+
+    azure_buffer_t rbuf;
+    azure_buffer_init(&rbuf);
+    azure_error_t aerr;
+    azure_error_init(&aerr);
+
+    azure_err_t arc = p->ops->page_blob_read(
+        p->ops_ctx, p->zBlobName,
+        startOffset, fetchLen, &rbuf, &aerr);
+
+    if (arc != AZURE_OK) {
+        azure_buffer_free(&rbuf);
+        return SQLITE_IOERR_READ;
+    }
+
+    if (!rbuf.data || rbuf.size == 0) {
+        azure_buffer_free(&rbuf);
+        return SQLITE_IOERR_READ;
+    }
+
+    /* Write to cache file */
+    size_t writeLen = rbuf.size < fetchLen ? rbuf.size : fetchLen;
+    ssize_t nw = pwrite(p->cacheFd, rbuf.data, writeLen, (off_t)startOffset);
+    azure_buffer_free(&rbuf);
+
+    if (nw < 0 || (size_t)nw != writeLen) {
+        return SQLITE_IOERR_WRITE;
+    }
+
+    /* Mark fetched pages valid */
+    validMarkRange(p, startOffset, startOffset + (sqlite3_int64)writeLen);
+
+    if (sqlite_objs_debug_timing()) {
+        double elapsed = sqlite_objs_time_ms() - t0;
+        fprintf(stderr, "[TIMING] fetchPagesFromAzure: %.1fms "
+                "(page=%d, %zu bytes, blob=%s)\n",
+                elapsed, pageIdx, writeLen, p->zBlobName);
+    }
+
+    return SQLITE_OK;
+}
+
+/*
+** Download all invalid pages in the valid bitmap.
+** Coalesces contiguous invalid ranges for efficiency.
+** Used by PRAGMA sqlite_objs_prefetch.
+**
+** Returns SQLITE_OK on success, or an error code on failure.
+*/
+static int prefetchInvalidPages(sqliteObjsFile *p) {
+    if (!p->aValid || p->pageSize <= 0 || p->nData <= 0) return SQLITE_OK;
+    if (!p->ops || !p->ops->page_blob_read) return SQLITE_IOERR;
+
+    int nPages = (int)((p->nData + p->pageSize - 1) / p->pageSize);
+    int fetchCount = 0;
+    int i = 0;
+
+    while (i < nPages) {
+        /* Skip valid pages */
+        if (validIsPageValid(p, i)) { i++; continue; }
+
+        /* Found an invalid page — start a contiguous range */
+        int rangeStart = i;
+        while (i < nPages && !validIsPageValid(p, i)) i++;
+        int rangeEnd = i;
+
+        /* Fetch this range */
+        int64_t startOffset = (int64_t)rangeStart * p->pageSize;
+        int64_t endOffset = (int64_t)rangeEnd * p->pageSize;
+        if (endOffset > p->nData) endOffset = p->nData;
+        size_t fetchLen = (size_t)(endOffset - startOffset);
+        if (fetchLen == 0) continue;
+
+        azure_buffer_t rbuf;
+        azure_buffer_init(&rbuf);
+        azure_error_t aerr;
+        azure_error_init(&aerr);
+
+        azure_err_t arc = p->ops->page_blob_read(
+            p->ops_ctx, p->zBlobName,
+            startOffset, fetchLen, &rbuf, &aerr);
+
+        if (arc != AZURE_OK) {
+            azure_buffer_free(&rbuf);
+            return SQLITE_IOERR_READ;
+        }
+        if (!rbuf.data || rbuf.size == 0) {
+            azure_buffer_free(&rbuf);
+            return SQLITE_IOERR_READ;
+        }
+
+        size_t writeLen = rbuf.size < fetchLen ? rbuf.size : fetchLen;
+        ssize_t nw = pwrite(p->cacheFd, rbuf.data, writeLen, (off_t)startOffset);
+        azure_buffer_free(&rbuf);
+
+        if (nw < 0 || (size_t)nw != writeLen) {
+            return SQLITE_IOERR_WRITE;
+        }
+
+        validMarkRange(p, startOffset, startOffset + (sqlite3_int64)writeLen);
+        fetchCount++;
+    }
+
+    if (sqlite_objs_debug_timing() && fetchCount > 0) {
+        fprintf(stderr, "[TIMING] prefetchInvalidPages: %d ranges fetched (blob=%s)\n",
+                fetchCount, p->zBlobName);
+    }
+
+    return SQLITE_OK;
+}
 
 /*
 ** Apply incremental diff from a previous snapshot to the local cache file.
@@ -569,6 +1081,10 @@ static int applyIncrementalDiff(sqliteObjsFile *p, int64_t blobSize, const char 
                                 (off_t)rangeStart);
             free(zeros);
             if (nw != (ssize_t)rangeLen) { diffOk = 0; break; }
+            /* Mark these pages valid (they contain the correct zeros) */
+            if (p->aValid) {
+                validMarkRange(p, rangeStart, rangeStart + rangeLen);
+            }
         } else {
             /* PageRange: download and patch */
             azure_buffer_t rbuf;
@@ -590,6 +1106,10 @@ static int applyIncrementalDiff(sqliteObjsFile *p, int64_t blobSize, const char 
                                 (off_t)rangeStart);
             azure_buffer_free(&rbuf);
             if (nw != (ssize_t)rangeLen) { diffOk = 0; break; }
+            /* Mark these pages valid (freshly downloaded) */
+            if (p->aValid) {
+                validMarkRange(p, rangeStart, rangeStart + rangeLen);
+            }
         }
     }
 
@@ -621,6 +1141,9 @@ static int applyIncrementalDiff(sqliteObjsFile *p, int64_t blobSize, const char 
     }
 
     dirtyEnsureCapacity(p);
+    if (p->prefetchMode == SQLITE_OBJS_PREFETCH_NONE) {
+        validEnsureCapacity(p);
+    }
     dirtyClearAll(p);
     p->lastSyncedSize = p->nData;
 
@@ -827,11 +1350,18 @@ static int sqliteObjsClose(sqlite3_file *pFile) {
 
     /* Close and conditionally delete cache file for MAIN_DB */
     if (p->cacheFd >= 0) {
+        fsync(p->cacheFd);  /* cache fsync before .state write */
         close(p->cacheFd);
         p->cacheFd = -1;
     }
     if (p->zCachePath) {
         if (p->cacheReuse && p->etag[0] != '\0' && !dirtyHasAny(p)) {
+            /* Write order: .state → .etag (per design decision) */
+            /* Persist valid bitmap for lazy cache reuse */
+            if (p->aValid && p->nValidAlloc > 0) {
+                writeStateFile(p->zCachePath, p->pageSize, p->nData,
+                               p->aValid, p->nValidAlloc);
+            }
             /* Cache is clean and we have a valid ETag — persist for reuse */
             writeEtagFile(p->zCachePath, p->etag);
             /* Persist snapshot for incremental diff on reconnect */
@@ -844,6 +1374,7 @@ static int sqliteObjsClose(sqlite3_file *pFile) {
             unlink(p->zCachePath);
             unlinkEtagFile(p->zCachePath);
             unlinkSnapshotFile(p->zCachePath);
+            unlinkStateFile(p->zCachePath);
         }
         free(p->zCachePath);
         p->zCachePath = NULL;
@@ -851,6 +1382,8 @@ static int sqliteObjsClose(sqlite3_file *pFile) {
     
     free(p->aDirty);
     p->aDirty = NULL;
+    free(p->aValid);
+    p->aValid = NULL;
     free(p->aJrnlData);
     p->aJrnlData = NULL;
     free(p->aWalData);
@@ -933,6 +1466,24 @@ static int sqliteObjsRead(sqlite3_file *pFile, void *pBuf, int iAmt,
         /* Reading entirely past end — zero fill */
         memset(pBuf, 0, iAmt);
         return SQLITE_IOERR_SHORT_READ;
+    }
+
+    /* Lazy cache: check validity bitmap and fetch on miss */
+    if (p->prefetchMode == SQLITE_OBJS_PREFETCH_NONE && p->aValid
+        && p->pageSize > 0) {
+        sqlite3_int64 readEnd = iOfst + iAmt;
+        if (readEnd > p->nData) readEnd = p->nData;
+        int startPage = (int)(iOfst / p->pageSize);
+        int endPage = (int)((readEnd + p->pageSize - 1) / p->pageSize);
+        for (int pg = startPage; pg < endPage; pg++) {
+            if (!validIsPageValid(p, pg)) {
+                int rc = fetchPagesFromAzure(p, pg);
+                if (rc != SQLITE_OK) {
+                    memset(pBuf, 0, iAmt);
+                    return rc;
+                }
+            }
+        }
     }
     
     sqlite3_int64 avail = p->nData - iOfst;
@@ -1028,11 +1579,12 @@ static int sqliteObjsWrite(sqlite3_file *pFile, const void *pBuf, int iAmt,
         if (rc != SQLITE_OK) return rc;
     }
 
-    /* Mark affected pages dirty */
+    /* Mark affected pages dirty + valid */
     if (p->pageSize > 0) {
         sqlite3_int64 pageStart = (iOfst / p->pageSize) * p->pageSize;
         while (pageStart < end) {
             dirtyMarkPage(p, pageStart);
+            if (p->aValid) validMarkPage(p, pageStart);
             pageStart += p->pageSize;
         }
     }
@@ -1100,6 +1652,14 @@ static int sqliteObjsTruncate(sqlite3_file *pFile, sqlite3_int64 size) {
     }
     
     if (size < p->nData) {
+        /* Clear valid bits for pages beyond new size */
+        if (p->aValid && p->pageSize > 0) {
+            int firstGone = (int)((size + p->pageSize - 1) / p->pageSize);
+            int nPages = (int)((p->nData + p->pageSize - 1) / p->pageSize);
+            for (int pg = firstGone; pg < nPages; pg++) {
+                validClearPage(p, pg);
+            }
+        }
         p->nData = size;
     }
     return SQLITE_OK;
@@ -1485,6 +2045,13 @@ sync_create_snapshot:
                     snap_rc, p->zBlobName);
         }
     }
+
+    /* Persist .state sidecar after successful upload (best-effort) */
+    if (p->cacheReuse && p->aValid && p->nValidAlloc > 0 && p->zCachePath) {
+        writeStateFile(p->zCachePath, p->pageSize, p->nData,
+                       p->aValid, p->nValidAlloc);
+    }
+
     return SQLITE_OK;
 }
 
@@ -1577,15 +2144,85 @@ static int revalidateAfterLease(sqliteObjsFile *p, const char *leaseEtag) {
         p->nData = 0;
         p->snapshot[0] = '\0';
         dirtyClearAll(p);
+        validClearAll(p);
         p->lastSyncedSize = 0;
         return SQLITE_OK;
     }
 
-    /* ---- Incremental diff path: use snapshot to download only changed pages ---- */
-    if (applyIncrementalDiff(p, blobSize, "revalidateAfterLease") == SQLITE_OK) {
-        return SQLITE_OK;
+    /* ---- Lazy mode: try to mark changed pages invalid instead of downloading ---- */
+    if (p->prefetchMode == SQLITE_OBJS_PREFETCH_NONE
+        && p->snapshot[0] != '\0'
+        && p->ops->blob_get_page_ranges_diff && p->ops->page_blob_read) {
+        azure_diff_range_t *diffRanges = NULL;
+        int diffCount = 0;
+        azure_error_t derr;
+        azure_error_init(&derr);
+        azure_err_t darc = p->ops->blob_get_page_ranges_diff(
+            p->ops_ctx, p->zBlobName, p->snapshot,
+            &diffRanges, &diffCount, &derr);
+        if (darc == AZURE_OK && diffCount >= 0) {
+            /* Calculate how many pages changed */
+            int nTotalPages = (int)((blobSize + p->pageSize - 1) / p->pageSize);
+            int nChangedPages = 0;
+            for (int i = 0; i < diffCount; i++) {
+                int64_t rangeLen = diffRanges[i].end - diffRanges[i].start + 1;
+                nChangedPages += (int)((rangeLen + p->pageSize - 1) / p->pageSize);
+            }
+
+            if (nTotalPages > 0 &&
+                (nChangedPages * 100 / nTotalPages) <= SQLITE_OBJS_DIFF_THRESHOLD_PCT) {
+                /* Small diff — mark changed pages invalid, don't download */
+                /* Resize cache if blob grew */
+                if (blobSize > p->nData) {
+                    ftruncate(p->cacheFd, (off_t)blobSize);
+                }
+                p->nData = blobSize;
+                validEnsureCapacity(p);
+                for (int i = 0; i < diffCount; i++) {
+                    int64_t rs = diffRanges[i].start;
+                    int64_t re = diffRanges[i].end + 1;
+                    int startPg = (int)(rs / p->pageSize);
+                    int endPg = (int)((re + p->pageSize - 1) / p->pageSize);
+                    for (int pg = startPg; pg < endPg; pg++) {
+                        validClearPage(p, pg);
+                    }
+                }
+                /* Truncate if blob shrank */
+                if (blobSize < p->nData) {
+                    ftruncate(p->cacheFd, (off_t)blobSize);
+                    p->nData = blobSize;
+                }
+                free(diffRanges);
+                p->snapshot[0] = '\0';
+                dirtyEnsureCapacity(p);
+                dirtyClearAll(p);
+                p->lastSyncedSize = p->nData;
+                if (sqlite_objs_debug_timing()) {
+                    double elapsed = sqlite_objs_time_ms() - t0;
+                    fprintf(stderr, "[TIMING] revalidateAfterLease(lazy): "
+                            "invalidated %d/%d pages in %.1fms (blob=%s)\n",
+                            nChangedPages, nTotalPages, elapsed, p->zBlobName);
+                }
+                return SQLITE_OK;
+            }
+            /* >50% changed — fall through to full download */
+        }
+        free(diffRanges);
+        p->snapshot[0] = '\0';
     }
-    p->snapshot[0] = '\0';  /* Clear stale snapshot */
+
+    /* ---- Incremental diff path (prefetch=all): download changed pages ---- */
+    if (p->prefetchMode == SQLITE_OBJS_PREFETCH_ALL) {
+        if (applyIncrementalDiff(p, blobSize, "revalidateAfterLease") == SQLITE_OK) {
+            /* All pages now valid after full diff apply */
+            if (p->aValid) {
+                validEnsureCapacity(p);
+                validMarkAll(p);
+            }
+            return SQLITE_OK;
+        }
+        p->snapshot[0] = '\0';
+    }
 
     /* ---- Full re-download path (original behavior) ---- */
     unsigned char *tempBuf = (unsigned char *)malloc(blobSize);
@@ -1662,6 +2299,12 @@ static int revalidateAfterLease(sqliteObjsFile *p, const char *leaseEtag) {
     dirtyEnsureCapacity(p);
     dirtyClearAll(p);
     p->lastSyncedSize = p->nData;
+
+    /* Full download = all pages valid */
+    if (p->aValid) {
+        validEnsureCapacity(p);
+        validMarkAll(p);
+    }
 
     if (sqlite_objs_debug_timing()) {
         double elapsed = sqlite_objs_time_ms() - t0;
@@ -1879,6 +2522,22 @@ static int sqliteObjsFileControl(sqlite3_file *pFile, int op, void *pArg) {
                 } else {
                     int val = p->pVfsData ? p->pVfsData->walChunkSize : 0;
                     aArg[0] = sqlite3_mprintf("%d", val);
+                }
+                return SQLITE_OK;
+            }
+            /* PRAGMA sqlite_objs_prefetch — download all invalid pages */
+            if (aArg[1] && sqlite3_stricmp(aArg[1],
+                    "sqlite_objs_prefetch") == 0) {
+                sqliteObjsFile *p = (sqliteObjsFile *)pFile;
+                if (p->prefetchMode == SQLITE_OBJS_PREFETCH_NONE && p->aValid) {
+                    int rc = prefetchInvalidPages(p);
+                    if (rc != SQLITE_OK) {
+                        aArg[0] = sqlite3_mprintf("error");
+                        return rc;
+                    }
+                    aArg[0] = sqlite3_mprintf("ok");
+                } else {
+                    aArg[0] = sqlite3_mprintf("noop");
                 }
                 return SQLITE_OK;
             }
@@ -2139,6 +2798,13 @@ static int sqliteObjsOpen(sqlite3_vfs *pVfs, sqlite3_filename zName,
     const char *cacheDir = sqlite3_uri_parameter(zName, "cache_dir");
     int cacheReuse = sqlite3_uri_boolean(zName, "cache_reuse", 0);
 
+    /* Parse prefetch mode: "all" (default) or "none" (lazy cache) */
+    const char *prefetchParam = sqlite3_uri_parameter(zName, "prefetch");
+    p->prefetchMode = SQLITE_OBJS_PREFETCH_ALL;  /* default */
+    if (prefetchParam && sqlite3_stricmp(prefetchParam, "none") == 0) {
+        p->prefetchMode = SQLITE_OBJS_PREFETCH_NONE;
+    }
+
     if (isMainDb) {
         /* MAIN_DB → Azure page blob */
         int blobExists = 0;
@@ -2207,6 +2873,33 @@ static int sqliteObjsOpen(sqlite3_vfs *pVfs, sqlite3_filename zName,
                                 /* Load stored snapshot for incremental diff */
                                 readSnapshotFile(cachePath, p->snapshot,
                                                  sizeof(p->snapshot));
+                                /* Load valid bitmap from .state sidecar (lazy mode) */
+                                if (p->prefetchMode == SQLITE_OBJS_PREFETCH_NONE) {
+                                    unsigned char *savedValid = NULL;
+                                    int savedValidSize = 0;
+                                    int savedPageSize = 0;
+                                    sqlite3_int64 savedFileSize = 0;
+                                    if (readStateFile(cachePath, &savedValid,
+                                                      &savedValidSize, &savedPageSize,
+                                                      &savedFileSize) == 0
+                                        && savedPageSize == p->pageSize
+                                        && savedFileSize == p->nData) {
+                                        p->aValid = savedValid;
+                                        p->nValidAlloc = savedValidSize;
+                                        /* Recount valid pages */
+                                        p->nValidPages = 0;
+                                        int nPg = (int)((p->nData + p->pageSize - 1) / p->pageSize);
+                                        for (int vi = 0; vi < nPg; vi++) {
+                                            if (validIsPageValid(p, vi)) p->nValidPages++;
+                                        }
+                                    } else {
+                                        free(savedValid);
+                                        /* No valid .state — treat all as invalid,
+                                        ** but page 1 was cached so mark it valid */
+                                        validEnsureCapacity(p);
+                                        validClearAll(p);
+                                    }
+                                }
                                 free(etagPath);
                                 goto cache_ready;
                             }
@@ -2282,7 +2975,73 @@ static int sqliteObjsOpen(sqlite3_vfs *pVfs, sqlite3_filename zName,
 
             cache_download:
             p->nDownloads++;
-            if (blobSize > 0) {
+            if (blobSize > 0 && p->prefetchMode == SQLITE_OBJS_PREFETCH_NONE) {
+                /* Lazy cache: create sparse cache, fetch page 1 only */
+                if (ftruncate(p->cacheFd, (off_t)blobSize) != 0) {
+                    close(p->cacheFd);
+                    if (p->zCachePath) { unlink(p->zCachePath); free(p->zCachePath); }
+                    p->cacheFd = -1;
+                    p->zCachePath = NULL;
+                    sqlite3_free(p->zBlobName);
+                    p->zBlobName = NULL;
+                    return SQLITE_IOERR;
+                }
+                p->nData = blobSize;
+
+                /* Bootstrap: fetch first 65536 bytes (covers any legal page size) */
+                size_t bootstrapLen = SQLITE_OBJS_PAGE1_BOOTSTRAP;
+                if ((int64_t)bootstrapLen > blobSize) bootstrapLen = (size_t)blobSize;
+
+                azure_buffer_t bbuf;
+                azure_buffer_init(&bbuf);
+                azure_error_t berr;
+                azure_error_init(&berr);
+                arc = p->ops->page_blob_read(
+                    p->ops_ctx, zName, 0, bootstrapLen, &bbuf, &berr);
+                if (arc != AZURE_OK || !bbuf.data || bbuf.size == 0) {
+                    azure_buffer_free(&bbuf);
+                    close(p->cacheFd);
+                    if (p->zCachePath) { unlink(p->zCachePath); free(p->zCachePath); }
+                    p->cacheFd = -1;
+                    p->zCachePath = NULL;
+                    sqlite3_free(p->zBlobName);
+                    p->zBlobName = NULL;
+                    return azureErrToSqlite(arc, SQLITE_CANTOPEN);
+                }
+
+                size_t writeLen = bbuf.size < bootstrapLen ? bbuf.size : bootstrapLen;
+                ssize_t nw = pwrite(p->cacheFd, bbuf.data, writeLen, 0);
+                azure_buffer_free(&bbuf);
+                if (nw < 0 || (size_t)nw != writeLen) {
+                    close(p->cacheFd);
+                    if (p->zCachePath) { unlink(p->zCachePath); free(p->zCachePath); }
+                    p->cacheFd = -1;
+                    p->zCachePath = NULL;
+                    sqlite3_free(p->zBlobName);
+                    p->zBlobName = NULL;
+                    return SQLITE_IOERR;
+                }
+
+                /* Detect page size from bootstrap data */
+                {
+                    unsigned char header[100];
+                    ssize_t nRead = pread(p->cacheFd, header, sizeof(header), 0);
+                    if (nRead == (ssize_t)sizeof(header)) {
+                        int detected = detectPageSize(header, sizeof(header));
+                        if (detected > 0) p->pageSize = detected;
+                    }
+                }
+
+                /* Initialize bitmaps */
+                dirtyEnsureCapacity(p);
+                validEnsureCapacity(p);
+                validClearAll(p);
+                /* Mark bootstrapped pages valid */
+                validMarkRange(p, 0, (sqlite3_int64)writeLen);
+
+                p->lastSyncedSize = p->nData;
+
+            } else if (blobSize > 0) {
                 /* Download to temporary buffer, then write to cache file */
                 unsigned char *tempBuf = (unsigned char *)malloc(blobSize);
                 if (!tempBuf) {
@@ -2386,6 +3145,12 @@ static int sqliteObjsOpen(sqlite3_vfs *pVfs, sqlite3_filename zName,
 
                 /* Re-ensure dirty bitmap with correct page size */
                 dirtyEnsureCapacity(p);
+
+                /* Full download — all pages are valid */
+                if (p->prefetchMode == SQLITE_OBJS_PREFETCH_NONE) {
+                    validEnsureCapacity(p);
+                    validMarkAll(p);
+                }
 
                 /* R2: Record initial Azure blob size to skip redundant resizes */
                 p->lastSyncedSize = p->nData;
