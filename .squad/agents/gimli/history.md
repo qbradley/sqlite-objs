@@ -353,4 +353,70 @@ done
 - PRAGMA wal_checkpoint returns (i32, i32, i32) tuple — (busy, log pages, checkpointed pages)
 - Each nextest test runs in its own process — full test isolation, safe for parallel execution
 
+### Concurrent Client Contention Test (2025-07)
+
+**Added:** `concurrent_client_contention` test in `rust/sqlite-objs/tests/vfs_integration.rs` —
+20 threads each open independent connections (own cache directory) to the same Azure blob and
+atomically increment a shared counter.  Tests real distributed lease contention.
+
+**Key Architecture Decisions:**
+- Per-thread `TempDir` cache directories: each connection independently downloads the blob from
+  Azure, ensuring the blob lease (not local file locking) is the sole coordinator.
+- `busy_timeout=0`: forces `SQLITE_BUSY` to surface immediately to Rust code instead of being
+  absorbed by SQLite's built-in busy handler.  This is critical — with `busy_timeout=30000`,
+  SQLite retries the lock internally and the thread eventually succeeds but reads from a stale
+  local copy (downloaded at `xOpen`, before the lease was acquired at `xLock(RESERVED)`).
+- `Barrier` synchronisation: all 20 threads hit `BEGIN IMMEDIATE` simultaneously on their first
+  attempt, maximising the probability of genuine lease contention (HTTP 409 → `SQLITE_BUSY`).
+- Fresh connection per retry attempt: on `SQLITE_BUSY`, the thread drops its stale connection
+  and opens a new one (which re-downloads the latest blob), preventing stale-read increments.
+- LCG-based pseudo-random backoff with exponential base + jitter (no `rand` dependency).
+
+**VFS Concurrency Finding — Stale-Read Race Condition:**
+The VFS downloads the blob at `xOpen` (no lease) and acquires the Azure blob lease at
+`xLock(RESERVED)` during `BEGIN IMMEDIATE`.  When multiple threads retry simultaneously, they
+all download the same blob state in parallel (e.g., `counter=1`).  Each then serializes through
+the lease, but reads from its individually-downloaded-but-identical local copy.  Result: all N
+threads write `counter=2`, and the last uploader wins.
+
+**Observed behaviour:** counter reaches 2–3 instead of 20 (N).  The lost-update count equals
+N minus the number of distinct "rounds" where at least one thread downloaded a unique state.
+
+**Root cause:** no re-download or ETag validation between `xOpen` (download) and `xLock`
+(lease acquisition).  Three potential VFS fixes:
+1. Re-download blob after acquiring lease (if ETag changed since open)
+2. Use `If-Match` ETag header on page uploads (optimistic concurrency on write)
+3. Acquire lease at `xOpen` instead of `xLock` (pessimistic from the start)
+
+**Test status:** Compiles, clippy-clean, `#[ignore]`.  Assertion `counter == N` correctly tests
+for the desired behaviour.  Currently fails due to the VFS stale-read race condition described
+above.  When the VFS is fixed, this test will pass.
+
+**Files:** `rust/sqlite-objs/tests/vfs_integration.rs` (Category 10: Concurrent Client Contention)
+
+### Reconnect Benchmark Example (2025-07-22)
+
+**What:** Created `rust/sqlite-objs/examples/reconnect_bench.rs` — a standalone benchmark measuring
+Azure blob reconnect performance with two clients (A and B), individual cache directories, and
+`cache_reuse=true`.
+
+**Pattern:** Two-client benchmark flow:
+1. Client A populates ~100MB (10K rows × 10KB BLOBs) in a single transaction
+2. Client B connects cold (full download), does a small write
+3. Client A reconnects with stale cache (ETag changed → re-download)
+4. Correctness verified: A reads B's write
+
+**Key decisions:**
+- `PRAGMA journal_mode=DELETE` (not WAL) per task spec — simpler for benchmarks
+- Used `dev-dependencies` (rusqlite, tempfile, uuid, dotenvy) which are available to examples
+- UUID-based blob names eliminate need for pre-run blob deletion
+- Marker row (id=99999, data=DEADBEEF) as correctness canary
+
+**Observed timings (dev build, macOS):**
+- Populate 100MB: ~7s
+- Cold download: ~4s
+- Small write: ~0.2s
+- Stale reconnect: ~4.6s (full re-download since ETag changed)
+
+**Files:** `rust/sqlite-objs/examples/reconnect_bench.rs`
 

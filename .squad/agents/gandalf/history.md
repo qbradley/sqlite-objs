@@ -114,3 +114,28 @@ Completed comprehensive design review (D1-D11). Verdict: **APPROVE WITH CONDITIO
 - **Implementation estimate:** 4.5 days across 4 phases. Phase 1 (foundation) → Phase 2 (correctness) → Phase 3 (robustness) → Phase 4 (completeness).
 - **5 open questions for Brady:** Thread count for CI, FCNTL wrapper placement (test-only vs crate API), WAL vs journal default, real Azure cadence, Toxiproxy deferral.
 - **Status:** PROPOSED — awaiting Brady's review before implementation.
+
+### Lazy Cache Filling Design Review (2025-07-19)
+
+- **Produced comprehensive design review:** `.squad/decisions/inbox/gandalf-lazy-cache-analysis.md` (D-LAZY). Analyzed Quetzal's proposal for demand-paged Azure blob reads with validity bitmap persistence.
+- **Core verdict: Architecturally sound, but has critical gaps.** Three additions required before implementation: (1) mandatory page-1 bootstrap at xOpen, (2) readahead-on-fault for xRead misses, (3) bitmap persistence atomicity contract.
+- **Key finding: No validity bitmap exists today.** Only `aDirty` bitmap (`sqlite_objs_vfs.c:130-132`). Proposal requires adding parallel `aValid` bitmap with same infrastructure. 4 states per page: (!valid,!dirty), (valid,!dirty), (valid,dirty), and ILLEGAL (!valid,dirty).
+- **Key finding: Read coalescing is mandatory, not optional.** Without it, cold-cache table scans are 100-1000× slower than current model. Fixed 16-page readahead window reduces HTTP requests by 16× with minimal complexity. Adaptive readahead (already designed in `research/adaptive-readahead-design.md`) is the full solution.
+- **Key finding: Journal read-before-write penalty.** SQLite reads page N before writing (for rollback journal). On cold cache, every write triggers an Azure read. Acceptable for "do a little" scenario, unacceptable for bulk writes without prefetch.
+- **Key architecture decisions proposed:** (1) `prefetch=all` default (no regression), lazy is opt-in via `prefetch=none`. (2) Bitmap sidecar with CRC32 checksum, written BEFORE ETag sidecar. (3) Large-diff threshold in revalidateAfterLease (>50% → full download). (4) No "prefetch table X" — too complex for marginal benefit.
+- **Recommended 4-phase implementation:** Phase 1 minimal lazy (~2 days), Phase 2 readahead (~2 days), Phase 3 prefetch pragma (~1 day), Phase 4 reconnect optimization (~1 day).
+- **80/20 version identified:** ~200 lines of new code for minimal lazy cache covering Quetzal's target scenario. Full adaptive readahead adds complexity but covers all workloads.
+- **3 open questions for Quetzal:** Default behavior (lazy opt-in vs opt-out), readahead scope (fixed vs adaptive), cache file sharing between processes.
+- **Key files analyzed:** `src/sqlite_objs_vfs.c` (ObjsFile struct at :116, dirty bitmap at :265-329, xRead at :877-964, xWrite at :971-1041, xSync at :1182-1523, revalidateAfterLease at :1524-1665, xOpen at :2071-2470, xClose at :785-869, ETag sidecars at :357-495, applyIncrementalDiff at :521-635).
+- **User preference confirmed:** Quetzal values simplicity and flexibility over completeness. "Keep the code simple, make it more flexible for different scenarios while remaining correct."
+
+### Lazy Cache Filling Design Review (2026-03-21)
+
+- **Produced comprehensive architectural analysis:** `.squad/decisions/inbox/gandalf-lazy-cache-analysis.md` (merged to D23 in decisions.md).
+- **Verdict:** Proposal is architecturally sound but requires three critical additions: (1) Page-1 bootstrap, (2) Readahead-on-fault, (3) Bitmap persistence atomicity.
+- **Key insight:** The sweet-spot scenario (open 100MB database, do a few lookups, close) achieves **20× faster open time**, but table scans become catastrophic without prefetch (~2500× slower for full table scans).
+- **Regression guarantee:** Lazy cache is opt-in via `prefetch=none` URI parameter. Default `prefetch=all` preserves current behavior.
+- **Implementation roadmap:** 4 phases across 4-6 days. Phase 1 (minimal lazy + page-1) deferred to Phase 2+.
+- **Pending input:** 3 questions identified for Quetzal regarding scope constraints (interactive reads vs scans vs VACUUM), readahead strategy (fixed vs adaptive), and process-local cache sharing.
+- **Context:** Synthesis of 4+ months prior analysis. Coordinated with Aragorn's code-level review.
+

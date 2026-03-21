@@ -370,3 +370,34 @@ In C code, never ignore return codes. Applies to both product and test code. Err
 - All meaningful changes require team consensus
 - Document architectural decisions here
 - Keep history focused on work, decisions focused on direction
+
+### D23: Lazy Cache Filling — Analysis and Requirements
+**Date:** 2026-03-21 | **From:** Gandalf (Lead/Architect), Aragorn (SQLite/C Dev)
+
+**Status:** ANALYSIS — Not yet a decision (awaiting scope clarification from Quetzal).
+
+Quetzal's lazy cache proposal (download-on-demand pages with validity bitmap persistence) is **architecturally sound** but requires three critical additions before implementation:
+
+1. **Page-1 Bootstrap:** Cannot size validity bitmap without page size. At xOpen, if no cached page 1 exists, fetch first 4-64 KB to detect page size. One-time HTTP round-trip (~100ms), then proceed with on-demand reads.
+
+2. **Readahead-on-Fault:** Cold-cache sequential reads are 100-1000× slower without batching. Fixed 16-page readahead window reduces HTTP requests by 16× with minimal complexity. Full adaptive readahead (already designed in `research/adaptive-readahead-design.md`) covers all workloads.
+
+3. **Bitmap Persistence Atomicity:** Specification required for when `aValid` bitmap is written relative to blob pages, lease renewal interaction, and recovery after crash during sync.
+
+**Key Findings:**
+- Journal read-before-write penalty on cold cache: every write triggers an Azure read for rollback safety.
+- B-tree schema traversal on first open: 5-50 sequential requests before first query (currently 1 bulk download).
+- Sweet-spot scenario (open 100MB, do a few lookups, close): **20× faster** with lazy cache. Table scans: **catastrophic** without prefetch.
+- Regression-free guarantee achievable: Make lazy cache opt-in via `prefetch=none` URI parameter, default remains `prefetch=all`.
+
+**Recommended Implementation:** 4 phases (2 days each) — (1) minimal lazy + page-1 bootstrap, (2) readahead on-fault, (3) prefetch pragma, (4) reconnect optimization. MVP 1 defers to Phase 2+.
+
+**Pending User Input:**
+- Q1: Which workloads are in scope? (small reads/writes vs table scans vs VACUUM)
+- Q2: Readahead scope: fixed window vs adaptive?
+- Q3: Cache file sharing between processes?
+
+**Files Modified (Implementation):** `src/sqlite_objs_vfs.c` (~400-500 lines new code + ~200 lines refactoring). Estimated 4-6 days.
+
+---
+

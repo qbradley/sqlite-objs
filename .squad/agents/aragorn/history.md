@@ -604,3 +604,110 @@ Implemented parallel WAL sync using Azure Block Blob staged upload (Put Block + 
 **Critical discovery:** The Rust test suite (`rust/sqlite-objs/`) compiles C sources from `rust/sqlite-objs-sys/csrc/`, NOT from `src/`. Changes must be applied to BOTH locations. There is no automated sync mechanism. The `cc` crate in `rust/sqlite-objs-sys/build.rs` compiles the csrc files independently of the Makefile.
 
 **Test validated:** `concurrent_client_contention` (20 threads, Azurite) — counter=20 with zero lost updates.
+
+### Incremental Page-Range Download (2026-07-25)
+
+**Problem:** When Client B modifies a few pages of a 100MB blob and Client A reconnects, `revalidateAfterLease()` re-downloaded the ENTIRE 100MB blob — even though only a handful of pages changed.
+
+**Solution: Snapshot-based incremental diff.** Three new moving parts:
+
+1. **Snapshot creation after xSync:** After uploading dirty pages, call `PUT ?comp=snapshot` to create an Azure blob snapshot. Store the snapshot datetime in a `.snapshot` sidecar file alongside `.etag` and `.cache`. This is best-effort — failure doesn't fail the sync.
+
+2. **Incremental revalidation:** When ETag mismatches in `revalidateAfterLease()` and we have a stored snapshot, call `GET ?comp=pagelist&prevsnapshot={snap}` to get only changed/cleared 512-byte-aligned ranges. For `PageRange`: download bytes with range GET, `pwrite()` to cache. For `ClearRange`: write zeros. Falls back to full re-download on any failure.
+
+3. **Cache metadata lifecycle:** Three sidecar files per cached blob: `.cache` (data), `.etag` (ETag), `.snapshot` (snapshot datetime). All three written on xClose, loaded on xOpen with `cache_reuse=1`.
+
+**Key files:**
+- `src/azure_client.h`: `azure_diff_range_t` struct, `blob_snapshot_create` and `blob_get_page_ranges_diff` ops
+- `src/azure_client.c`: `az_blob_snapshot_create()`, `az_blob_get_page_ranges_diff()`, `parse_page_ranges_xml()`
+- `src/azure_client_impl.h`: `snapshot[128]` field in `azure_response_headers_t`
+- `src/sqlite_objs_vfs.c`: `buildSnapshotPath/readSnapshotFile/writeSnapshotFile/unlinkSnapshotFile` helpers, modified `revalidateAfterLease()`, modified `sqliteObjsSync()`, modified `sqliteObjsClose()`
+
+**Patterns used:**
+- `execute_with_retry()` for all Azure HTTP calls — same retry/backoff as existing ops
+- `azure_response_headers_t` captures `x-ms-snapshot` header via `curl_header_cb`
+- Snapshot datetime is URL-encoded via `uri_encode()` when used in query strings
+- XML parsing is hand-rolled (no libxml dependency) — scans for `<PageRange>`, `<ClearRange>`, `<Start>`, `<End>` tags
+- Goto-based common path in xSync: both batch and sequential write paths converge on `sync_create_snapshot:` label
+
+**Design decisions:**
+- Snapshot creation is best-effort: if it fails, xSync still returns SQLITE_OK, and next reconnect uses full download
+- Incremental diff failure (snapshot GC'd, parse error, network) gracefully falls back to full download — no data corruption possible
+- Stale snapshot field cleared on fallback to prevent retrying a bad snapshot
+- Empty blob (blobSize <= 0) clears snapshot and skips diff path entirely
+
+### Lazy Cache Filling Architecture Analysis (2026-XX-XX)
+
+**Objective:** Comprehensive code-level analysis of implementing lazy cache filling — eliminating the full blob download at xOpen and instead downloading pages on-demand during xRead.
+
+**Scope:** Analyzed all VFS methods and helper functions that interact with the cache file and blob download mechanisms. Identified specific line numbers, data structures, and integration points needed for the lazy cache design.
+
+**Key architectural findings:**
+
+1. **xOpen currently downloads entire blob** (lines 2283-2392 via `cache_download:` label) using `page_blob_read_multi()` or fallback `page_blob_read()`. With lazy cache, this entire code block would be **deleted** and replaced with metadata-only fetch plus optional page 0 eager download for header detection.
+
+2. **Valid bitmap is the missing piece.** The VFS already has a dirty bitmap (`aDirty`, lines 130-132) with full allocation/management helpers (lines 268-329). Lazy cache needs a parallel **valid bitmap** (`aValid`) to track which pages are present in the local cache file. This requires ~40 new lines for struct fields + ~100 lines for bitmap helpers (mirror of dirty bitmap functions).
+
+3. **State file persistence is critical.** Unlike the dirty bitmap (ephemeral, cleared at xOpen/xSync), the valid bitmap must persist across sessions. Proposed `.state` sidecar file (binary format, ~24 byte header + N-byte valid bitmap) stored alongside `.etag` and `.snapshot`. Requires atomic write via temp+rename for crash safety.
+
+4. **xRead becomes the download hotspot.** Currently a simple `pread(p->cacheFd, ...)` at line 942. With lazy cache, needs valid bitmap check before pread — if page not valid, call new `fetchPageFromAzure()` helper (~50 lines) to download single page (or batch of adjacent invalid pages) via `page_blob_read()`, write to cache, mark valid.
+
+5. **Page size detection timing shift.** Current code calls `detectPageSize()` after full download (line 2382). Lazy cache has three options:
+   - **Eager page 0** (recommended): Always download first 4KB at xOpen to detect page size — only ~5ms latency, simplifies bitmap allocation
+   - **Fully lazy:** Defer detection until first xRead of offset 0 — complex edge cases
+   - **Default assumption:** Use 4096 until header read — breaks for non-4K databases
+
+6. **applyIncrementalDiff() mostly compatible.** The existing snapshot-based diff (lines 521-635) already downloads changed page ranges and writes to cache. Only addition: mark downloaded pages **valid** after pwrite. Unchanged pages keep existing valid bits (no re-download).
+
+7. **revalidateAfterLease() benefits from lazy design.** Currently re-downloads entire blob on ETag mismatch (lines 1590-1671). With lazy cache + incremental diff, could instead **mark changed pages invalid** (discovered via `blob_get_page_ranges_diff()`) and skip full re-download. Next xRead would lazy-fetch those pages. Alternative: keep full re-download as fallback for simplicity.
+
+8. **xWrite marks pages valid.** Writing a page to cache (line 1019 pwrite) means that page is now valid — add `validMarkPage(p, pageStart)` after `dirtyMarkPage()` (line 1037). No Azure download needed for written pages.
+
+9. **xTruncate invalidates pages beyond new EOF.** When file is truncated (line 1046), pages beyond the new size must have valid bits cleared — they no longer represent correct blob state.
+
+10. **Prefetch operation enables warm-up.** New `PRAGMA sqlite_objs_prefetch=1` would iterate valid bitmap, find invalid pages, download them in batches via `page_blob_read()`. Allows user to explicitly "warm" cache after lazy open, trading latency spike at open-time for background download under user control.
+
+**Data structure impact:**
+- sqliteObjsFile struct: +3 fields (aValid, nValidPages, nValidAlloc) — 24 bytes overhead
+- Per-database bitmap overhead: 1 bit per page = ~32 KB for 1 GB database (128K pages × 4KB/page)
+- Sidecar file overhead: `.state` file = 24 byte header + bitmap size (same ~32 KB)
+
+**Performance implications:**
+- **xOpen latency:** Drops from ~200ms (full 10MB download) to ~10ms (metadata + page 0 only) — **20x improvement**
+- **First query latency:** May increase if query touches many uncached pages — each page triggers on-demand fetch (~5ms per page)
+- **Cache warm time:** With prefetch, same as current full download (user-controlled timing)
+- **Incremental reconnect:** No change (already uses diff-based revalidation)
+
+**Integration complexity:**
+- **New code:** ~500 lines (valid bitmap helpers, state file I/O, lazy fetch, prefetch)
+- **Modified code:** xOpen, xRead, xWrite, xSync, xTruncate, xClose, applyIncrementalDiff, revalidateAfterLease
+- **Deleted code:** ~110 lines (full download in xOpen)
+- **Net:** +400 lines
+
+**Risks identified:**
+- **High:** xRead performance regression on first access (mitigated by prefetch), bitmap persistence bugs (mitigated by atomic rename)
+- **Medium:** Page size detection edge cases (mitigated by eager page 0 fetch), ETag/state desync (mitigated by deleting all sidecars together)
+- **Low:** Prefetch complexity, incremental diff interaction
+
+**Testing requirements:** 14 unit tests (bitmap ops, state I/O, lazy fetch, truncate), 6 integration tests (open without download, lazy fetch, write-read, revalidate, prefetch), 4 performance benchmarks (cold open, first query, prefetch, diff efficiency).
+
+**Deliverable:** Documented as `.squad/decisions/inbox/aragorn-lazy-cache-code-analysis.md` — comprehensive implementation roadmap with line numbers, function signatures, and specific code changes needed.
+
+### Lazy Cache Code Analysis (2026-03-21)
+
+- **Completed code-level VFS analysis:** `.squad/decisions/inbox/aragorn-lazy-cache-code-analysis.md` (merged to D23).
+- **Major finding:** Current architecture already has 80% of scaffolding needed (disk-backed cache, dirty bitmap, ETag sidecars, incremental diff support). Lazy cache is primarily a resequencing (defer xOpen download) rather than new machinery.
+- **Scope:** ~400-500 lines of new code + ~200 lines of refactoring in `src/sqlite_objs_vfs.c`.
+- **Critical modifications mapped:**
+  - **xOpen** (2071-2570): Skip full blob download, load valid bitmap from sidecar, page-1 bootstrap for size detection.
+  - **xRead** (877-964): Add lazy-fetch logic, readahead window on cache miss.
+  - **xWrite** (971-1041): Mark page as valid+dirty simultaneously.
+  - **xSync** (1182-1523): Atomicity guarantee — sync bitmap BEFORE blob writes.
+  - **Sidecar persistence:** New `.state` file with bitmap, ETag, CRC32 checksum.
+- **Hotspots identified:**
+  - `dirtyBitmapSize()` (269) must accommodate parallel `aValid` bitmap.
+  - Incremental diff logic (521-635) gains importance for reconnect scenarios.
+  - Lease renewal (`revalidateAfterLease`, 1524-1665) must validate against bitmap.
+- **Implementation estimate:** 4 days (2 for xOpen/xRead/xWrite/xSync, 1 for sidecar, 1 for tests).
+- **Vtable contract:** No changes required; all modifications internal to sqlite_objs_vfs.c.
+
