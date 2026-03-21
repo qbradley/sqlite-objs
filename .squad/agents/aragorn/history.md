@@ -47,3 +47,36 @@ CanonicalizedResource
 **Result**: Authentication signatures now match correctly. Azure Client integration tests (8) all pass. VFS integration tests went from 0/32 passing to 23/41 passing.
 
 **Key Principle**: The `extra_x_ms` array is ONLY for `x-ms-*` headers. Standard HTTP headers must be handled through explicit parameters to ensure they're placed correctly in the signing string.
+
+### Azure Lease + If-Match Conflict with Azurite (2025-01-09)
+
+**Problem**: 13 integration tests were failing after fixing the If-Match auth bug. 11 tests failed with "database is locked" (SQLITE_BUSY) during COMMIT, and 1 WAL test had a stale ETag sidecar after checkpoint.
+
+**SQLITE_BUSY Root Cause**: The VFS was sending BOTH `x-ms-lease-id` AND `If-Match` headers in the same write request. When xSync called `page_blob_write_batch()`, Azurite rejected the request with HTTP 412 Precondition Failed (AZURE_ERR_PRECONDITION), which the VFS translated to SQLITE_BUSY. This happened because:
+1. When we hold a lease, we already have exclusive write access
+2. Sending If-Match with the lease is redundant and causes Azurite to reject the request
+3. The precondition failure made SQLite think the database was locked by another process
+
+**The Fix Pattern**:
+- **Never send If-Match when you hold a lease** — the lease provides exclusive access
+- Only use If-Match for optimistic concurrency when you DON'T have a lease
+- In `xSync`, check `hasLease(p)` before passing `p->etag` to write functions:
+  ```c
+  /* Don't send If-Match when we hold a lease */
+  (hasLease(p) || !p->etag[0]) ? NULL : p->etag
+  ```
+
+**ETag Sidecar Staleness**: After a WAL checkpoint + batch write, the ETag sidecar wasn't being updated until xClose. The fix was to call `writeEtagFile()` immediately after a successful batch write in xSync:
+```c
+if (aerr.etag[0] != '\0') {
+    memcpy(p->etag, aerr.etag, sizeof(p->etag));
+    if (p->cacheReuse && p->zCachePath) {
+        writeEtagFile(p->zCachePath, p->etag);  // Persist immediately
+    }
+}
+```
+
+**Busy Timeout Addition**: Added `sqlite3_busy_timeout(db, 10000)` to the test helper as a safety measure for multi-client scenarios, though the real fix was removing If-Match with lease.
+
+**Result**: All 41 integration tests now pass. The key insight is that Azure blob leases and If-Match ETags are mutually exclusive strategies for write protection — use one or the other, never both.
+
