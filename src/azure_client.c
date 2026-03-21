@@ -708,6 +708,7 @@ static azure_err_t az_page_blob_create(void *ctx, const char *name,
 static azure_err_t az_page_blob_write(void *ctx, const char *name,
                                       int64_t offset, const uint8_t *data,
                                       size_t len, const char *lease_id,
+                                      const char *if_match,
                                       azure_error_t *err)
 {
     azure_client_t *c = (azure_client_t *)ctx;
@@ -738,25 +739,53 @@ static azure_err_t az_page_blob_write(void *ctx, const char *name,
              (long long)offset, (long long)(offset + (int64_t)len - 1));
 
     char lease_header[128];
-    const char *extra_with_lease[] = {
+    char if_match_header[256];
+    const char *extra_both[] = {
+        "x-ms-page-write:update",
+        range_header,
+        lease_header,
+        if_match_header,
+        NULL
+    };
+    const char *extra_lease_only[] = {
         "x-ms-page-write:update",
         range_header,
         lease_header,
         NULL
     };
-    const char *extra_no_lease[] = {
+    const char *extra_match_only[] = {
+        "x-ms-page-write:update",
+        range_header,
+        if_match_header,
+        NULL
+    };
+    const char *extra_none[] = {
         "x-ms-page-write:update",
         range_header,
         NULL
     };
 
-    const char **extra;
-    if (lease_id && lease_id[0] != '\0') {
+    int has_lease = (lease_id && lease_id[0] != '\0');
+    int has_match = (if_match && if_match[0] != '\0');
+
+    if (has_lease) {
         snprintf(lease_header, sizeof(lease_header),
                  "x-ms-lease-id:%s", lease_id);
-        extra = extra_with_lease;
+    }
+    if (has_match) {
+        snprintf(if_match_header, sizeof(if_match_header),
+                 "If-Match:%s", if_match);
+    }
+
+    const char **extra;
+    if (has_lease && has_match) {
+        extra = extra_both;
+    } else if (has_lease) {
+        extra = extra_lease_only;
+    } else if (has_match) {
+        extra = extra_match_only;
     } else {
-        extra = extra_no_lease;
+        extra = extra_none;
     }
 
     return execute_with_retry(c, "PUT", name, "comp=page",
@@ -1436,7 +1465,7 @@ static azure_err_t az_blob_undelete(void *ctx, const char *name,
 
     return execute_with_retry(c, "PUT", name, "comp=undelete",
                               NULL, NULL, NULL, 0, NULL,
-                              NULL, NULL, NULL, err);
+                              NULL, NULL, err);
 }
 
 /*
@@ -1686,6 +1715,7 @@ static azure_err_t batch_init_easy(
     const char *blob_name,
     const azure_page_range_t *range,
     const char *lease_id,
+    const char *if_match,
     batch_req_t *req)
 {
     req->easy = curl_easy_init();
@@ -1779,6 +1809,11 @@ static azure_err_t batch_init_easy(
         SLIST_APPEND(list, h);
     }
 
+    if (if_match && *if_match) {
+        snprintf(h, sizeof(h), "If-Match: %s", if_match);
+        SLIST_APPEND(list, h);
+    }
+
     snprintf(h, sizeof(h), "Content-Length: %zu", range->len);
     SLIST_APPEND(list, h);
 
@@ -1852,7 +1887,8 @@ static void batch_free_req(batch_req_t *req)
 static azure_err_t az_page_blob_write_batch(
     void *ctx, const char *name,
     const azure_page_range_t *ranges, int nRanges,
-    const char *lease_id, azure_error_t *err)
+    const char *lease_id, const char *if_match,
+    azure_error_t *err)
 {
     if (!ctx || !name || !err) return AZURE_ERR_INVALID_ARG;
     azure_error_init(err);
@@ -1863,7 +1899,7 @@ static azure_err_t az_page_blob_write_batch(
     if (nRanges == 1) {
         return az_page_blob_write(ctx, name, ranges[0].offset,
                                   ranges[0].data, ranges[0].len,
-                                  lease_id, err);
+                                  lease_id, if_match, err);
     }
 
     azure_client_t *c = (azure_client_t *)ctx;
@@ -1950,7 +1986,7 @@ static azure_err_t az_page_blob_write_batch(
             if (done[i]) continue;
             reqs[req_count].range_idx = i;
             azure_err_t rc = batch_init_easy(c, url, name, &ranges[i],
-                                              lease_id, &reqs[req_count]);
+                                              lease_id, if_match, &reqs[req_count]);
             if (rc != AZURE_OK) {
                 result = rc;
                 err->code = rc;
