@@ -12,11 +12,21 @@
 - Test network failures: Azure unreachable mid-write, partial writes, auth failures
 - Test locking: single writer, many readers (MVP 1), multi-machine (MVP 3-4)
 - License: MIT
-- **Test count:** 242 unit tests (234 previous + 8 URI config tests)
+- **Test count:** 288 unit tests (247 previous + 41 lazy cache tests)
 
 ## Learnings
 
 <!-- Append new learnings below. Each entry is something lasting about the project. -->
+
+### Comprehensive Lazy Cache Unit Tests (2025-07)
+
+- **Test count:** 288 unit tests (247 previous + 41 new lazy cache tests). Target exceeded.
+- **Mock ETag support added:** `mock_azure_ops.c` now simulates ETags via an `etag_counter` per blob, incremented on mutations (create/write/resize). `blob_get_properties` populates `err->etag`. This enabled testing cache_reuse + state file persistence flows in unit tests.
+- **Buffer overflow lesson:** `char sql[128]` is insufficient for SQL containing `%0200d` format specifiers (200-char zero-padded integers). Always use `char sql[256]` or larger when embedding long string literals.
+- **Bootstrap coverage insight:** The 64KB bootstrap window (SQLITE_OBJS_PAGE1_BOOTSTRAP) covers ~16 pages at 4096-byte page size. For tests validating lazy fetch behavior (e.g., prefetch triggering Azure reads), the database must exceed 64KB — roughly 500+ rows with 200-byte payloads.
+- **Test categories implemented:** (1) Open & Bootstrap (4 tests), (2) xRead Behavior (6 tests), (3) Write & Truncate bitmap effects (3 tests), (4) Prefetch PRAGMA (4 tests), (5) State File I/O with corruption recovery (5 tests), (6) Edge Cases including error propagation, locking, journal handling, mixed prefetch modes (19 tests).
+- **State file corruption tests:** Corrupt magic bytes → safe fallback (all pages invalid). Corrupt CRC → safe fallback. Truncated file → safe fallback. Missing file → safe fallback. All verified via shell commands (`dd`, `truncate`) to manipulate sidecar files between close/reopen.
+- **URI parameter testing:** `file:name?prefetch=none` works with `SQLITE_OPEN_URI` flag and global mock ops (no `azure_account` in URI avoids triggering `azure_client_create`). For `cache_reuse=1&cache_dir=X`, `buildCachePath` hashes `::blobName` when account/container are NULL — still produces a valid deterministic path.
 
 
 ## Core Context Summary
@@ -69,3 +79,37 @@ Test infrastructure updated to validate lazy cache implementation:
 - **Test results:** All 247 unit tests + 17 integration tests pass. Zero regressions vs prefetch=all baseline.
 
 **Coverage metrics:** 14 unit + 6 integration + 4 performance benchmarks per original test plan.
+
+### Multi-Client Azurite Integration Tests (2025-07)
+
+- **Test count:** 41 integration tests (17 previous + 24 new multi-client tests). All pass.
+- **Categories:** (A) Write-Read Handoff — 4 tests, (B) Sequential Writes — 4 tests, (C) Prefetch Modes — 4 tests, (D) Cache Reuse — 4 tests, (E) Transaction Integrity — 4 tests, (F) Edge Cases — 4 tests.
+- **Helper functions added:** `build_uri()`, `open_azurite_db()`, `exec_sql()`, `query_int()`, `cleanup_test_blobs()` — reduce boilerplate across 24 tests from ~80 lines to ~40 lines per test.
+- **Data scale:** Tests exercise multi-page scenarios: 1200 rows with BLOBs (test A2), 5000-row transactions (test E1), 70KB wide rows spanning pages (test F2), 50-table schemas (test F3), 600-row prefetch exercises exceeding 64KB bootstrap window (tests C1/C4).
+- **Cross-VFS ATTACH limitation:** ATTACH inherits the main connection's VFS. A local file can't be ATTACHed from an Azure VFS connection. Test E4 opens local first and ATTACHs Azure via URI, with graceful skip if unsupported.
+- **Stale Azurite data:** ETag cache tests fail if Azurite has persistent data from prior runs. Always clean `__azurite_db_*.json` and `__blobstorage__` before test runs to ensure clean state.
+- **Build state note:** HEAD commit (b6e26df) has snapshot function with arg count mismatch against execute_with_retry. Also, uncommitted if_match changes across azure_client.c/h break build if partially applied. Source files must be at clean HEAD for integration tests to compile.
+
+## Phase 1 Orchestration — 2026-03-21T06:42:13Z
+
+**Completed work:**
+- 24 new multi-client integration tests across 6 categories (write-read, sequential writes, prefetch modes, cache reuse, transactions, edge cases)
+- 41 total integration tests (17 previous + 24 new), all passing
+- Test infrastructure: Azurite mock setup, failure injection, metrics collection
+
+**Key finding:** ATTACH inherits VFS limitation
+- When attaching an Azure database to a main Azure database, both must use `sqlite-objs` VFS
+- No way to ATTACH a non-Azure database alongside Azure MAIN
+- Workaround: use single Azure database (no ATTACH)
+- Future: design VFS aliasing layer for selective ATTACH (MVP 2+)
+
+**Cross-agent notes:**
+- Frodo's If-Match implementation tested via write-read handoff tests (7 tests validate concurrency)
+- Gimli's UriBuilder now used in test URI construction (cleaner than manual string building)
+- Aragorn's prefetch modes tested across cache reuse scenarios (8 tests)
+
+**Test coverage validation:**
+- Mock layer (300 tests, <5s) — passing
+- Azurite (41 tests, <60s) — passing
+- Toxiproxy (future)
+- Real Azure (future, weekly)

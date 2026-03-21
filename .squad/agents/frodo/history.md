@@ -113,3 +113,22 @@ Comprehensive analysis of Azure Blob Storage features we're not using vs. what w
 - Enable soft delete at account level, add If-Match headers to Put Page, enable last access time tracking
 
 Full analysis: `.squad/decisions/inbox/frodo-azure-capabilities.md`
+
+## Phase 1 Orchestration — 2026-03-21T06:42:13Z
+
+**Completed work:**
+- If-Match conditional headers on PUT Page: prevents race condition (412 → SQLITE_BUSY)
+- Undelete Blob API: `az_blob_undelete()` via REST `?comp=undelete`, added to vtable
+- Last Access Time Tracking: sidecar `.atime` format documented
+
+**Test status:** 294/295 passing (1 unrelated intermittent)
+
+**Cross-agent notes:**
+- Samwise's write-read handoff tests validate If-Match implementation
+- Gimli's pragmas module will expose FCNTL metrics for debugging
+- Aragorn's next phase: incremental downloads using page snapshot diffs
+
+**Remaining opportunities:**
+- Extend If-Match to journal writes (currently page-blob only)
+- Use `.atime` for cache eviction heuristics (Aragorn's prefetch optimization)
+- Put Page From URL (server-side copy) for future backup/clone scenarios

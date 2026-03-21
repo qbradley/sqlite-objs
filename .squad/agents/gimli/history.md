@@ -57,3 +57,41 @@ Co-designed 54 Rust integration tests. 6 categories: lifecycle, transactions, ca
 
 **Files:** `rust/sqlite-objs/examples/reconnect_bench.rs`
 
+## Learnings
+
+**Ergonomic Rust API Additions (2025-07-22):**
+- Added `PrefetchMode` enum and `UriBuilder::prefetch()` for the `prefetch` URI parameter (`"all"` or `"none"`). Only emitted when explicitly set, keeping default URIs short.
+- Task spec had wrong FCNTL numbers (200=WAL_PARALLEL, etc.). Actual C header: 200=DOWNLOAD_COUNT, 201=STATS, 202=STATS_RESET. Always verify against the C header, not spec documents.
+- `VfsMetrics` struct (27 counters) with forward-compatible parser — unknown keys are ignored so older Rust code works with newer C builds. Field names match the C `formatMetrics()` output exactly (e.g. `prefetch_pages` not `cache_prefetch_pages`).
+- C metrics struct has `journal_bytes_uploaded` and `wal_bytes_uploaded` which the task spec omitted, and lacks `azure_retries` which the spec invented. Always match the C reality.
+- `rusqlite` 0.38 does NOT expose a public `file_control()` method. Must use unsafe FFI: `rusqlite::ffi::sqlite3_file_control(conn.handle(), ...)`. This is the standard pattern for custom FCNTLs.
+- STATS FCNTL returns a `sqlite3_malloc`'d string; caller must `sqlite3_free()` it. The pragmas module handles this lifecycle automatically.
+- Gated the `pragmas` module behind a `rusqlite` Cargo feature to keep the core crate dependency-free for non-rusqlite users.
+- C string literal syntax `c"main"` (stabilised in Rust 1.77) is cleaner than `CString::new("main").unwrap()` for known-good constants.
+
+
+## Phase 1 Orchestration — 2026-03-21T06:42:13Z
+
+**Completed work:**
+- PrefetchMode enum: Off, On, Adaptive
+- UriBuilder::prefetch() fluent API for ergonomic URI construction
+- VfsMetrics struct: 27 fields covering lease ops, downloads, cache, ETags, WAL, snapshots, timing
+- Pragmas module: `get_stats()`, `reset_stats()`, `get_download_count()` with `rusqlite` feature gating
+- 664 lines added (300 pragmas, 200 UriBuilder, 164 docs/tests)
+- 34 lib tests + 8 doc tests passing, clippy clean
+
+**Integration points:**
+- Pragmas module exposes Aragorn's custom FCNTL convention (op codes 200+)
+- UriBuilder simplifies Samwise's test URI construction
+- VfsMetrics enables Frodo's ETag cache hit verification (via `get_download_count()`)
+
+**Cross-agent notes:**
+- Samwise now uses UriBuilder instead of string concatenation in integration tests
+- Frodo can use `get_download_count()` PRAGMA to assert on cache hits
+- Aragorn's metrics (lease count, download latency) exposed via pragmas module
+- Future: Gandalf's monitoring dashboards can consume VfsMetrics snapshots
+
+**Tech debt noted:**
+- Feature flag required for rusqlite: `--features bin-deps` when building binaries
+- Unsafe FFI required for file_control() (no public rusqlite method)
+- Metrics parser is forward-compatible (unknown keys ignored)
