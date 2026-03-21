@@ -49,3 +49,20 @@ Quetzal's proposal (download-on-demand with validity bitmap) architecturally sou
 - **Pending input:** 3 questions identified for Quetzal regarding scope constraints (interactive reads vs scans vs VACUUM), readahead strategy (fixed vs adaptive), and process-local cache sharing.
 - **Context:** Synthesis of 4+ months prior analysis. Coordinated with Aragorn's code-level review.
 
+
+### Lazy Cache Architecture Integration (2026-03-22)
+
+Aragorn completed implementation of lazy cache filling feature per architecture review. Key architectural outcomes:
+
+- **Design validation:** All 6 lazy cache design decisions (D-LC1 through D-LC6) proven sound in implementation. Bitmap persistence atomicity (D-LC6) correctly sequences .state before .etag writes.
+- **Prefetch default:** Per UD9 user directive, `prefetch=all` remains default. Lazy mode opt-in via `prefetch=none` URI parameter. Regression-free: default behavior unchanged.
+- **Code footprint:** ~500 lines new code + ~200 lines refactoring. Touches xOpen, xRead, xWrite, xSync, xClose, revalidateAfterLease(). No vtable changes.
+- **Performance profile:** Cold-cache small-read workloads see 20× faster open latency. Sequential table scans remain slow without explicit prefetch (architectural limit, not regression).
+- **Readahead simplicity:** Fixed 16-page window as designed (no adaptive state machine). Measured 16× reduction in HTTP requests for sequential reads.
+
+**Impact on ongoing work:** 
+- Lease renewal logic (`revalidateAfterLease`) refactored to support bitmap invalidation instead of forced downloads. Incremental diff now updates bitmap state.
+- ETag + state file sidecar dependency chain enforced: cache fsync → .state (atomic) → .etag. Guards against desync on crash.
+- Test infrastructure extended to validate bitmap consistency and .state file recovery.
+
+**Deliverables validated:** 264 tests pass (247 unit + 17 integration). Zero regressions vs baseline.

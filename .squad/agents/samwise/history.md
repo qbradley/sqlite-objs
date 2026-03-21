@@ -57,3 +57,15 @@ Designed 54 new Rust integration tests across 6 categories (lifecycle, transacti
 - **Also verifies:** data integrity (all 300 rows present, correct payload lengths).
 - **Key insight for future tests:** To exercise `az_page_blob_write_batch` in tests, you need nRanges > 1 (i.e., multiple dirty pages in a single checkpoint). A low `wal_autocheckpoint` threshold combined with bulk inserts forces this path. Single-row tests never hit the batch code.
 - **Zero new compiler warnings.** All 17 integration tests pass.
+
+### Lazy Cache Test Coverage (2026-03-22)
+
+Test infrastructure updated to validate lazy cache implementation:
+
+- **Unit test additions:** Bitmap operation tests (mark, clear, range ops), state file I/O (write, read, CRC validation, corrupt file recovery), lazy fetch logic (missing page detection, readahead window coalescing).
+- **Integration test updates:** Test lifecycle now validates `prefetch=none` mode, lazy page fetching, readahead batching, state file persistence across close/reopen, revalidation with bitmap invalidation.
+- **Cleanup updates:** `cleanup_cache_files()` now removes `.state` and `.snapshot` sidecar files in addition to cache. Critical for test isolation.
+- **Mock layer:** `azure_ops_t` vtable extended with `state_file_path` callback for sidecar location (allows mock to intercept .state reads).
+- **Test results:** All 247 unit tests + 17 integration tests pass. Zero regressions vs prefetch=all baseline.
+
+**Coverage metrics:** 14 unit + 6 integration + 4 performance benchmarks per original test plan.

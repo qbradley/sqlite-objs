@@ -60,3 +60,15 @@ Frodo designed and implemented Azure REST client (libcurl-based), SAS+SharedKey 
 - **nghttp2 dependency:** HTTP/2 requires libcurl built with nghttp2. macOS Homebrew curl includes it. If absent, curl falls back silently.
 - **Synced to `rust/sqlite-objs-sys/csrc/azure_client.c`.**
 - **Build:** Zero warnings. All 242 unit tests pass.
+
+### Lazy Cache HTTP Integration (2026-03-22)
+
+Lazy cache implementation completed. HTTP layer implications:
+
+- **Page 1 bootstrap:** New `page_blob_read(blob_client, offset=0, length=65536)` call at xOpen in lazy mode. Single 64KB request fetches max SQLite page size without round-trip for header parsing.
+- **Readahead batching:** `fetchPagesFromAzure()` now issues single `page_blob_read` for 16-page windows (pages N:N+15) instead of individual requests. Reduces HTTP call count by 16× on sequential reads.
+- **State file I/O:** New `.state` sidecar file written via `put_blob()` after cache fsync. Atomic rename pattern on local disk. No new Azure API requirements.
+- **Error handling:** Readahead window fetch failures (404, 429, etc.) map to existing SQLITE_BUSY/SQLITE_IOERR logic. Lazy mode doesn't introduce new error scenarios.
+- **Caching implications:** Valid bitmap persistence in `.state` file allows reconnect scenario: no need to re-fetch pages already in cache if state file exists. ETag matching guarantees file unchanged.
+
+**Testing:** Integration tests validate `page_blob_read` offset/length contracts at HTTP mock layer.

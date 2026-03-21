@@ -400,4 +400,51 @@ Quetzal's lazy cache proposal (download-on-demand pages with validity bitmap per
 **Files Modified (Implementation):** `src/sqlite_objs_vfs.c` (~400-500 lines new code + ~200 lines refactoring). Estimated 4-6 days.
 
 ---
+### D-LC1: Lazy Cache — Validity Bitmap Structure
+**Date:** 2026-03-22 | **From:** Aragorn (SQLite/C Dev)
 
+Implemented parallel to dirty bitmap. Same allocation strategy (`unsigned char *aValid` array), same helper function pattern. `bitmapsEnsureCapacity()` wrapper keeps both in sync. Mirrors dirty bitmap API: `validMarkPage`, `validIsPageValid`, `validClearPage`, `validClearAll`, `validMarkAll`, `validEnsureCapacity`, `validMarkRange`.
+
+---
+
+### D-LC2: Lazy Cache — State File Binary Format
+**Date:** 2026-03-22 | **From:** Aragorn (SQLite/C Dev)
+
+Fixed format: `SQOS` magic (4B) + version LE32 (4B) + pageSize LE32 (4B) + fileSize LE64 (8B) + bitmapSize LE32 (4B) + bitmap (N bytes) + CRC32 LE32 (4B). Total header = 24 bytes. CRC32 covers header + bitmap. Atomic write via rename. Implemented `writeStateFile`, `readStateFile`, `unlinkStateFile` with ISO 3309 CRC32 lookup table.
+
+---
+
+### D-LC3: Lazy Cache — Page 1 Bootstrap Size
+**Date:** 2026-03-22 | **From:** Aragorn (SQLite/C Dev)
+
+65536 bytes (max legal SQLite page size) downloaded at xOpen in lazy mode. Handles all page size values (512–65536) without a second round-trip.
+
+---
+
+### D-LC4: Lazy Cache — Readahead Window
+**Date:** 2026-03-22 | **From:** Aragorn (SQLite/C Dev)
+
+Fixed 16 pages. `fetchPagesFromAzure()` issues a single `page_blob_read` for pages N through N+15, clamped to file size.
+
+---
+
+### D-LC5: Lazy Cache — Lazy Revalidation Strategy
+**Date:** 2026-03-22 | **From:** Aragorn (SQLite/C Dev)
+
+In lazy mode, `revalidateAfterLease()` uses incremental diff to **invalidate** changed pages (clear valid bits) instead of downloading them. Downloads happen only on subsequent xRead misses. If diff exceeds 50% of pages, falls back to full download for efficiency. After full re-download, marks all valid.
+
+---
+
+### D-LC6: Lazy Cache — Write Order at Close
+**Date:** 2026-03-22 | **From:** Aragorn (SQLite/C Dev)
+
+Cache fsync → .state file (atomic rename) → .etag file → .snapshot file. Ensures valid bitmap persisted before ETag that gates cache reuse.
+
+---
+
+### UD9: User Directive — Lazy Cache Defaults and Readahead Simplicity
+**Date:** 2026-03-21 | **From:** Quetzal Bradley (via Copilot)
+
+(1) `prefetch=all` is the default — lazy cache is opt-in via `prefetch=none`. Rationale: small databases are common case, should be excellent out of box. Diverse-writers-large-database scenario is corner case. Document prominently in README. (2) Readahead should be simple (fixed window), NOT complicated adaptive state machine. (3) Get core C code finished first, then Rust test infrastructure.
+
+---
