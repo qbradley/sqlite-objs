@@ -4,7 +4,8 @@ use std::process::Command;
 
 fn main() {
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
-    let src_dir = manifest_dir.join("csrc");
+    // Use the canonical C sources from the repo root — no copies needed
+    let src_dir = manifest_dir.join("../../src");
 
     // Get SQLite include path from libsqlite3-sys (set via its `links` metadata)
     let sqlite_include = env::var("DEP_SQLITE3_INCLUDE")
