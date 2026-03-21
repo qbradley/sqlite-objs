@@ -22,6 +22,7 @@ uuid = { version = "1", features = ["v4"] }
 dotenvy = "0.15"
 
 [features]
+rusqlite = ["dep:rusqlite"]
 bin-deps = ["dep:rusqlite", "dep:dotenvy", "dep:tracing-subscriber"]
 
 [[bin]]

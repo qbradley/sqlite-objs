@@ -91,6 +91,21 @@ pub const SQLITE_ERROR: c_int = 1;
 pub const SQLITE_CANTOPEN: c_int = 14;
 pub const SQLITE_NOMEM: c_int = 7;
 
+// sqlite-objs custom file-control opcodes.
+// These must match the #define values in sqlite_objs.h.
+
+/// FCNTL opcode: query the number of full blob downloads (int* arg).
+/// ETag cache hits do not increment the counter.
+pub const SQLITE_OBJS_FCNTL_DOWNLOAD_COUNT: c_int = 200;
+
+/// FCNTL opcode: retrieve all VFS activity metrics as a `key=value\n` string.
+/// The returned `char*` is allocated with `sqlite3_malloc`; the caller must
+/// free it with `sqlite3_free`.
+pub const SQLITE_OBJS_FCNTL_STATS: c_int = 201;
+
+/// FCNTL opcode: reset all VFS activity metrics to zero. Pass NULL as arg.
+pub const SQLITE_OBJS_FCNTL_STATS_RESET: c_int = 202;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -110,5 +125,13 @@ mod tests {
             // Should return SQLITE_OK since URI mode doesn't require config upfront
             assert_eq!(result, SQLITE_OK);
         }
+    }
+
+    #[test]
+    fn test_fcntl_constants_match_header() {
+        // Values must stay in sync with sqlite_objs.h #defines
+        assert_eq!(SQLITE_OBJS_FCNTL_DOWNLOAD_COUNT, 200);
+        assert_eq!(SQLITE_OBJS_FCNTL_STATS, 201);
+        assert_eq!(SQLITE_OBJS_FCNTL_STATS_RESET, 202);
     }
 }
