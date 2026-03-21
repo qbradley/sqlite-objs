@@ -24,10 +24,10 @@ fn load_dotenv() {
 fn azure_config_from_env() -> Result<SqliteObjsConfig, DynError> {
     load_dotenv();
 
-    let account = std::env::var("AZURE_STORAGE_ACCOUNT")
-        .map_err(|_| "missing AZURE_STORAGE_ACCOUNT")?;
-    let container = std::env::var("AZURE_STORAGE_CONTAINER")
-        .map_err(|_| "missing AZURE_STORAGE_CONTAINER")?;
+    let account =
+        std::env::var("AZURE_STORAGE_ACCOUNT").map_err(|_| "missing AZURE_STORAGE_ACCOUNT")?;
+    let container =
+        std::env::var("AZURE_STORAGE_CONTAINER").map_err(|_| "missing AZURE_STORAGE_CONTAINER")?;
 
     let sas_token = std::env::var("AZURE_STORAGE_SAS").ok();
     let account_key = std::env::var("AZURE_STORAGE_CONNECTION_STRING")
@@ -35,7 +35,9 @@ fn azure_config_from_env() -> Result<SqliteObjsConfig, DynError> {
         .and_then(|cs| parse_connection_string_field(&cs, "AccountKey"));
 
     if sas_token.is_none() && account_key.is_none() {
-        return Err("need AZURE_STORAGE_SAS or AccountKey in AZURE_STORAGE_CONNECTION_STRING".into());
+        return Err(
+            "need AZURE_STORAGE_SAS or AccountKey in AZURE_STORAGE_CONNECTION_STRING".into(),
+        );
     }
 
     Ok(SqliteObjsConfig {
@@ -166,13 +168,20 @@ fn run_spawn_two(db_name: &str, iterations: u32, hold_ms: u64) -> Result<(), Dyn
     Ok(())
 }
 
-fn run_threads(db_name: &str, threads: usize, iterations: u32, hold_ms: u64) -> Result<(), DynError> {
+fn run_threads(
+    db_name: &str,
+    threads: usize,
+    iterations: u32,
+    hold_ms: u64,
+) -> Result<(), DynError> {
     let mut handles = Vec::with_capacity(threads);
 
     for index in 0..threads {
         let worker = format!("thread-{index}");
         let db = db_name.to_string();
-        handles.push(thread::spawn(move || run_worker(&worker, &db, iterations, hold_ms)));
+        handles.push(thread::spawn(move || {
+            run_worker(&worker, &db, iterations, hold_ms)
+        }));
     }
 
     for handle in handles {
@@ -185,13 +194,20 @@ fn run_threads(db_name: &str, threads: usize, iterations: u32, hold_ms: u64) -> 
     Ok(())
 }
 
-fn run_threads_distinct(db_prefix: &str, threads: usize, iterations: u32, hold_ms: u64) -> Result<(), DynError> {
+fn run_threads_distinct(
+    db_prefix: &str,
+    threads: usize,
+    iterations: u32,
+    hold_ms: u64,
+) -> Result<(), DynError> {
     let mut handles = Vec::with_capacity(threads);
 
     for index in 0..threads {
         let worker = format!("thread-{index}");
         let db = format!("{db_prefix}-{index}.db");
-        handles.push(thread::spawn(move || run_worker(&worker, &db, iterations, hold_ms)));
+        handles.push(thread::spawn(move || {
+            run_worker(&worker, &db, iterations, hold_ms)
+        }));
     }
 
     for handle in handles {
@@ -230,7 +246,9 @@ fn main() -> Result<(), DynError> {
             let db_name = args.next().unwrap_or_else(default_db_name);
             let iterations = args.next().and_then(|v| v.parse().ok()).unwrap_or(20);
             let hold_ms = args.next().and_then(|v| v.parse().ok()).unwrap_or(10);
-            eprintln!("[parent] mode=spawn-two db={db_name} iterations={iterations} hold_ms={hold_ms}");
+            eprintln!(
+                "[parent] mode=spawn-two db={db_name} iterations={iterations} hold_ms={hold_ms}"
+            );
             run_spawn_two(&db_name, iterations, hold_ms)
         }
         "threads" => {
@@ -242,7 +260,9 @@ fn main() -> Result<(), DynError> {
             run_threads(&db_name, threads, iterations, hold_ms)
         }
         "threads-distinct" => {
-            let db_prefix = args.next().unwrap_or_else(|| default_db_name().trim_end_matches(".db").to_string());
+            let db_prefix = args
+                .next()
+                .unwrap_or_else(|| default_db_name().trim_end_matches(".db").to_string());
             let threads = args.next().and_then(|v| v.parse().ok()).unwrap_or(2);
             let iterations = args.next().and_then(|v| v.parse().ok()).unwrap_or(20);
             let hold_ms = args.next().and_then(|v| v.parse().ok()).unwrap_or(10);

@@ -40,12 +40,12 @@ fn main() {
     println!("3. URI mode with UriBuilder (recommended for per-database credentials):");
     println!("   SqliteObjsVfs::register_uri(false)?;");
     println!();
-    
+
     // Demonstrate URI builder
     let uri = UriBuilder::new("mydb.db", "myaccount", "databases")
         .sas_token("sv=2024-08-04&ss=b&srt=sco&sp=rwdlacyx&se=2026-01-01T00:00:00Z&sig=abc123")
         .build();
-    
+
     println!("   let uri = UriBuilder::new(\"mydb.db\", \"myaccount\", \"databases\")");
     println!("       .sas_token(\"sv=2024-08-04&ss=b&srt=sco&sp=rwdlacyx&se=2026-01-01T00:00:00Z&sig=abc123\")");
     println!("       .build();");
@@ -62,11 +62,15 @@ fn main() {
     // Example 4: URI mode with endpoint (Azurite)
     println!("4. URI mode with custom endpoint (e.g., Azurite):");
     let azurite_uri = UriBuilder::new("testdb.db", "devstoreaccount1", "testcontainer")
-        .sas_token("sv=2024-08-04&st=2025-01-01T00:00:00Z&se=2026-01-01T00:00:00Z&sr=c&sp=rwdlac&sig=test")
+        .sas_token(
+            "sv=2024-08-04&st=2025-01-01T00:00:00Z&se=2026-01-01T00:00:00Z&sr=c&sp=rwdlac&sig=test",
+        )
         .endpoint("http://127.0.0.1:10000/devstoreaccount1")
         .build();
-    
-    println!("   let uri = UriBuilder::new(\"testdb.db\", \"devstoreaccount1\", \"testcontainer\")");
+
+    println!(
+        "   let uri = UriBuilder::new(\"testdb.db\", \"devstoreaccount1\", \"testcontainer\")"
+    );
     println!("       .sas_token(\"sv=2024-08-04&st=2025-01-01T00:00:00Z&se=2026-01-01T00:00:00Z&sr=c&sp=rwdlac&sig=test\")");
     println!("       .endpoint(\"http://127.0.0.1:10000/devstoreaccount1\")");
     println!("       .build();");

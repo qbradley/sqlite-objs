@@ -76,10 +76,10 @@ fn open_azure(uri: &str) -> Connection {
     conn
 }
 
+#[allow(dead_code)]
 fn open_azure_readonly(uri: &str) -> Connection {
-    let conn = Connection::open_with_flags_and_vfs(uri, RO_URI, "sqlite-objs")
-        .expect("Failed to open Azure connection (readonly)");
-    conn
+    Connection::open_with_flags_and_vfs(uri, RO_URI, "sqlite-objs")
+        .expect("Failed to open Azure connection (readonly)")
 }
 
 fn configure_azure(conn: &Connection) {
@@ -281,28 +281,42 @@ fn lifecycle_create_fresh_database() {
     let name: String = db
         .query_row("SELECT name FROM t WHERE id = 1", [], |r| r.get(0))
         .unwrap();
-    assert_eq!(name, "hello", "Data should be readable immediately after insert");
+    assert_eq!(
+        name, "hello",
+        "Data should be readable immediately after insert"
+    );
 }
 
 #[test]
 #[ignore]
 fn lifecycle_reopen_existing_database() {
     let mut db = AzureTestDb::new("lc-reopen");
-    db.execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)").unwrap();
+    db.execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)")
+        .unwrap();
     for i in 0..20u64 {
-        db.execute("INSERT INTO t VALUES (?1, ?2)", rusqlite::params![i as i64, seeded_text(TEST_SEED, i)])
-            .unwrap();
+        db.execute(
+            "INSERT INTO t VALUES (?1, ?2)",
+            rusqlite::params![i as i64, seeded_text(TEST_SEED, i)],
+        )
+        .unwrap();
     }
     db.reopen();
 
-    let count: i64 = db.query_row("SELECT COUNT(*) FROM t", [], |r| r.get(0)).unwrap();
+    let count: i64 = db
+        .query_row("SELECT COUNT(*) FROM t", [], |r| r.get(0))
+        .unwrap();
     assert_eq!(count, 20, "All 20 rows should persist through close/reopen");
 
     for i in 0..20u64 {
         let v: String = db
             .query_row("SELECT v FROM t WHERE id = ?1", [i as i64], |r| r.get(0))
             .unwrap();
-        assert_eq!(v, seeded_text(TEST_SEED, i), "Row {} mismatch after reopen", i);
+        assert_eq!(
+            v,
+            seeded_text(TEST_SEED, i),
+            "Row {} mismatch after reopen",
+            i
+        );
     }
 }
 
@@ -343,32 +357,45 @@ fn lifecycle_reopen_preserves_schema() {
 #[ignore]
 fn lifecycle_multiple_sessions() {
     let mut db = AzureTestDb::new("lc-multi");
-    db.execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)").unwrap();
+    db.execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)")
+        .unwrap();
 
     // Session 1: seed 1000
     for i in 0..50u64 {
-        db.execute("INSERT INTO t VALUES (?1, ?2)", rusqlite::params![i as i64, seeded_text(1000, i)])
-            .unwrap();
+        db.execute(
+            "INSERT INTO t VALUES (?1, ?2)",
+            rusqlite::params![i as i64, seeded_text(1000, i)],
+        )
+        .unwrap();
     }
     db.reopen();
 
     // Session 2: seed 2000
     for i in 50..100u64 {
-        db.execute("INSERT INTO t VALUES (?1, ?2)", rusqlite::params![i as i64, seeded_text(2000, i)])
-            .unwrap();
+        db.execute(
+            "INSERT INTO t VALUES (?1, ?2)",
+            rusqlite::params![i as i64, seeded_text(2000, i)],
+        )
+        .unwrap();
     }
     db.reopen();
 
     // Session 3: verify all
-    let count: i64 = db.query_row("SELECT COUNT(*) FROM t", [], |r| r.get(0)).unwrap();
+    let count: i64 = db
+        .query_row("SELECT COUNT(*) FROM t", [], |r| r.get(0))
+        .unwrap();
     assert_eq!(count, 100, "Both batches should be present");
 
     for i in 0..50u64 {
-        let v: String = db.query_row("SELECT v FROM t WHERE id=?1", [i as i64], |r| r.get(0)).unwrap();
+        let v: String = db
+            .query_row("SELECT v FROM t WHERE id=?1", [i as i64], |r| r.get(0))
+            .unwrap();
         assert_eq!(v, seeded_text(1000, i), "Session1 row {} mismatch", i);
     }
     for i in 50..100u64 {
-        let v: String = db.query_row("SELECT v FROM t WHERE id=?1", [i as i64], |r| r.get(0)).unwrap();
+        let v: String = db
+            .query_row("SELECT v FROM t WHERE id=?1", [i as i64], |r| r.get(0))
+            .unwrap();
         assert_eq!(v, seeded_text(2000, i), "Session2 row {} mismatch", i);
     }
 }
@@ -377,13 +404,16 @@ fn lifecycle_multiple_sessions() {
 #[ignore]
 fn lifecycle_open_close_rapid_cycle() {
     let mut db = AzureTestDb::new("lc-rapid");
-    db.execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)").unwrap();
+    db.execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)")
+        .unwrap();
 
     for cycle in 0..10u64 {
         if cycle > 0 {
             db.reopen();
         }
-        let count: i64 = db.query_row("SELECT COUNT(*) FROM t", [], |r| r.get(0)).unwrap();
+        let count: i64 = db
+            .query_row("SELECT COUNT(*) FROM t", [], |r| r.get(0))
+            .unwrap();
         assert_eq!(count, cycle as i64, "Before insert in cycle {}", cycle);
         db.execute(
             "INSERT INTO t VALUES (?1, ?2)",
@@ -392,7 +422,9 @@ fn lifecycle_open_close_rapid_cycle() {
         .unwrap();
     }
     db.reopen();
-    let count: i64 = db.query_row("SELECT COUNT(*) FROM t", [], |r| r.get(0)).unwrap();
+    let count: i64 = db
+        .query_row("SELECT COUNT(*) FROM t", [], |r| r.get(0))
+        .unwrap();
     assert_eq!(count, 10, "Should have exactly 10 rows after 10 cycles");
 }
 
@@ -463,9 +495,16 @@ fn lifecycle_concurrent_blob_names() {
     // Verify no cross-contamination
     for (idx, (conn, tbl)) in conns.iter().enumerate() {
         let v: String = conn
-            .query_row(&format!("SELECT v FROM {} WHERE id=1", tbl), [], |r| r.get(0))
+            .query_row(&format!("SELECT v FROM {} WHERE id=1", tbl), [], |r| {
+                r.get(0)
+            })
             .unwrap();
-        assert_eq!(v, format!("blob{}", idx), "Blob {} cross-contamination", idx);
+        assert_eq!(
+            v,
+            format!("blob{}", idx),
+            "Blob {} cross-contamination",
+            idx
+        );
 
         // Other tables should NOT exist
         for (j, (_, other_tbl)) in conns.iter().enumerate() {
@@ -477,7 +516,11 @@ fn lifecycle_concurrent_blob_names() {
                         |r| r.get(0),
                     )
                     .unwrap();
-                assert_eq!(exists, 0, "Table from blob {} should not exist in blob {}", j, idx);
+                assert_eq!(
+                    exists, 0,
+                    "Table from blob {} should not exist in blob {}",
+                    j, idx
+                );
             }
         }
     }
@@ -491,22 +534,35 @@ fn lifecycle_concurrent_blob_names() {
 #[ignore]
 fn txn_commit_persists_to_azure() {
     let mut db = AzureTestDb::new("txn-commit");
-    db.execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)").unwrap();
+    db.execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)")
+        .unwrap();
 
     db.execute_batch("BEGIN").unwrap();
     for i in 0..100u64 {
-        db.execute("INSERT INTO t VALUES (?1, ?2)", rusqlite::params![i as i64, seeded_text(TEST_SEED, i)])
-            .unwrap();
+        db.execute(
+            "INSERT INTO t VALUES (?1, ?2)",
+            rusqlite::params![i as i64, seeded_text(TEST_SEED, i)],
+        )
+        .unwrap();
     }
     db.execute_batch("COMMIT").unwrap();
     db.reopen();
 
-    let count: i64 = db.query_row("SELECT COUNT(*) FROM t", [], |r| r.get(0)).unwrap();
+    let count: i64 = db
+        .query_row("SELECT COUNT(*) FROM t", [], |r| r.get(0))
+        .unwrap();
     assert_eq!(count, 100, "All 100 committed rows should persist");
 
     for i in 0..100u64 {
-        let v: String = db.query_row("SELECT v FROM t WHERE id=?1", [i as i64], |r| r.get(0)).unwrap();
-        assert_eq!(v, seeded_text(TEST_SEED, i), "Row {} mismatch after reopen", i);
+        let v: String = db
+            .query_row("SELECT v FROM t WHERE id=?1", [i as i64], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            v,
+            seeded_text(TEST_SEED, i),
+            "Row {} mismatch after reopen",
+            i
+        );
     }
 }
 
@@ -514,61 +570,87 @@ fn txn_commit_persists_to_azure() {
 #[ignore]
 fn txn_rollback_discards_changes() {
     let db = AzureTestDb::new("txn-rb");
-    db.execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)").unwrap();
+    db.execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)")
+        .unwrap();
 
     // Commit initial 10 rows
     db.execute_batch("BEGIN").unwrap();
     for i in 0..10u64 {
-        db.execute("INSERT INTO t VALUES (?1, ?2)", rusqlite::params![i as i64, seeded_text(TEST_SEED, i)])
-            .unwrap();
+        db.execute(
+            "INSERT INTO t VALUES (?1, ?2)",
+            rusqlite::params![i as i64, seeded_text(TEST_SEED, i)],
+        )
+        .unwrap();
     }
     db.execute_batch("COMMIT").unwrap();
 
     // Insert 50 more, then ROLLBACK
     db.execute_batch("BEGIN").unwrap();
     for i in 10..60u64 {
-        db.execute("INSERT INTO t VALUES (?1, ?2)", rusqlite::params![i as i64, seeded_text(TEST_SEED, i)])
-            .unwrap();
+        db.execute(
+            "INSERT INTO t VALUES (?1, ?2)",
+            rusqlite::params![i as i64, seeded_text(TEST_SEED, i)],
+        )
+        .unwrap();
     }
     db.execute_batch("ROLLBACK").unwrap();
 
-    let count: i64 = db.query_row("SELECT COUNT(*) FROM t", [], |r| r.get(0)).unwrap();
-    assert_eq!(count, 10, "Only original 10 rows should survive after rollback");
+    let count: i64 = db
+        .query_row("SELECT COUNT(*) FROM t", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(
+        count, 10,
+        "Only original 10 rows should survive after rollback"
+    );
 }
 
 #[test]
 #[ignore]
 fn txn_nested_savepoints() {
     let mut db = AzureTestDb::new("txn-save");
-    db.execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)").unwrap();
+    db.execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)")
+        .unwrap();
 
     db.execute_batch("BEGIN").unwrap();
     for i in 0..5u64 {
-        db.execute("INSERT INTO t VALUES (?1, ?2)", rusqlite::params![i as i64, seeded_text(100, i)])
-            .unwrap();
+        db.execute(
+            "INSERT INTO t VALUES (?1, ?2)",
+            rusqlite::params![i as i64, seeded_text(100, i)],
+        )
+        .unwrap();
     }
 
     db.execute_batch("SAVEPOINT sp1").unwrap();
     for i in 5..10u64 {
-        db.execute("INSERT INTO t VALUES (?1, ?2)", rusqlite::params![i as i64, seeded_text(100, i)])
-            .unwrap();
+        db.execute(
+            "INSERT INTO t VALUES (?1, ?2)",
+            rusqlite::params![i as i64, seeded_text(100, i)],
+        )
+        .unwrap();
     }
 
     db.execute_batch("SAVEPOINT sp2").unwrap();
     for i in 10..15u64 {
-        db.execute("INSERT INTO t VALUES (?1, ?2)", rusqlite::params![i as i64, seeded_text(100, i)])
-            .unwrap();
+        db.execute(
+            "INSERT INTO t VALUES (?1, ?2)",
+            rusqlite::params![i as i64, seeded_text(100, i)],
+        )
+        .unwrap();
     }
 
     db.execute_batch("ROLLBACK TO sp2").unwrap();
-    let count: i64 = db.query_row("SELECT COUNT(*) FROM t", [], |r| r.get(0)).unwrap();
+    let count: i64 = db
+        .query_row("SELECT COUNT(*) FROM t", [], |r| r.get(0))
+        .unwrap();
     assert_eq!(count, 10, "After ROLLBACK TO sp2, should have 10 rows");
 
     db.execute_batch("RELEASE sp1").unwrap();
     db.execute_batch("COMMIT").unwrap();
     db.reopen();
 
-    let count: i64 = db.query_row("SELECT COUNT(*) FROM t", [], |r| r.get(0)).unwrap();
+    let count: i64 = db
+        .query_row("SELECT COUNT(*) FROM t", [], |r| r.get(0))
+        .unwrap();
     assert_eq!(count, 10, "10 rows should persist through close/reopen");
 }
 
@@ -576,7 +658,8 @@ fn txn_nested_savepoints() {
 #[ignore]
 fn txn_large_transaction() {
     let mut db = AzureTestDb::new("txn-large");
-    db.execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT, b BLOB)").unwrap();
+    db.execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT, b BLOB)")
+        .unwrap();
 
     db.execute_batch("BEGIN").unwrap();
     for i in 0..5000u64 {
@@ -590,7 +673,9 @@ fn txn_large_transaction() {
     db.execute_batch("COMMIT").unwrap();
     db.reopen();
 
-    let count: i64 = db.query_row("SELECT COUNT(*) FROM t", [], |r| r.get(0)).unwrap();
+    let count: i64 = db
+        .query_row("SELECT COUNT(*) FROM t", [], |r| r.get(0))
+        .unwrap();
     assert_eq!(count, 5000, "All 5000 rows should persist");
 
     // Spot-check a few rows
@@ -601,7 +686,12 @@ fn txn_large_transaction() {
             })
             .unwrap();
         assert_eq!(v, seeded_text(TEST_SEED, i), "Text mismatch at row {}", i);
-        assert_eq!(b, seeded_blob(TEST_SEED, i, 256), "Blob mismatch at row {}", i);
+        assert_eq!(
+            b,
+            seeded_blob(TEST_SEED, i, 256),
+            "Blob mismatch at row {}",
+            i
+        );
     }
 }
 
@@ -639,28 +729,39 @@ fn txn_multiple_tables_single_txn() {
 #[ignore]
 fn txn_interleaved_read_write() {
     let db = AzureTestDb::new("txn-interleave");
-    db.execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)").unwrap();
+    db.execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)")
+        .unwrap();
 
     // Batch 1
     db.execute_batch("BEGIN").unwrap();
     for i in 0..100u64 {
-        db.execute("INSERT INTO t VALUES (?1, ?2)", rusqlite::params![i as i64, seeded_text(1000, i)])
-            .unwrap();
+        db.execute(
+            "INSERT INTO t VALUES (?1, ?2)",
+            rusqlite::params![i as i64, seeded_text(1000, i)],
+        )
+        .unwrap();
     }
     db.execute_batch("COMMIT").unwrap();
 
     // Read batch 1 while inserting batch 2
-    let v0: String = db.query_row("SELECT v FROM t WHERE id=0", [], |r| r.get(0)).unwrap();
+    let v0: String = db
+        .query_row("SELECT v FROM t WHERE id=0", [], |r| r.get(0))
+        .unwrap();
     assert_eq!(v0, seeded_text(1000, 0));
 
     db.execute_batch("BEGIN").unwrap();
     for i in 100..200u64 {
-        db.execute("INSERT INTO t VALUES (?1, ?2)", rusqlite::params![i as i64, seeded_text(2000, i)])
-            .unwrap();
+        db.execute(
+            "INSERT INTO t VALUES (?1, ?2)",
+            rusqlite::params![i as i64, seeded_text(2000, i)],
+        )
+        .unwrap();
     }
     db.execute_batch("COMMIT").unwrap();
 
-    let count: i64 = db.query_row("SELECT COUNT(*) FROM t", [], |r| r.get(0)).unwrap();
+    let count: i64 = db
+        .query_row("SELECT COUNT(*) FROM t", [], |r| r.get(0))
+        .unwrap();
     assert_eq!(count, 200, "Both batches totaling 200 rows");
 }
 
@@ -668,10 +769,14 @@ fn txn_interleaved_read_write() {
 #[ignore]
 fn txn_commit_then_immediate_close() {
     let db = AzureTestDb::new("txn-imm-close");
-    db.execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)").unwrap();
+    db.execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)")
+        .unwrap();
     for i in 0..50u64 {
-        db.execute("INSERT INTO t VALUES (?1, ?2)", rusqlite::params![i as i64, seeded_text(TEST_SEED, i)])
-            .unwrap();
+        db.execute(
+            "INSERT INTO t VALUES (?1, ?2)",
+            rusqlite::params![i as i64, seeded_text(TEST_SEED, i)],
+        )
+        .unwrap();
     }
     // Drop = immediate close after autocommit
     let _uri = db.uri();
@@ -685,24 +790,35 @@ fn txn_commit_then_immediate_close() {
         .cache_dir(cache_dir_path.to_str().unwrap())
         .build();
     let conn = open_azure(&reopen_uri);
-    let count: i64 = conn.query_row("SELECT COUNT(*) FROM t", [], |r| r.get(0)).unwrap();
-    assert_eq!(count, 50, "Data should survive immediate close after commit");
+    let count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM t", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(
+        count, 50,
+        "Data should survive immediate close after commit"
+    );
 }
 
 #[test]
 #[ignore]
 fn txn_autocommit_mode() {
     let mut db = AzureTestDb::new("txn-autocommit");
-    db.execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)").unwrap();
+    db.execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)")
+        .unwrap();
 
     // No explicit BEGIN/COMMIT — autocommit mode
     for i in 0..30u64 {
-        db.execute("INSERT INTO t VALUES (?1, ?2)", rusqlite::params![i as i64, seeded_text(TEST_SEED, i)])
-            .unwrap();
+        db.execute(
+            "INSERT INTO t VALUES (?1, ?2)",
+            rusqlite::params![i as i64, seeded_text(TEST_SEED, i)],
+        )
+        .unwrap();
     }
 
     db.reopen();
-    let count: i64 = db.query_row("SELECT COUNT(*) FROM t", [], |r| r.get(0)).unwrap();
+    let count: i64 = db
+        .query_row("SELECT COUNT(*) FROM t", [], |r| r.get(0))
+        .unwrap();
     assert_eq!(count, 30, "All autocommit rows should persist");
 }
 
@@ -714,13 +830,18 @@ fn txn_autocommit_mode() {
 #[ignore]
 fn deterministic_bulk_insert_verify() {
     let mut db = AzureTestDb::new("det-bulk");
-    db.execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY, txt TEXT, val REAL)").unwrap();
+    db.execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY, txt TEXT, val REAL)")
+        .unwrap();
 
     db.execute_batch("BEGIN").unwrap();
     for i in 0..1000u64 {
         db.execute(
             "INSERT INTO t VALUES (?1, ?2, ?3)",
-            rusqlite::params![i as i64, seeded_text(TEST_SEED, i), seeded_value(TEST_SEED, i)],
+            rusqlite::params![
+                i as i64,
+                seeded_text(TEST_SEED, i),
+                seeded_value(TEST_SEED, i)
+            ],
         )
         .unwrap();
     }
@@ -728,9 +849,17 @@ fn deterministic_bulk_insert_verify() {
     db.reopen();
 
     let mut mismatches = 0;
-    let mut stmt = db.prepare("SELECT id, txt, val FROM t ORDER BY id").unwrap();
+    let mut stmt = db
+        .prepare("SELECT id, txt, val FROM t ORDER BY id")
+        .unwrap();
     let rows = stmt
-        .query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, f64>(2)?)))
+        .query_map([], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, f64>(2)?,
+            ))
+        })
         .unwrap();
     for row in rows {
         let (id, txt, val) = row.unwrap();
@@ -746,7 +875,8 @@ fn deterministic_bulk_insert_verify() {
 #[ignore]
 fn deterministic_update_verify() {
     let mut db = AzureTestDb::new("det-upd");
-    db.execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY, txt TEXT, val REAL)").unwrap();
+    db.execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY, txt TEXT, val REAL)")
+        .unwrap();
 
     let seed_a: u64 = 0xAAAA;
     let seed_b: u64 = 0xBBBB;
@@ -778,7 +908,12 @@ fn deterministic_update_verify() {
                 Ok((r.get(0)?, r.get(1)?))
             })
             .unwrap();
-        assert_eq!(txt, seeded_text(seed_b, i), "Row {} text should be seed_b", i);
+        assert_eq!(
+            txt,
+            seeded_text(seed_b, i),
+            "Row {} text should be seed_b",
+            i
+        );
         assert!(
             (val - seeded_value(seed_b, i)).abs() < 1e-6,
             "Row {} value should be seed_b",
@@ -791,7 +926,8 @@ fn deterministic_update_verify() {
 #[ignore]
 fn deterministic_mixed_operations() {
     let mut db = AzureTestDb::new("det-mix");
-    db.execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY, txt TEXT)").unwrap();
+    db.execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY, txt TEXT)")
+        .unwrap();
 
     let seed_orig: u64 = 0x1111;
     let seed_upd: u64 = 0x2222;
@@ -819,7 +955,9 @@ fn deterministic_mixed_operations() {
     db.execute_batch("COMMIT").unwrap();
     db.reopen();
 
-    let count: i64 = db.query_row("SELECT COUNT(*) FROM t", [], |r| r.get(0)).unwrap();
+    let count: i64 = db
+        .query_row("SELECT COUNT(*) FROM t", [], |r| r.get(0))
+        .unwrap();
     assert_eq!(count, 500, "500 odd rows should remain");
 
     for i in (1..1000u64).step_by(2) {
@@ -834,13 +972,18 @@ fn deterministic_mixed_operations() {
 #[ignore]
 fn deterministic_checksum_validation() {
     let mut db = AzureTestDb::new("det-chk");
-    db.execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY, txt TEXT, val REAL)").unwrap();
+    db.execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY, txt TEXT, val REAL)")
+        .unwrap();
 
     db.execute_batch("BEGIN").unwrap();
     for i in 0..2000u64 {
         db.execute(
             "INSERT INTO t VALUES (?1, ?2, ?3)",
-            rusqlite::params![i as i64, seeded_text(TEST_SEED, i), seeded_value(TEST_SEED, i)],
+            rusqlite::params![
+                i as i64,
+                seeded_text(TEST_SEED, i),
+                seeded_value(TEST_SEED, i)
+            ],
         )
         .unwrap();
     }
@@ -854,7 +997,11 @@ fn deterministic_checksum_validation() {
         let mut hash: u64 = 0;
         let rows = stmt
             .query_map([], |r| {
-                Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, f64>(2)?))
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, f64>(2)?,
+                ))
             })
             .unwrap();
         for row in rows {
@@ -873,7 +1020,10 @@ fn deterministic_checksum_validation() {
     db.reopen();
     let checksum2 = compute_checksum(&db.conn);
 
-    assert_eq!(checksum1, checksum2, "Checksums must match across close/reopen (no silent corruption)");
+    assert_eq!(
+        checksum1, checksum2,
+        "Checksums must match across close/reopen (no silent corruption)"
+    );
 }
 
 // ===================================================================
@@ -893,9 +1043,14 @@ fn cache_reuse_skips_download_on_clean_reopen() {
     db.reopen_with_cache_reuse();
 
     let dl = get_download_count(&db.conn);
-    assert_eq!(dl, 0, "ETag match should skip download (download_count == 0)");
+    assert_eq!(
+        dl, 0,
+        "ETag match should skip download (download_count == 0)"
+    );
 
-    let v: String = db.query_row("SELECT v FROM t WHERE id=1", [], |r| r.get(0)).unwrap();
+    let v: String = db
+        .query_row("SELECT v FROM t WHERE id=1", [], |r| r.get(0))
+        .unwrap();
     assert_eq!(v, "cached");
 }
 
@@ -915,16 +1070,23 @@ fn cache_reuse_redownloads_when_blob_modified() {
     drop(db.conn);
     {
         let ext = open_azure(&uri_no_cache);
-        ext.execute("UPDATE t SET v='modified' WHERE id=1", []).unwrap();
+        ext.execute("UPDATE t SET v='modified' WHERE id=1", [])
+            .unwrap();
     }
 
     // Reopen with cache_reuse — ETag should be stale
     db.conn = open_azure(&uri_cr);
 
     let dl = get_download_count(&db.conn);
-    assert!(dl > 0, "ETag mismatch should trigger fresh download (got {})", dl);
+    assert!(
+        dl > 0,
+        "ETag mismatch should trigger fresh download (got {})",
+        dl
+    );
 
-    let v: String = db.query_row("SELECT v FROM t WHERE id=1", [], |r| r.get(0)).unwrap();
+    let v: String = db
+        .query_row("SELECT v FROM t WHERE id=1", [], |r| r.get(0))
+        .unwrap();
     assert_eq!(v, "modified", "Should see externally modified data");
 }
 
@@ -932,13 +1094,18 @@ fn cache_reuse_redownloads_when_blob_modified() {
 #[ignore]
 fn cache_reuse_data_integrity_after_reuse() {
     let mut db = AzureTestDb::new_with_cache_reuse("cr-int");
-    db.execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY, txt TEXT, val REAL)").unwrap();
+    db.execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY, txt TEXT, val REAL)")
+        .unwrap();
 
     db.execute_batch("BEGIN").unwrap();
     for i in 0..500u64 {
         db.execute(
             "INSERT INTO t VALUES (?1, ?2, ?3)",
-            rusqlite::params![i as i64, seeded_text(TEST_SEED, i), seeded_value(TEST_SEED, i)],
+            rusqlite::params![
+                i as i64,
+                seeded_text(TEST_SEED, i),
+                seeded_value(TEST_SEED, i)
+            ],
         )
         .unwrap();
     }
@@ -952,7 +1119,12 @@ fn cache_reuse_data_integrity_after_reuse() {
                 Ok((r.get(0)?, r.get(1)?))
             })
             .unwrap();
-        assert_eq!(txt, seeded_text(TEST_SEED, i), "Row {} text mismatch via cache reuse", i);
+        assert_eq!(
+            txt,
+            seeded_text(TEST_SEED, i),
+            "Row {} text mismatch via cache reuse",
+            i
+        );
         assert!(
             (val - seeded_value(TEST_SEED, i)).abs() < 1e-6,
             "Row {} value mismatch via cache reuse",
@@ -974,7 +1146,11 @@ fn cache_reuse_disabled_always_downloads() {
     db.reopen(); // reopen WITHOUT cache_reuse
 
     let dl = get_download_count(&db.conn);
-    assert!(dl > 0, "Without cache_reuse, should always download (got {})", dl);
+    assert!(
+        dl > 0,
+        "Without cache_reuse, should always download (got {})",
+        dl
+    );
 }
 
 #[test]
@@ -994,7 +1170,11 @@ fn cache_reuse_different_cache_dirs() {
 
     let conn = open_azure(&uri);
     let dl = get_download_count(&conn);
-    assert!(dl > 0, "Different cache dir means no cached file — should download (got {})", dl);
+    assert!(
+        dl > 0,
+        "Different cache dir means no cached file — should download (got {})",
+        dl
+    );
 }
 
 #[test]
@@ -1012,8 +1192,13 @@ fn cache_reuse_no_cache_dir_falls_back() {
     drop(db.conn);
 
     let conn = open_azure(&uri);
-    let v: String = conn.query_row("SELECT v FROM t WHERE id=1", [], |r| r.get(0)).unwrap();
-    assert_eq!(v, "fallback", "Data should be accessible with default cache path");
+    let v: String = conn
+        .query_row("SELECT v FROM t WHERE id=1", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(
+        v, "fallback",
+        "Data should be accessible with default cache path"
+    );
 }
 
 // ===================================================================
@@ -1024,7 +1209,8 @@ fn cache_reuse_no_cache_dir_falls_back() {
 #[ignore]
 fn grow_incremental_inserts() {
     let db = AzureTestDb::new("grow-inc");
-    db.execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)").unwrap();
+    db.execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)")
+        .unwrap();
 
     let mut total = 0i64;
     for batch in 0..10u64 {
@@ -1040,8 +1226,14 @@ fn grow_incremental_inserts() {
         db.execute_batch("COMMIT").unwrap();
         total += 100;
 
-        let count: i64 = db.query_row("SELECT COUNT(*) FROM t", [], |r| r.get(0)).unwrap();
-        assert_eq!(count, total, "After batch {}, expected {} rows", batch, total);
+        let count: i64 = db
+            .query_row("SELECT COUNT(*) FROM t", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            count, total,
+            "After batch {}, expected {} rows",
+            batch, total
+        );
     }
 }
 
@@ -1049,25 +1241,39 @@ fn grow_incremental_inserts() {
 #[ignore]
 fn grow_large_blob_data() {
     let mut db = AzureTestDb::new("grow-blob");
-    db.execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY, payload BLOB)").unwrap();
+    db.execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY, payload BLOB)")
+        .unwrap();
 
     db.execute_batch("BEGIN").unwrap();
     for i in 0..500u64 {
         let blob = seeded_blob(TEST_SEED, i, 4096);
-        db.execute("INSERT INTO t VALUES (?1, ?2)", rusqlite::params![i as i64, blob]).unwrap();
+        db.execute(
+            "INSERT INTO t VALUES (?1, ?2)",
+            rusqlite::params![i as i64, blob],
+        )
+        .unwrap();
     }
     db.execute_batch("COMMIT").unwrap();
     db.reopen();
 
-    let count: i64 = db.query_row("SELECT COUNT(*) FROM t", [], |r| r.get(0)).unwrap();
+    let count: i64 = db
+        .query_row("SELECT COUNT(*) FROM t", [], |r| r.get(0))
+        .unwrap();
     assert_eq!(count, 500, "All 500 BLOB rows should persist");
 
     // Spot-check
     for &i in &[0u64, 250, 499] {
         let b: Vec<u8> = db
-            .query_row("SELECT payload FROM t WHERE id=?1", [i as i64], |r| r.get(0))
+            .query_row("SELECT payload FROM t WHERE id=?1", [i as i64], |r| {
+                r.get(0)
+            })
             .unwrap();
-        assert_eq!(b, seeded_blob(TEST_SEED, i, 4096), "Blob row {} mismatch", i);
+        assert_eq!(
+            b,
+            seeded_blob(TEST_SEED, i, 4096),
+            "Blob row {} mismatch",
+            i
+        );
     }
 }
 
@@ -1075,7 +1281,8 @@ fn grow_large_blob_data() {
 #[ignore]
 fn shrink_delete_and_vacuum() {
     let mut db = AzureTestDb::new("shrink-vac");
-    db.execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT, padding TEXT)").unwrap();
+    db.execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT, padding TEXT)")
+        .unwrap();
 
     db.execute_batch("BEGIN").unwrap();
     for i in 0..2000u64 {
@@ -1100,8 +1307,13 @@ fn shrink_delete_and_vacuum() {
     );
 
     db.reopen();
-    let count: i64 = db.query_row("SELECT COUNT(*) FROM t", [], |r| r.get(0)).unwrap();
-    assert_eq!(count, 0, "Table should be empty after DELETE + VACUUM + reopen");
+    let count: i64 = db
+        .query_row("SELECT COUNT(*) FROM t", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(
+        count, 0,
+        "Table should be empty after DELETE + VACUUM + reopen"
+    );
 }
 
 #[test]
@@ -1109,8 +1321,10 @@ fn shrink_delete_and_vacuum() {
 fn shrink_incremental_vacuum() {
     let db = AzureTestDb::new("shrink-incr");
     // Must set auto_vacuum before creating tables
-    db.execute_batch("PRAGMA auto_vacuum = INCREMENTAL").unwrap();
-    db.execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT, padding TEXT)").unwrap();
+    db.execute_batch("PRAGMA auto_vacuum = INCREMENTAL")
+        .unwrap();
+    db.execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT, padding TEXT)")
+        .unwrap();
 
     db.execute_batch("BEGIN").unwrap();
     for i in 0..1000u64 {
@@ -1135,15 +1349,21 @@ fn shrink_incremental_vacuum() {
         pages_after
     );
 
-    let count: i64 = db.query_row("SELECT COUNT(*) FROM t", [], |r| r.get(0)).unwrap();
-    assert_eq!(count, 200, "200 remaining rows should be intact after incremental vacuum");
+    let count: i64 = db
+        .query_row("SELECT COUNT(*) FROM t", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(
+        count, 200,
+        "200 remaining rows should be intact after incremental vacuum"
+    );
 }
 
 #[test]
 #[ignore]
 fn grow_shrink_cycle() {
     let db = AzureTestDb::new("grow-shrink");
-    db.execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)").unwrap();
+    db.execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)")
+        .unwrap();
 
     for cycle in 0..3u64 {
         db.execute_batch("BEGIN").unwrap();
@@ -1156,13 +1376,25 @@ fn grow_shrink_cycle() {
         }
         db.execute_batch("COMMIT").unwrap();
 
-        let count: i64 = db.query_row("SELECT COUNT(*) FROM t", [], |r| r.get(0)).unwrap();
-        assert_eq!(count, 500, "Cycle {} should have 500 rows after insert", cycle);
+        let count: i64 = db
+            .query_row("SELECT COUNT(*) FROM t", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            count, 500,
+            "Cycle {} should have 500 rows after insert",
+            cycle
+        );
 
         db.execute_batch("DELETE FROM t; VACUUM;").unwrap();
 
-        let count: i64 = db.query_row("SELECT COUNT(*) FROM t", [], |r| r.get(0)).unwrap();
-        assert_eq!(count, 0, "Cycle {} should have 0 rows after delete+vacuum", cycle);
+        let count: i64 = db
+            .query_row("SELECT COUNT(*) FROM t", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            count, 0,
+            "Cycle {} should have 0 rows after delete+vacuum",
+            cycle
+        );
     }
 }
 
@@ -1187,15 +1419,21 @@ fn wal_basic_operations() {
     .unwrap();
 
     db.reopen();
-    let v: String = db.query_row("SELECT v FROM t WHERE id=1", [], |r| r.get(0)).unwrap();
-    assert_eq!(v, "wal-test", "Data should persist through WAL mode close/reopen");
+    let v: String = db
+        .query_row("SELECT v FROM t WHERE id=1", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(
+        v, "wal-test",
+        "Data should persist through WAL mode close/reopen"
+    );
 }
 
 #[test]
 #[ignore]
 fn wal_checkpoint_truncate() {
     let mut db = AzureTestDb::new("wal-chkpt");
-    db.execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)").unwrap();
+    db.execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)")
+        .unwrap();
 
     // 5 transactions
     for txn in 0..5u64 {
@@ -1225,8 +1463,13 @@ fn wal_checkpoint_truncate() {
     db.execute_batch("COMMIT").unwrap();
 
     db.reopen();
-    let count: i64 = db.query_row("SELECT COUNT(*) FROM t", [], |r| r.get(0)).unwrap();
-    assert_eq!(count, 120, "All 120 rows (pre+post checkpoint) should persist");
+    let count: i64 = db
+        .query_row("SELECT COUNT(*) FROM t", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(
+        count, 120,
+        "All 120 rows (pre+post checkpoint) should persist"
+    );
 }
 
 #[test]
@@ -1234,7 +1477,8 @@ fn wal_checkpoint_truncate() {
 fn wal_large_wal_before_checkpoint() {
     let mut db = AzureTestDb::new("wal-large");
     db.execute_batch("PRAGMA wal_autocheckpoint=0").unwrap(); // disable auto-checkpoint
-    db.execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)").unwrap();
+    db.execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)")
+        .unwrap();
 
     // 20 separate transactions accumulating WAL
     for txn in 0..20u64 {
@@ -1253,8 +1497,13 @@ fn wal_large_wal_before_checkpoint() {
     db.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
     db.reopen();
 
-    let count: i64 = db.query_row("SELECT COUNT(*) FROM t", [], |r| r.get(0)).unwrap();
-    assert_eq!(count, 500, "All 500 rows should survive large WAL + manual checkpoint");
+    let count: i64 = db
+        .query_row("SELECT COUNT(*) FROM t", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(
+        count, 500,
+        "All 500 rows should survive large WAL + manual checkpoint"
+    );
 }
 
 #[test]
@@ -1262,7 +1511,8 @@ fn wal_large_wal_before_checkpoint() {
 fn wal_low_autocheckpoint() {
     let mut db = AzureTestDb::new("wal-lowcp");
     db.execute_batch("PRAGMA wal_autocheckpoint=2").unwrap();
-    db.execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT, padding TEXT)").unwrap();
+    db.execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT, padding TEXT)")
+        .unwrap();
 
     // Many inserts → trigger frequent auto-checkpoints
     db.execute_batch("BEGIN").unwrap();
@@ -1276,7 +1526,9 @@ fn wal_low_autocheckpoint() {
     db.execute_batch("COMMIT").unwrap();
     db.reopen();
 
-    let count: i64 = db.query_row("SELECT COUNT(*) FROM t", [], |r| r.get(0)).unwrap();
+    let count: i64 = db
+        .query_row("SELECT COUNT(*) FROM t", [], |r| r.get(0))
+        .unwrap();
     assert_eq!(count, 200, "Frequent auto-checkpoints should not lose data");
 }
 
@@ -1284,11 +1536,15 @@ fn wal_low_autocheckpoint() {
 #[ignore]
 fn wal_reopen_after_wal_exists() {
     let db = AzureTestDb::new("wal-recover");
-    db.execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)").unwrap();
+    db.execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)")
+        .unwrap();
 
     for i in 0..50u64 {
-        db.execute("INSERT INTO t VALUES (?1, ?2)", rusqlite::params![i as i64, seeded_text(TEST_SEED, i)])
-            .unwrap();
+        db.execute(
+            "INSERT INTO t VALUES (?1, ?2)",
+            rusqlite::params![i as i64, seeded_text(TEST_SEED, i)],
+        )
+        .unwrap();
     }
 
     // Normal drop (no explicit checkpoint) — WAL file may still exist on blob.
@@ -1307,7 +1563,9 @@ fn wal_reopen_after_wal_exists() {
         .cache_dir(cache_dir_path.to_str().unwrap())
         .build();
     let conn = open_azure(&reopen_uri);
-    let count: i64 = conn.query_row("SELECT COUNT(*) FROM t", [], |r| r.get(0)).unwrap();
+    let count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM t", [], |r| r.get(0))
+        .unwrap();
     assert_eq!(count, 50, "WAL recovery should replay all committed data");
     let _ = uri;
 }
@@ -1352,13 +1610,16 @@ fn thread_separate_blobs_parallel() {
                 .unwrap();
             }
 
-            let count: i64 = conn.query_row("SELECT COUNT(*) FROM t", [], |r| r.get(0)).unwrap();
+            let count: i64 = conn
+                .query_row("SELECT COUNT(*) FROM t", [], |r| r.get(0))
+                .unwrap();
             assert_eq!(count, 100, "Thread {} should have 100 rows", t);
 
             // Verify deterministic data
             for i in 0..100u64 {
-                let v: String =
-                    conn.query_row("SELECT v FROM t WHERE id=?1", [i as i64], |r| r.get(0)).unwrap();
+                let v: String = conn
+                    .query_row("SELECT v FROM t WHERE id=?1", [i as i64], |r| r.get(0))
+                    .unwrap();
                 assert_eq!(v, seeded_text(t as u64 * 1000, i));
             }
         }));
@@ -1380,9 +1641,16 @@ fn thread_sequential_access_same_blob() {
 
     // Thread 1: create and write batch 1
     {
-        let (acc, cont, s, bn) = (account.clone(), container.clone(), sas.clone(), blob_name.clone());
+        let (acc, cont, s, bn) = (
+            account.clone(),
+            container.clone(),
+            sas.clone(),
+            blob_name.clone(),
+        );
         thread::spawn(move || {
-            let uri = sqlite_objs::UriBuilder::new(&bn, &acc, &cont).sas_token(&s).build();
+            let uri = sqlite_objs::UriBuilder::new(&bn, &acc, &cont)
+                .sas_token(&s)
+                .build();
             let conn = open_azure(&uri);
             conn.execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)")
                 .unwrap();
@@ -1400,9 +1668,16 @@ fn thread_sequential_access_same_blob() {
 
     // Thread 2: write batch 2
     {
-        let (acc, cont, s, bn) = (account.clone(), container.clone(), sas.clone(), blob_name.clone());
+        let (acc, cont, s, bn) = (
+            account.clone(),
+            container.clone(),
+            sas.clone(),
+            blob_name.clone(),
+        );
         thread::spawn(move || {
-            let uri = sqlite_objs::UriBuilder::new(&bn, &acc, &cont).sas_token(&s).build();
+            let uri = sqlite_objs::UriBuilder::new(&bn, &acc, &cont)
+                .sas_token(&s)
+                .build();
             let conn = open_azure(&uri);
             for i in 50..100u64 {
                 conn.execute(
@@ -1421,8 +1696,13 @@ fn thread_sequential_access_same_blob() {
         .sas_token(&sas)
         .build();
     let conn = open_azure(&uri);
-    let count: i64 = conn.query_row("SELECT COUNT(*) FROM t", [], |r| r.get(0)).unwrap();
-    assert_eq!(count, 100, "Sequential thread access should produce 100 rows");
+    let count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM t", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(
+        count, 100,
+        "Sequential thread access should produce 100 rows"
+    );
 }
 
 #[test]
@@ -1431,14 +1711,18 @@ fn thread_connection_send_to_worker() {
     use std::thread;
 
     let db = AzureTestDb::new("thr-send");
-    db.execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)").unwrap();
+    db.execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)")
+        .unwrap();
     db.execute("INSERT INTO t VALUES (1, 'main')", []).unwrap();
 
     // Move connection to worker thread
     let conn = db.conn;
     let returned_conn = thread::spawn(move || {
-        conn.execute("INSERT INTO t VALUES (2, 'worker')", []).unwrap();
-        let count: i64 = conn.query_row("SELECT COUNT(*) FROM t", [], |r| r.get(0)).unwrap();
+        conn.execute("INSERT INTO t VALUES (2, 'worker')", [])
+            .unwrap();
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM t", [], |r| r.get(0))
+            .unwrap();
         assert_eq!(count, 2, "Worker thread should see 2 rows");
         conn
     })
@@ -1448,7 +1732,10 @@ fn thread_connection_send_to_worker() {
     let count: i64 = returned_conn
         .query_row("SELECT COUNT(*) FROM t", [], |r| r.get(0))
         .unwrap();
-    assert_eq!(count, 2, "Main thread should see 2 rows after getting connection back");
+    assert_eq!(
+        count, 2,
+        "Main thread should see 2 rows after getting connection back"
+    );
 }
 
 #[test]
@@ -1467,7 +1754,8 @@ fn thread_parallel_reads_same_blob() {
             .sas_token(&sas)
             .build();
         let conn = open_azure(&uri);
-        conn.execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)").unwrap();
+        conn.execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)")
+            .unwrap();
         conn.execute_batch("BEGIN").unwrap();
         for i in 0..1000u64 {
             conn.execute(
@@ -1486,20 +1774,30 @@ fn thread_parallel_reads_same_blob() {
 
     for _ in 0..num_readers {
         let barrier = barrier.clone();
-        let (acc, cont, s, bn) = (account.clone(), container.clone(), sas.clone(), blob_name.clone());
+        let (acc, cont, s, bn) = (
+            account.clone(),
+            container.clone(),
+            sas.clone(),
+            blob_name.clone(),
+        );
 
         handles.push(thread::spawn(move || {
-            let uri = sqlite_objs::UriBuilder::new(&bn, &acc, &cont).sas_token(&s).build();
+            let uri = sqlite_objs::UriBuilder::new(&bn, &acc, &cont)
+                .sas_token(&s)
+                .build();
             barrier.wait();
             let conn = open_azure(&uri);
 
-            let count: i64 = conn.query_row("SELECT COUNT(*) FROM t", [], |r| r.get(0)).unwrap();
+            let count: i64 = conn
+                .query_row("SELECT COUNT(*) FROM t", [], |r| r.get(0))
+                .unwrap();
             assert_eq!(count, 1000);
 
             // Verify a sample
             for &i in &[0u64, 333, 666, 999] {
-                let v: String =
-                    conn.query_row("SELECT v FROM t WHERE id=?1", [i as i64], |r| r.get(0)).unwrap();
+                let v: String = conn
+                    .query_row("SELECT v FROM t WHERE id=?1", [i as i64], |r| r.get(0))
+                    .unwrap();
                 assert_eq!(v, seeded_text(TEST_SEED, i));
             }
         }));
@@ -1540,8 +1838,9 @@ fn thread_stress_many_blobs() {
                 )
                 .unwrap();
 
-                let count: i64 =
-                    conn.query_row("SELECT COUNT(*) FROM t", [], |r| r.get(0)).unwrap();
+                let count: i64 = conn
+                    .query_row("SELECT COUNT(*) FROM t", [], |r| r.get(0))
+                    .unwrap();
                 assert_eq!(count, c as i64 + 1);
             }
         }));
@@ -1582,8 +1881,14 @@ fn thread_vfs_registration_once() {
             conn.execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY)")
                 .unwrap();
             conn.execute("INSERT INTO t VALUES (1)", []).unwrap();
-            let v: i64 = conn.query_row("SELECT id FROM t", [], |r| r.get(0)).unwrap();
-            assert_eq!(v, 1, "Thread {} should work after concurrent registration", t);
+            let v: i64 = conn
+                .query_row("SELECT id FROM t", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(
+                v, 1,
+                "Thread {} should work after concurrent registration",
+                t
+            );
         }));
     }
 
@@ -1616,16 +1921,22 @@ fn dirty_shutdown_drop_without_close() {
         )
         .unwrap();
         for i in 0..50u64 {
-            conn.execute("INSERT INTO t VALUES (?1, ?2)", rusqlite::params![i as i64, seeded_text(100, i)])
-                .unwrap();
+            conn.execute(
+                "INSERT INTO t VALUES (?1, ?2)",
+                rusqlite::params![i as i64, seeded_text(100, i)],
+            )
+            .unwrap();
         }
         conn.execute_batch("COMMIT").unwrap();
 
         // Start uncommitted transaction
         conn.execute_batch("BEGIN").unwrap();
         for i in 50..100u64 {
-            conn.execute("INSERT INTO t VALUES (?1, ?2)", rusqlite::params![i as i64, seeded_text(200, i)])
-                .unwrap();
+            conn.execute(
+                "INSERT INTO t VALUES (?1, ?2)",
+                rusqlite::params![i as i64, seeded_text(200, i)],
+            )
+            .unwrap();
         }
         // DROP without COMMIT — Rust drop triggers xClose
     }
@@ -1636,8 +1947,13 @@ fn dirty_shutdown_drop_without_close() {
         .cache_dir(cache_dir.path().to_str().unwrap())
         .build();
     let conn = open_azure(&uri);
-    let count: i64 = conn.query_row("SELECT COUNT(*) FROM t", [], |r| r.get(0)).unwrap();
-    assert_eq!(count, 50, "Only committed rows (50) should survive dirty shutdown");
+    let count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM t", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(
+        count, 50,
+        "Only committed rows (50) should survive dirty shutdown"
+    );
 }
 
 #[test]
@@ -1688,15 +2004,25 @@ fn dirty_shutdown_committed_data_survives() {
         .cache_dir(cache_dir.path().to_str().unwrap())
         .build();
     let conn = open_azure(&uri);
-    let count: i64 = conn.query_row("SELECT COUNT(*) FROM t", [], |r| r.get(0)).unwrap();
-    assert_eq!(count, 300, "Exactly 300 committed rows should survive (3 txns × 100)");
+    let count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM t", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(
+        count, 300,
+        "Exactly 300 committed rows should survive (3 txns × 100)"
+    );
 
     // Verify deterministic values
     for i in 0..300u64 {
         let v: String = conn
             .query_row("SELECT v FROM t WHERE id=?1", [i as i64], |r| r.get(0))
             .unwrap();
-        assert_eq!(v, seeded_text(TEST_SEED, i), "Row {} mismatch after dirty shutdown", i);
+        assert_eq!(
+            v,
+            seeded_text(TEST_SEED, i),
+            "Row {} mismatch after dirty shutdown",
+            i
+        );
     }
 }
 
@@ -1748,7 +2074,9 @@ fn dirty_shutdown_wal_recovery() {
         .cache_dir(cache_dir.path().to_str().unwrap())
         .build();
     let conn = open_azure(&uri);
-    let count: i64 = conn.query_row("SELECT COUNT(*) FROM t", [], |r| r.get(0)).unwrap();
+    let count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM t", [], |r| r.get(0))
+        .unwrap();
     assert_eq!(count, 100, "WAL recovery: 5 committed txns × 20 rows = 100");
 }
 
@@ -1800,8 +2128,13 @@ fn dirty_shutdown_rapid_reconnect() {
 
     // Verify
     let conn = open_azure(&build_uri());
-    let count: i64 = conn.query_row("SELECT COUNT(*) FROM t", [], |r| r.get(0)).unwrap();
-    assert_eq!(count, 200, "Rapid reconnect after dirty shutdown should yield 200 rows");
+    let count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM t", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(
+        count, 200,
+        "Rapid reconnect after dirty shutdown should yield 200 rows"
+    );
 }
 
 // ===================================================================
@@ -1868,7 +2201,8 @@ fn schema_alter_table() {
 
     db.execute_batch("ALTER TABLE t ADD COLUMN age INTEGER DEFAULT 0")
         .unwrap();
-    db.execute("INSERT INTO t VALUES (2, 'Bob', 30)", []).unwrap();
+    db.execute("INSERT INTO t VALUES (2, 'Bob', 30)", [])
+        .unwrap();
 
     db.reopen();
 
@@ -1895,11 +2229,14 @@ fn pragma_persistence() {
     // page_size and auto_vacuum must be set before ANY writes (including WAL creation).
     // configure_azure() already set journal_mode=WAL which writes to the db,
     // so auto_vacuum can't be changed after that. Test pragmas that DO persist.
-    db.execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY)").unwrap();
+    db.execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY)")
+        .unwrap();
 
     db.reopen();
 
-    let jm: String = db.query_row("PRAGMA journal_mode", [], |r| r.get(0)).unwrap();
+    let jm: String = db
+        .query_row("PRAGMA journal_mode", [], |r| r.get(0))
+        .unwrap();
     assert_eq!(
         jm.to_lowercase(),
         "wal",
@@ -1909,7 +2246,9 @@ fn pragma_persistence() {
     // user_version is an application-settable persistent pragma
     db.execute_batch("PRAGMA user_version = 42").unwrap();
     db.reopen();
-    let uv: i64 = db.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
+    let uv: i64 = db
+        .query_row("PRAGMA user_version", [], |r| r.get(0))
+        .unwrap();
     assert_eq!(uv, 42, "user_version should persist across reopen");
 }
 
@@ -1931,12 +2270,14 @@ fn schema_attach_not_supported() {
 
     // Create primary DB
     let conn = open_azure(&uri1);
-    conn.execute_batch("CREATE TABLE main_t (id INTEGER PRIMARY KEY)").unwrap();
+    conn.execute_batch("CREATE TABLE main_t (id INTEGER PRIMARY KEY)")
+        .unwrap();
 
     // Create secondary DB
     {
         let c2 = open_azure(&uri2);
-        c2.execute_batch("CREATE TABLE other_t (id INTEGER PRIMARY KEY)").unwrap();
+        c2.execute_batch("CREATE TABLE other_t (id INTEGER PRIMARY KEY)")
+            .unwrap();
     }
 
     // Attempt ATTACH — document current behavior (either works or returns an error)
@@ -1945,10 +2286,7 @@ fn schema_attach_not_supported() {
 
     if let Err(e) = result {
         // ATTACH not supported is acceptable — just verify no crash
-        eprintln!(
-            "ATTACH returned error (expected for Azure VFS): {}",
-            e
-        );
+        eprintln!("ATTACH returned error (expected for Azure VFS): {}", e);
     } else {
         // If it works, verify we can use it
         let count: i64 = conn
@@ -1956,4 +2294,234 @@ fn schema_attach_not_supported() {
             .unwrap();
         assert_eq!(count, 0, "Attached DB should have 0 rows");
     }
+}
+
+// ===================================================================
+// Category 10: Concurrent Client Contention
+// ===================================================================
+
+/// Many independent clients connect to the same Azure blob simultaneously and
+/// each atomically increments a shared counter.  This exercises real distributed
+/// lease contention — each thread opens its own `Connection::open()` with its
+/// own cache directory, so they contend on the Azure blob lease rather than
+/// sharing an in-process lock or a local cache file.
+///
+/// **How it works:**
+///
+/// The VFS downloads the blob at `xOpen` and acquires the Azure blob lease at
+/// `xLock(RESERVED)` (triggered by `BEGIN IMMEDIATE`).  We set `busy_timeout=0`
+/// so that a lease conflict (HTTP 409 → `SQLITE_BUSY`) surfaces immediately to
+/// our Rust code instead of being absorbed by SQLite's built-in busy handler.
+/// On failure, we drop the stale connection and open a fresh one — which
+/// re-downloads the blob with the latest data — then retry.  This ensures every
+/// successful commit reads from a fresh download, preventing lost updates.
+///
+/// A `Barrier` synchronises the first attempt across all threads to maximise
+/// the probability of genuine lease contention on the very first round.
+#[test]
+#[ignore]
+fn concurrent_client_contention() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Barrier};
+    use std::thread;
+    use std::time::{Duration, Instant};
+
+    init();
+    let (account, container, sas) = azure_env();
+    let blob_name = format!("vfstest-contention-{}.db", Uuid::new_v4());
+
+    // --- Setup: create the database with counters table, value=0 ---
+    {
+        let setup_cache = TempDir::new().unwrap();
+        let uri = sqlite_objs::UriBuilder::new(&blob_name, &account, &container)
+            .sas_token(&sas)
+            .cache_dir(setup_cache.path().to_str().unwrap())
+            .build();
+        let conn = open_azure(&uri);
+        conn.execute_batch(
+            "CREATE TABLE counters (id INTEGER PRIMARY KEY, value INTEGER);
+             INSERT INTO counters (id, value) VALUES (1, 0);",
+        )
+        .unwrap();
+    }
+
+    // --- Concurrent increment phase ---
+    //
+    // Each thread gets its own cache directory per attempt so that every
+    // Connection::open() independently downloads the blob from Azure.
+    // The Azure blob lease is the sole coordinator — this simulates truly
+    // independent clients on different machines.
+    let num_threads: usize = 20;
+    let success_count = Arc::new(AtomicUsize::new(0));
+    let barrier = Arc::new(Barrier::new(num_threads));
+    let mut handles = Vec::with_capacity(num_threads);
+
+    for t in 0..num_threads {
+        let (acc, cont, s, bn) = (
+            account.clone(),
+            container.clone(),
+            sas.clone(),
+            blob_name.clone(),
+        );
+        let success_count = success_count.clone();
+        let barrier = barrier.clone();
+
+        handles.push(thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(120);
+            let mut rng_state: u64 = (t as u64).wrapping_mul(6364136223846793005).wrapping_add(1);
+            let mut attempts: u32 = 0;
+            let mut first_attempt = true;
+
+            loop {
+                if Instant::now() >= deadline {
+                    panic!(
+                        "Thread {} timed out after {} attempts without successful commit",
+                        t, attempts
+                    );
+                }
+                attempts += 1;
+
+                // Fresh cache directory per attempt — forces a new blob download
+                // so we always read the latest committed state from Azure.
+                let thread_cache = TempDir::new().expect("Failed to create per-thread cache dir");
+                let uri = sqlite_objs::UriBuilder::new(&bn, &acc, &cont)
+                    .sas_token(&s)
+                    .cache_dir(thread_cache.path().to_str().unwrap())
+                    .build();
+
+                let conn =
+                    match Connection::open_with_flags_and_vfs(&uri, RW_CREATE_URI, "sqlite-objs") {
+                        Ok(c) => c,
+                        Err(_) => {
+                            if first_attempt {
+                                barrier.wait();
+                                first_attempt = false;
+                            }
+                            backoff(&mut rng_state, attempts);
+                            continue;
+                        }
+                    };
+
+                // busy_timeout=0: surface SQLITE_BUSY immediately so we retry
+                // with a fresh connection (fresh download) rather than letting
+                // SQLite's busy handler spin on a stale local copy.
+                if conn
+                    .execute_batch(
+                        "PRAGMA locking_mode=EXCLUSIVE;
+                         PRAGMA journal_mode=WAL;
+                         PRAGMA synchronous=NORMAL;
+                         PRAGMA busy_timeout=0;",
+                    )
+                    .is_err()
+                {
+                    if first_attempt {
+                        barrier.wait();
+                        first_attempt = false;
+                    }
+                    backoff(&mut rng_state, attempts);
+                    continue;
+                }
+
+                // Synchronise the first attempt across all threads so they
+                // hit BEGIN IMMEDIATE (lease acquisition) at the same moment.
+                if first_attempt {
+                    barrier.wait();
+                    first_attempt = false;
+                }
+
+                // Atomic read-increment-write inside BEGIN IMMEDIATE
+                let txn_result = (|| -> Result<(), rusqlite::Error> {
+                    conn.execute_batch("BEGIN IMMEDIATE")?;
+
+                    let current: i64 =
+                        conn.query_row("SELECT value FROM counters WHERE id = 1", [], |row| {
+                            row.get(0)
+                        })?;
+
+                    conn.execute("UPDATE counters SET value = ?1 WHERE id = 1", [current + 1])?;
+
+                    conn.execute_batch("COMMIT")?;
+                    Ok(())
+                })();
+
+                match txn_result {
+                    Ok(()) => {
+                        // Drop connection before cache dir so the VFS upload
+                        // completes while local files still exist.
+                        drop(conn);
+                        drop(thread_cache);
+                        success_count.fetch_add(1, Ordering::Relaxed);
+                        return (t, attempts);
+                    }
+                    Err(_) => {
+                        let _ = conn.execute_batch("ROLLBACK");
+                        drop(conn);
+                        drop(thread_cache);
+                        backoff(&mut rng_state, attempts);
+                    }
+                }
+            }
+        }));
+    }
+
+    // --- Collect results ---
+    let mut results: Vec<(usize, u32)> = Vec::with_capacity(num_threads);
+    for h in handles {
+        results.push(h.join().expect("Worker thread panicked"));
+    }
+
+    // Log per-thread attempt counts for diagnostics
+    results.sort_by_key(|(id, _)| *id);
+    let total_attempts: u32 = results.iter().map(|(_, a)| *a).sum();
+    for (id, attempts) in &results {
+        eprintln!(
+            "  Thread {:>2}: succeeded after {} attempt(s)",
+            id, attempts
+        );
+    }
+    eprintln!(
+        "  Total: {} attempts for {} threads ({:.1} avg)",
+        total_attempts,
+        num_threads,
+        total_attempts as f64 / num_threads as f64
+    );
+
+    // --- Validation ---
+    assert_eq!(
+        success_count.load(Ordering::Relaxed),
+        num_threads,
+        "All threads must complete successfully"
+    );
+
+    // Read final counter from a fresh connection
+    let verify_cache = TempDir::new().unwrap();
+    let uri = sqlite_objs::UriBuilder::new(&blob_name, &account, &container)
+        .sas_token(&sas)
+        .cache_dir(verify_cache.path().to_str().unwrap())
+        .build();
+    let conn = open_azure(&uri);
+    let final_value: i64 = conn
+        .query_row("SELECT value FROM counters WHERE id = 1", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+
+    assert_eq!(
+        final_value, num_threads as i64,
+        "Final counter must equal number of threads (no lost updates)"
+    );
+}
+
+/// Pseudo-random backoff with jitter.  Uses a simple LCG so we don't need the `rand` crate.
+fn backoff(rng_state: &mut u64, attempt: u32) {
+    *rng_state = rng_state
+        .wrapping_mul(6364136223846793005)
+        .wrapping_add(1442695040888963407);
+    let jitter_ms = (*rng_state >> 33) % 50;
+
+    // Exponential backoff capped at 2 seconds, plus jitter
+    let base_ms = std::cmp::min(50 * (1u64 << std::cmp::min(attempt, 6)), 2000);
+    let sleep_ms = base_ms + jitter_ms;
+
+    std::thread::sleep(std::time::Duration::from_millis(sleep_ms));
 }

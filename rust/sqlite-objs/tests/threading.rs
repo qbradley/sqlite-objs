@@ -37,18 +37,15 @@ fn test_two_threads_separate_databases() {
     // Thread A
     let handle_a = thread::spawn(move || {
         barrier_a.wait();
-        
+
         let conn = Connection::open_with_flags(
             &path_a,
             OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_CREATE,
         )
         .expect("Thread A failed to open database");
 
-        conn.execute(
-            "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)",
-            [],
-        )
-        .expect("Thread A failed to create table");
+        conn.execute("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)", [])
+            .expect("Thread A failed to create table");
 
         conn.execute("INSERT INTO users (name) VALUES (?1)", ["Alice"])
             .expect("Thread A failed to insert");
@@ -64,7 +61,7 @@ fn test_two_threads_separate_databases() {
     // Thread B
     let handle_b = thread::spawn(move || {
         barrier_b.wait();
-        
+
         let conn = Connection::open_with_flags(
             &path_b,
             OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_CREATE,
@@ -120,11 +117,7 @@ fn test_multiple_threads_mutex_sequential() {
 
     // Wrap connection in Arc<Mutex<>> for sharing
     let conn = Arc::new(Mutex::new(
-        Connection::open_with_flags(
-            &db_path,
-            OpenFlags::SQLITE_OPEN_READ_WRITE,
-        )
-        .unwrap(),
+        Connection::open_with_flags(&db_path, OpenFlags::SQLITE_OPEN_READ_WRITE).unwrap(),
     ));
 
     let thread_count = 4;
@@ -135,7 +128,7 @@ fn test_multiple_threads_mutex_sequential() {
         let handle = thread::spawn(move || {
             // Lock the connection for this thread
             let conn = conn.lock().unwrap();
-            
+
             // Read current value
             let value: i32 = conn
                 .query_row("SELECT value FROM counters WHERE id = 1", [], |row| {
@@ -160,7 +153,9 @@ fn test_multiple_threads_mutex_sequential() {
     // Verify final value
     let conn = conn.lock().unwrap();
     let final_value: i32 = conn
-        .query_row("SELECT value FROM counters WHERE id = 1", [], |row| row.get(0))
+        .query_row("SELECT value FROM counters WHERE id = 1", [], |row| {
+            row.get(0)
+        })
         .unwrap();
 
     assert_eq!(
@@ -199,13 +194,13 @@ fn test_multiple_threads_separate_connections() {
 
         let handle = thread::spawn(move || {
             barrier.wait();
-            
+
             // Each thread opens its own connection
             let conn = Connection::open_with_flags(
                 &path,
                 OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_CREATE,
             )
-            .expect(&format!("Thread {} failed to open connection", i));
+            .unwrap_or_else(|_| panic!("Thread {} failed to open connection", i));
 
             // Create a unique table for this thread
             let table_name = format!("thread_{}_data", i);
@@ -216,33 +211,31 @@ fn test_multiple_threads_separate_connections() {
                 ),
                 [],
             )
-            .expect(&format!("Thread {} failed to create table", i));
+            .unwrap_or_else(|_| panic!("Thread {} failed to create table", i));
 
             // Insert data
             conn.execute(
                 &format!("INSERT INTO {} (value) VALUES (?1)", table_name),
                 [format!("Data from thread {}", i)],
             )
-            .expect(&format!("Thread {} failed to insert", i));
+            .unwrap_or_else(|_| panic!("Thread {} failed to insert", i));
 
             // Record in shared table
             conn.execute(
                 "INSERT INTO threads (thread_id, table_name) VALUES (?1, ?2)",
                 [&i.to_string(), &table_name],
             )
-            .expect(&format!("Thread {} failed to insert into shared table", i));
+            .unwrap_or_else(|_| panic!("Thread {} failed to insert into shared table", i));
 
             // Verify our data
             let count: i32 = conn
-                .query_row(
-                    &format!("SELECT COUNT(*) FROM {}", table_name),
-                    [],
-                    |row| row.get(0),
-                )
-                .expect(&format!("Thread {} failed to query", i));
+                .query_row(&format!("SELECT COUNT(*) FROM {}", table_name), [], |row| {
+                    row.get(0)
+                })
+                .unwrap_or_else(|_| panic!("Thread {} failed to query", i));
 
             assert_eq!(count, 1, "Thread {} should have 1 row", i);
-            
+
             i
         });
         handles.push(handle);
@@ -300,19 +293,20 @@ fn test_stress_many_threads() {
         let path = path_str.clone();
 
         let handle = thread::spawn(move || {
-            let conn = Connection::open_with_flags(
-                &path,
-                OpenFlags::SQLITE_OPEN_READ_WRITE,
-            )
-            .expect(&format!("Thread {} failed to open", thread_id));
+            let conn = Connection::open_with_flags(&path, OpenFlags::SQLITE_OPEN_READ_WRITE)
+                .unwrap_or_else(|_| panic!("Thread {} failed to open", thread_id));
 
             for iter in 0..iterations_per_thread {
                 // Insert
                 conn.execute(
                     "INSERT INTO stress_test (thread_id, iteration, value) VALUES (?1, ?2, ?3)",
-                    [&thread_id.to_string(), &iter.to_string(), &format!("t{}i{}", thread_id, iter)],
+                    [
+                        &thread_id.to_string(),
+                        &iter.to_string(),
+                        &format!("t{}i{}", thread_id, iter),
+                    ],
                 )
-                .expect(&format!("Thread {} iter {} failed to insert", thread_id, iter));
+                .unwrap_or_else(|_| panic!("Thread {} iter {} failed to insert", thread_id, iter));
 
                 // Read back
                 let count: i32 = conn
@@ -321,9 +315,18 @@ fn test_stress_many_threads() {
                         [thread_id],
                         |row| row.get(0),
                     )
-                    .expect(&format!("Thread {} iter {} failed to query", thread_id, iter));
+                    .unwrap_or_else(|_| {
+                        panic!("Thread {} iter {} failed to query", thread_id, iter)
+                    });
 
-                assert_eq!(count, iter + 1, "Thread {} should have {} rows at iteration {}", thread_id, iter + 1, iter);
+                assert_eq!(
+                    count,
+                    iter + 1,
+                    "Thread {} should have {} rows at iteration {}",
+                    thread_id,
+                    iter + 1,
+                    iter
+                );
             }
 
             thread_id
@@ -344,7 +347,7 @@ fn test_stress_many_threads() {
 
     assert_eq!(
         total,
-        (thread_count * iterations_per_thread) as i32,
+        thread_count * iterations_per_thread,
         "Should have exactly {} rows",
         thread_count * iterations_per_thread
     );
@@ -376,7 +379,7 @@ fn test_connection_send_trait() {
             .unwrap();
 
         assert_eq!(count, 2, "Should have 2 rows");
-        
+
         // Return connection ownership back to main thread
         conn
     });

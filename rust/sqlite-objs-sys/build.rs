@@ -98,10 +98,28 @@ fn main() {
     }
 
     // Tell cargo to recompile if C sources change
-    println!("cargo:rerun-if-changed={}", src_dir.join("sqlite_objs_vfs.c").display());
-    println!("cargo:rerun-if-changed={}", src_dir.join("azure_client.c").display());
-    println!("cargo:rerun-if-changed={}", src_dir.join("azure_auth.c").display());
-    println!("cargo:rerun-if-changed={}", src_dir.join("azure_error.c").display());
-    println!("cargo:rerun-if-changed={}", src_dir.join("sqlite_objs.h").display());
-    println!("cargo:rerun-if-changed={}", src_dir.join("azure_client.h").display());
+    println!(
+        "cargo:rerun-if-changed={}",
+        src_dir.join("sqlite_objs_vfs.c").display()
+    );
+    println!(
+        "cargo:rerun-if-changed={}",
+        src_dir.join("azure_client.c").display()
+    );
+    println!(
+        "cargo:rerun-if-changed={}",
+        src_dir.join("azure_auth.c").display()
+    );
+    println!(
+        "cargo:rerun-if-changed={}",
+        src_dir.join("azure_error.c").display()
+    );
+    println!(
+        "cargo:rerun-if-changed={}",
+        src_dir.join("sqlite_objs.h").display()
+    );
+    println!(
+        "cargo:rerun-if-changed={}",
+        src_dir.join("azure_client.h").display()
+    );
 }

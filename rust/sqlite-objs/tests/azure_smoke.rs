@@ -6,8 +6,9 @@
 //! Run with: cargo test --test azure_smoke
 //! Skip with: cargo test (these are ignored by default)
 
-use sqlite_objs::SqliteObjsVfs;
 use rusqlite::{Connection, OpenFlags};
+use sqlite_objs::SqliteObjsVfs;
+use std::f64::consts::{E, PI};
 use std::sync::Once;
 
 static REGISTER_VFS: Once = Once::new();
@@ -26,7 +27,10 @@ fn azure_uri(blob_name: &str) -> String {
     let sas = std::env::var("AZURE_STORAGE_SAS").expect("AZURE_STORAGE_SAS must be set");
 
     // Percent-encode the SAS token for URI safety
-    let encoded_sas = sas.replace('%', "%25").replace('&', "%26").replace('=', "%3D");
+    let encoded_sas = sas
+        .replace('%', "%25")
+        .replace('&', "%26")
+        .replace('=', "%3D");
 
     format!(
         "file:{blob_name}?azure_account={account}&azure_container={container}&azure_sas={encoded_sas}"
@@ -72,13 +76,13 @@ fn smoke_create_table_insert_query() {
     // Insert rows
     conn.execute(
         "INSERT INTO smoke_test (id, name, value) VALUES (?1, ?2, ?3)",
-        rusqlite::params![1, "alpha", 3.14],
+        rusqlite::params![1, "alpha", PI],
     )
     .expect("INSERT 1 failed");
 
     conn.execute(
         "INSERT INTO smoke_test (id, name, value) VALUES (?1, ?2, ?3)",
-        rusqlite::params![2, "beta", 2.718],
+        rusqlite::params![2, "beta", E],
     )
     .expect("INSERT 2 failed");
 
@@ -94,8 +98,8 @@ fn smoke_create_table_insert_query() {
         .collect();
 
     assert_eq!(rows.len(), 2);
-    assert_eq!(rows[0], (1, "alpha".to_string(), 3.14));
-    assert_eq!(rows[1], (2, "beta".to_string(), 2.718));
+    assert_eq!(rows[0], (1, "alpha".to_string(), PI));
+    assert_eq!(rows[1], (2, "beta".to_string(), E));
 
     // Clean up
     conn.execute_batch("DROP TABLE smoke_test")
