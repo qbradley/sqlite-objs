@@ -2861,3 +2861,677 @@ All 6 failures are platform/config issues — **zero VFS bugs found**.
 - Added `rm -rf testdir` cleanup between test runs (prevents cascading failures)
 - Expanded quick test subset from 5 to 10 tests
 - Tests organized by 78 categories with comments
+
+# Decision: If-Match Header Signature Fix
+
+**Date**: 2025-01-09  
+**Author**: Aragorn (SQLite/C Dev)  
+**Status**: Implemented
+
+## Context
+
+All 32 VFS integration tests were failing with "disk I/O error" (SQLITE_IOERR) due to Azure Blob Storage returning 403 Forbidden errors. The 8 raw Azure client tests were passing, indicating the issue was in the VFS layer's use of If-Match headers for ETag-based compare-and-swap operations.
+
+## Problem
+
+The If-Match header added in recent changes was corrupting the Azure SharedKey authentication signature. The header was being incorrectly placed in the `extra_x_ms` array, which caused:
+1. If-Match to appear in the canonicalized headers section (only `x-ms-*` headers belong there)
+2. The standard If-Match position in the signing string to always be empty
+
+Result: signature mismatch → 403 Forbidden → SQLITE_IOERR
+
+## Decision
+
+**Add standard HTTP headers as explicit parameters through the auth chain, NOT as part of `extra_x_ms`.**
+
+### Changes Made
+
+1. **`src/azure_auth.c` & `src/azure_client_impl.h`**:
+   - Added `const char *if_match` parameter to `azure_auth_sign_request()`
+   - Used it at line 193 of signing string construction
+
+2. **`src/azure_client.c` - `execute_single()` and `execute_with_retry()`**:
+   - Added `const char *if_match` parameter (now 13 parameters for execute_with_retry)
+   - Passed to `azure_auth_sign_request()`
+   - Added `If-Match` header to curl header list AFTER signing (not through extra_x_ms)
+
+3. **`src/azure_client.c` - `az_page_blob_write()`**:
+   - Removed `if_match_header` from all `extra_*` arrays
+   - Simplified from 4 conditional arrays to 2 (with/without lease)
+   - Passed `if_match` as separate parameter to `execute_with_retry()`
+
+4. **`src/azure_client.c` - `batch_init_easy()`**:
+   - Updated to pass `if_match` to `azure_auth_sign_request()`
+
+5. **All other callers**: Pass NULL for if_match parameter
+
+6. **Synced to `rust/sqlite-objs-sys/csrc/`**: Kept Rust FFI wrappers in sync
+
+### Alternatives Considered
+
+- **Using a params struct**: Would reduce parameter count but would require refactoring all call sites. Deferred for now.
+- **Special-casing If-Match in extra_x_ms**: Would make the code harder to understand and maintain. Rejected.
+
+## Consequences
+
+### Positive
+- ✅ Authentication signatures are now correct
+- ✅ All 8 Azure Client integration tests pass
+- ✅ VFS integration tests went from 0/32 passing to 23/41 passing
+- ✅ No compilation warnings
+- ✅ All 295 unit tests pass
+- ✅ Clear separation between x-ms-* headers and standard HTTP headers
+
+### Negative
+- `execute_with_retry()` now has 13 parameters (was 12) - still manageable but approaching the limit
+- Small increase in code complexity at call sites
+
+### Remaining Work
+- 18 integration tests still failing (etag cache, multi-client scenarios) - appears to be a different issue, not related to authentication
+- Consider refactoring to params struct if more parameters are needed in the future
+
+## Verification
+
+```bash
+make clean && make test-unit 2>&1 | tail -5
+# All 295 tests passed
+
+make clean && make test-integration 2>&1 | tail -20
+# 23 of 41 tests PASSED (was 0/32 before fix)
+# 0 "disk I/O error" messages (was universal before)
+
+make test-unit 2>&1 | grep "warning:"
+# (no output = zero warnings)
+```
+
+## Key Principle Established
+
+**The `extra_x_ms` array is ONLY for `x-ms-*` headers. Standard HTTP headers (If-Match, If-None-Match, Range, etc.) must be handled through explicit parameters to ensure correct placement in the Azure SharedKey signing string.**
+
+# Azure Blob Lease and If-Match Are Mutually Exclusive
+
+**Decision**: Never send both `x-ms-lease-id` and `If-Match` headers in the same Azure Blob Storage write request.
+
+**Context**: 
+During integration testing, 11 multi-client tests were failing with SQLITE_BUSY errors during COMMIT. The VFS was sending both a lease ID (for exclusive write access) and an If-Match ETag (for optimistic concurrency) in the same `page_blob_write_batch()` request. Azurite (and likely production Azure) rejected these requests with HTTP 412 Precondition Failed.
+
+**Rationale**:
+- **Blob leases** provide exclusive write access for a duration (15-60 seconds). When you hold a lease, you're the only writer.
+- **If-Match ETags** provide optimistic concurrency control without exclusive access. You send an ETag to ensure the blob hasn't changed since you last read it.
+- These are two different concurrency strategies and should not be mixed.
+- Azurite rejects requests that contain both, treating it as a precondition failure.
+
+**Implementation**:
+In `sqlite_objs_vfs.c`, both `xSync` paths (batch and sequential) now check `hasLease(p)` before passing the ETag:
+
+```c
+azure_err_t arc = p->ops->page_blob_write_batch(
+    p->ops_ctx, p->zBlobName,
+    ranges, nRanges,
+    hasLease(p) ? p->leaseId : NULL,
+    /* Don't send If-Match when we hold a lease */
+    (hasLease(p) || !p->etag[0]) ? NULL : p->etag,
+    &aerr);
+```
+
+**Consequences**:
+- ✅ All 41 integration tests now pass
+- ✅ Cleaner API semantics — lease OR ETag, never both
+- ✅ Matches Azure's documented best practices
+- ⚠️ Future code must maintain this invariant
+
+**Team Guidance**: Any code that calls `page_blob_write()` or `page_blob_write_batch()` must follow this rule: send `lease_id` XOR `if_match`, never both.
+
+### 2026-03-21T07:20:00Z: User directive — S3 design constraints
+**By:** Quetzal Bradley (via Copilot)
+**What:** For S3 support: (1) Must use sharding — uploading the whole blob on every write is unacceptable. (2) Multi-writer can require If-Match (conditional writes). AWS S3 supports If-Match, MinIO supports it, and that's sufficient coverage. Other S3-compatible providers will catch up.
+**Why:** User request — foundational design constraints for S3/multi-cloud implementation.
+
+# S3 Support Research — Architecture and Dependency Strategy
+
+**Author:** Gandalf (Lead Architect)
+**Date:** 2026-07-15
+**Status:** Research / Proposal — No implementation yet
+**Requested by:** Quetzal Bradley
+
+---
+
+## 1. Executive Summary
+
+Adding AWS S3 (and S3-compatible) backend support is architecturally feasible but requires a fundamentally different write strategy than our Azure page blob model. S3 lacks page-granularity random writes — every write is a full-object replacement — creating significant write amplification for the journal-mode SQLite workload we target. The good news: (a) S3 added conditional writes with `If-Match` ETag checks in November 2024, giving us multi-writer safety without leases; (b) SigV4 auth uses HMAC-SHA256 which we already implement in `azure_auth.c`; (c) our `azure_ops_t` vtable pattern (`azure_client.h:156-325`) can be generalized to a `storage_ops_t` abstraction with minimal VFS changes. The recommended approach is a phased plan: Phase 1 builds SigV4 auth + a read-only S3 backend; Phase 2 adds writes via download-modify-upload with conditional ETag safety; Phase 3 generalizes the vtable abstraction so Azure and S3 share one VFS core. The dependency strategy is unchanged: libcurl + OpenSSL, zero SDK dependency, with SigV4 signing implemented in ~400 lines of C.
+
+---
+
+## 2. API Mapping — Azure Page Blob ↔ S3 Equivalents
+
+### 2.1 Page Blob Random R/W → S3 Object (No Equivalent)
+
+**Azure:** Page blobs support 512-byte-aligned random writes via `PUT ?comp=page` with `x-ms-range`. Our VFS tracks dirty pages in a bitmap (`sqlite_objs_vfs.c:148`), coalesces them (`sqlite_objs_vfs.c:1645-1695`), and flushes only changed ranges during xSync. A 100-page dirty commit touching 5 pages uploads only 5 × 4096 = 20 KiB.
+
+**S3:** Objects are immutable once written. There is **no** partial/in-place write. The only write operations are:
+- `PutObject` — replaces the entire object
+- Multipart Upload (`CreateMultipartUpload` → `UploadPart` × N → `CompleteMultipartUpload`) — creates an object from parts, but parts are concatenated, not patched into an existing object
+
+**Consequence:** For S3, every xSync that writes dirty pages must:
+1. Download the current object (or use local cache)
+2. Apply dirty pages to the local copy
+3. Upload the entire modified object via `PutObject` or multipart upload
+
+**Write amplification:** If the database is 100 MiB and 5 pages (20 KiB) are dirty, Azure uploads 20 KiB; S3 uploads 100 MiB. This is **5000× write amplification** for small commits on large databases. Multipart upload helps with throughput (parallel chunks) but doesn't reduce total bytes uploaded.
+
+### 2.2 Byte-Range GET → S3 Range GET (Direct Equivalent)
+
+**Azure:** `page_blob_read()` uses `Range: bytes=offset-end` header.
+**S3:** `GetObject` supports identical `Range` header. This is universally supported across all S3-compatible services.
+
+**Read path is identical.** No architecture change needed for reads.
+
+### 2.3 Blob Leases → S3 Has No Leases
+
+**Azure:** 30-second renewable leases provide exclusive write access (`lease_acquire/renew/release` in `azure_client.h:213-234`). Our VFS uses this for RESERVED/EXCLUSIVE lock levels (`sqlite_objs_vfs.c:2326-2399`).
+
+**S3 Alternatives:**
+
+| Mechanism | Pros | Cons |
+|-----------|------|------|
+| **DynamoDB Lease Table** | True distributed locking, TTL-based expiry, conditional writes | External dependency (DynamoDB), AWS-only, adds latency |
+| **S3 Conditional Write (`If-Match`)** | No external dependency, built into S3 API | Not a lease — optimistic concurrency, not mutual exclusion |
+| **S3 Object Lock** | WORM compliance | Designed for retention, not locking; no unlock |
+| **Lock object pattern** | Simple — PUT a `<db>.lock` sentinel object | No automatic expiry; crash leaves stale lock |
+| **Lock object + TTL metadata** | PUT `<db>.lock` with `x-amz-meta-expires` timestamp | Requires polling; no atomicity guarantee on check+acquire |
+
+**Recommendation:** Use a **two-tier approach**:
+1. **Optimistic concurrency via `If-Match` ETag** for the common case (single writer). On xSync, upload with `If-Match: <last-known-etag>`. If another writer modified the object, S3 returns 412 Precondition Failed → map to `SQLITE_BUSY`.
+2. **Optional DynamoDB lease table** for multi-writer deployments that need true mutual exclusion. This would be an opt-in feature via URI parameter (`lock_table=my-dynamo-table`).
+
+This mirrors real-world patterns: DynamoDB lock tables are the standard AWS pattern for distributed locking (used by Terraform, Apache Iceberg, Delta Lake).
+
+### 2.4 ETag-Based Change Detection → S3 ETags (Mostly Equivalent)
+
+**Azure:** ETags are MD5 hashes of blob content. Our VFS uses them for cache revalidation (`sqlite_objs_vfs.c:2120-2318`): compare stored ETag with HEAD response, skip download if unchanged.
+
+**S3:** ETags work similarly with caveats:
+- **Single-part uploads:** ETag = MD5 of content (same as Azure)
+- **Multipart uploads:** ETag = MD5 of concatenated part MD5s, suffixed with `-N` (e.g., `"d41d8cd98f00b204e9800998ecf8427e-5"`). This is a "checksum of checksums," not a content hash.
+- **SSE-KMS encrypted objects:** ETag is not MD5
+
+**Impact:** ETags still work for **change detection** (different content → different ETag), which is all we need. We don't compare ETags across upload methods — we just check "has it changed since I last saw it?" The `-N` suffix is irrelevant for our use case.
+
+**S3 Conditional headers for reads:**
+- `If-None-Match: <etag>` → returns 304 Not Modified if unchanged (saves download bandwidth)
+- `If-Match: <etag>` → returns 412 if changed (write safety)
+
+Both are supported on `GetObject` and `PutObject`. This maps directly to our revalidation pattern.
+
+### 2.5 Get Page Ranges (Incremental Diff) → No S3 Equivalent
+
+**Azure:** `blob_get_page_ranges_diff()` (`azure_client.h:318-325`) returns which 512-byte pages changed between two snapshots. Our VFS uses this for incremental cache updates (`sqlite_objs_vfs.c:1004-1134`): instead of re-downloading the entire blob, fetch only changed ranges.
+
+**S3:** No equivalent API. S3 has no concept of page ranges or incremental diffs.
+
+**Workarounds:**
+1. **S3 Versioning:** Enabled per-bucket. Each PutObject creates a new version. But there's no API to diff two versions at the byte level — you must download both and diff locally.
+2. **Application-level diff:** Store a metadata object (`<db>.meta`) containing a hash map of page checksums. On revalidation, download metadata, compare page hashes, fetch only changed page ranges via byte-range GETs. This adds one extra HEAD + one extra GET per revalidation but can save significant bandwidth.
+3. **Just re-download:** For databases under ~50 MiB, re-downloading the full object may be faster than the metadata overhead. Our lazy cache mode (`prefetch=none`) already handles page-level fetching on demand.
+
+**Recommendation:** For S3 MVP, skip incremental diff. Use full re-download on ETag mismatch. Implement application-level page hash metadata as a Phase 3 optimization.
+
+### 2.6 Block Blobs (Journal) → S3 PutObject (Direct Equivalent)
+
+**Azure:** Journal files use block blob upload/download (`block_blob_upload/download` in `azure_client.h:186-194`). These are whole-object sequential operations.
+
+**S3:** `PutObject` / `GetObject` map directly. Journal files are typically small (< 1 MiB). No architecture change needed.
+
+---
+
+## 3. Dependency Strategy — Low-Dependency C Approach
+
+### 3.1 AWS C SDK: Not Viable for Our Project
+
+The **aws-c-s3** library (Apache 2.0 license) is the official AWS C client. Its dependency chain:
+
+```
+aws-c-s3
+├── aws-c-auth         (SigV4 signing)
+├── aws-c-http         (HTTP/1.1, HTTP/2)
+├── aws-c-io           (Event loop, TLS, DNS)
+│   ├── aws-lc         (TLS library — AWS fork of BoringSSL/OpenSSL)
+│   └── s2n-tls        (TLS implementation, Linux only)
+├── aws-c-cal          (Crypto abstraction layer)
+├── aws-c-compression  (Huffman coding for HTTP/2)
+├── aws-c-sdkutils     (Endpoints, profiles)
+├── aws-c-common       (Allocators, logging, strings, byte buffers)
+└── aws-checksums      (CRC32, CRC64)
+```
+
+**10 separate git repositories.** Each requires CMake. On Linux, requires building aws-lc + s2n-tls (their own TLS stack). Total compiled size: ~5-10 MiB of libraries.
+
+**Verdict:** Completely incompatible with our zero-SDK, minimal-dependency philosophy. Our entire binary is ~300 KiB. The AWS SDK alone would 10-30× our binary size. Reject.
+
+### 3.2 Mining the SDK for Ideas (Apache 2.0 — License Compatible)
+
+Apache 2.0 is compatible with our MIT license for idea/pattern borrowing. Key patterns worth studying:
+
+1. **SigV4 Signing** (`aws-c-auth`): Canonical request construction, credential scope derivation, 4-step HMAC chain
+2. **Retry Logic** (`aws-c-s3`): S3-specific retryable error codes (503, 500, SlowDown, RequestTimeout)
+3. **Endpoint Discovery**: Region → endpoint URL mapping, virtual-hosted vs path-style bucket addressing
+4. **Multipart Upload**: Part size selection, parallel upload orchestration
+
+We should read their SigV4 implementation for correctness reference but implement our own.
+
+### 3.3 SigV4 with libcurl + OpenSSL: Feasible and Recommended
+
+**SigV4 Signing Algorithm (5 steps):**
+
+```
+1. CanonicalRequest = HTTP_Method + '\n' + URI + '\n' + QueryString + '\n' +
+                      CanonicalHeaders + '\n' + SignedHeaders + '\n' + SHA256(payload)
+
+2. StringToSign = "AWS4-HMAC-SHA256" + '\n' + Timestamp + '\n' +
+                  Date + '/' + Region + '/' + Service + '/aws4_request' + '\n' +
+                  SHA256(CanonicalRequest)
+
+3. SigningKey = HMAC-SHA256(HMAC-SHA256(HMAC-SHA256(HMAC-SHA256(
+                  "AWS4" + SecretKey, Date), Region), Service), "aws4_request")
+
+4. Signature = Hex(HMAC-SHA256(SigningKey, StringToSign))
+
+5. Authorization = "AWS4-HMAC-SHA256 Credential=AccessKeyId/CredentialScope,
+                    SignedHeaders=..., Signature=..."
+```
+
+**What we already have:**
+- `azure_hmac_sha256()` (`azure_auth.c:100-110`) — wraps OpenSSL's `HMAC(EVP_sha256())`. **Directly reusable** — SigV4's 4-step HMAC chain calls this 4 times.
+- `azure_base64_encode/decode()` (`azure_auth.c:31-94`) — **Reusable** for key handling.
+- SHA256 hashing — OpenSSL's `EVP_Digest()` / `EVP_sha256()`. We already link OpenSSL.
+- URL encoding — Need to implement `UriEncode()` per AWS spec (slightly different from standard percent-encoding).
+- Header sorting — `compare_headers()` in `azure_auth.c:128` is reusable.
+
+**What's new for SigV4:**
+- Canonical request format (different from Azure's 13-line format)
+- 4-step HMAC key derivation chain (Date → Region → Service → "aws4_request")
+- SHA256 payload hashing (Azure doesn't hash the payload)
+- Credential scope string
+- UriEncode per AWS specification
+
+**Estimated implementation:** ~400 lines of C for a `s3_auth_sign_request()` function, using existing HMAC/base64 helpers. This is comparable to our `azure_auth_sign_request()` at `azure_auth.c:154-303` (~150 lines). SigV4 is more complex (payload hashing, key derivation chain) but well-documented.
+
+### 3.4 S3-Compatible Services and SigV4
+
+**All major S3-compatible services support SigV4.** This is the universal authentication standard:
+
+| Service | SigV4 | SigV2 (Legacy) | Notes |
+|---------|-------|----------------|-------|
+| AWS S3 | ✅ | Deprecated | SigV4 required for new regions |
+| MinIO | ✅ | ✅ | Full SigV4 support |
+| Cloudflare R2 | ✅ | ❌ | SigV4 only |
+| Backblaze B2 | ✅ | ✅ | Both supported |
+| DigitalOcean Spaces | ✅ | ✅ | SigV4 recommended |
+| Wasabi | ✅ | ✅ | Full SigV4 support |
+| Google Cloud Storage | ✅ | ❌ | Via HMAC keys, XML API |
+
+**Implementing SigV4 once covers all services.** No need for SigV2.
+
+---
+
+## 4. Performance Comparison
+
+### 4.1 Write Amplification — The Core Problem
+
+| Scenario | Azure (Page Blob) | S3 (Full Object) | Amplification |
+|----------|-------------------|-------------------|---------------|
+| 5 dirty pages, 10 MiB DB | 20 KiB upload | 10 MiB upload | 500× |
+| 5 dirty pages, 100 MiB DB | 20 KiB upload | 100 MiB upload | 5,000× |
+| 5 dirty pages, 1 GiB DB | 20 KiB upload | 1 GiB upload | 50,000× |
+| VACUUM 100 MiB DB | ~100 MiB upload | ~100 MiB upload | 1× |
+| Bulk load (new DB) | ~N MiB upload | ~N MiB upload | 1× |
+
+**Key insight:** Write amplification is proportional to database size, not dirty data size. Small transactions on large databases are catastrophically expensive on S3.
+
+### 4.2 Multipart Upload — Helps Throughput, Not Amplification
+
+S3 multipart upload splits the object into parts (min 5 MiB per part, up to 10,000 parts). It enables:
+- **Parallel upload:** Upload N chunks simultaneously via our curl_multi infrastructure
+- **Retry per part:** Failed part doesn't restart entire upload
+
+But each part is a chunk of the **full object** — you still upload the entire thing. Multipart reduces latency for large uploads but doesn't reduce bytes transferred.
+
+**One optimization:** If we know which pages are dirty, we could potentially use multipart upload where only dirty-containing parts have new data. But S3 parts must be contiguous and complete — you can't skip unchanged parts.
+
+### 4.3 S3 Express One Zone (Directory Buckets)
+
+S3 Express One Zone places data in a single Availability Zone for lower latency:
+- **Up to 200,000 read TPS, 100,000 write TPS** per directory bucket
+- **Single-digit millisecond latency** (vs 10-100ms for standard S3)
+- Supports conditional writes (`If-Match`, `If-None-Match`)
+- Supports multipart upload
+
+**Relevance to us:** Lower latency helps, but doesn't solve write amplification. A 100 MiB upload at lower latency is still a 100 MiB upload. Express One Zone would be most beneficial for read-heavy workloads or small databases.
+
+**Caveat:** Express One Zone uses a different authentication model (session-based with `CreateSession` API). We'd need to support this as a variant.
+
+### 4.4 Read Performance — Comparable
+
+Both Azure and S3 support byte-range GETs with similar performance characteristics:
+- First-byte latency: 10-100ms (standard), 1-10ms (Express One Zone)
+- Throughput: Both support parallel multi-connection downloads
+- Our `page_blob_read_multi()` curl_multi pattern works identically with S3 range GETs
+
+**Read path requires no architectural changes.** Just swap the URL construction and auth.
+
+### 4.5 Mitigating Write Amplification
+
+Strategies to reduce write amplification on S3:
+
+1. **Small databases:** For databases < 50 MiB, full re-upload is tolerable (50 MiB at 100 Mbps = 4 seconds). This covers many use cases.
+
+2. **WAL mode (future):** WAL appends to a separate file. If we store the WAL as a separate S3 object, we only upload WAL frames (small), not the full DB. Checkpoint then uploads the full DB. This amortizes write cost across many transactions.
+
+3. **Sharded objects:** Store the database as N separate objects (e.g., 1 MiB chunks). Dirty pages only require re-uploading the chunks they touch. This is a significant architecture change but could reduce amplification to ~1 MiB granularity.
+
+4. **Hybrid approach:** Use S3 for the "cold" database image + a separate "delta log" object for recent changes. Periodically merge. Similar to LSM tree compaction.
+
+5. **Accept the tradeoff:** For read-heavy workloads (many readers, rare writes), S3's write amplification is acceptable. Position S3 backend for read-replica scenarios.
+
+---
+
+## 5. Architecture — Supporting Multiple Backends
+
+### 5.1 Recommendation: Generalized Storage Ops Vtable
+
+Our current `azure_ops_t` (`azure_client.h:156-325`) has 23 function pointers. Many are Azure-specific (page blobs, append blobs, snapshots). The VFS (`sqlite_objs_vfs.c`) calls these directly.
+
+**Proposed approach:** Define a **`storage_ops_t`** abstraction at the VFS level with operations that map to what SQLite actually needs, not what any specific cloud offers:
+
+```c
+typedef struct storage_ops storage_ops_t;
+struct storage_ops {
+    /* Read a byte range from the database object */
+    storage_err_t (*read_range)(void *ctx, const char *name,
+                                int64_t offset, size_t len,
+                                storage_buffer_t *out, storage_error_t *err);
+
+    /* Write the full database object (S3) or dirty ranges (Azure) */
+    storage_err_t (*write_object)(void *ctx, const char *name,
+                                  const uint8_t *data, size_t total_size,
+                                  const storage_dirty_range_t *dirty, int nDirty,
+                                  const char *if_match_etag,
+                                  storage_error_t *err);
+
+    /* Read entire object (for journal, small blobs) */
+    storage_err_t (*read_object)(void *ctx, const char *name,
+                                 storage_buffer_t *out, storage_error_t *err);
+
+    /* Write entire object (for journal) */
+    storage_err_t (*write_whole_object)(void *ctx, const char *name,
+                                        const uint8_t *data, size_t len,
+                                        storage_error_t *err);
+
+    /* Get object metadata (size, etag) */
+    storage_err_t (*get_properties)(void *ctx, const char *name,
+                                    int64_t *size, char *etag,
+                                    storage_error_t *err);
+
+    /* Lock/unlock (lease on Azure, lock object on S3, DynamoDB, etc.) */
+    storage_err_t (*lock_acquire)(void *ctx, const char *name,
+                                   int duration_secs, char *lock_id,
+                                   size_t lock_id_size, storage_error_t *err);
+    storage_err_t (*lock_renew)(void *ctx, const char *name,
+                                 const char *lock_id, storage_error_t *err);
+    storage_err_t (*lock_release)(void *ctx, const char *name,
+                                   const char *lock_id, storage_error_t *err);
+
+    /* Delete an object */
+    storage_err_t (*delete_object)(void *ctx, const char *name,
+                                    storage_error_t *err);
+
+    /* Check existence */
+    storage_err_t (*exists)(void *ctx, const char *name,
+                            int *exists, storage_error_t *err);
+
+    /* Optional: parallel read (NULL = fallback to sequential) */
+    storage_err_t (*read_multi)(void *ctx, const char *name,
+                                 int64_t total_size, uint8_t *dest,
+                                 storage_error_t *err);
+
+    /* Optional: incremental diff (NULL = not supported, full re-download) */
+    storage_err_t (*get_diff_ranges)(void *ctx, const char *name,
+                                      const char *prev_snapshot,
+                                      storage_diff_range_t **ranges, int *count,
+                                      storage_error_t *err);
+};
+```
+
+**Key design decisions in this vtable:**
+
+1. **`write_object` receives dirty ranges AND full data.** Azure implementation uploads only dirty ranges; S3 implementation uploads the full object. The VFS doesn't need to know which strategy is used.
+
+2. **`if_match_etag` parameter on writes.** Enables conditional writes on both Azure (already used) and S3 (`If-Match` header). This is the multi-writer safety mechanism.
+
+3. **Lock operations are abstract.** Azure implements via leases; S3 implements via lock objects or DynamoDB. The VFS just calls `lock_acquire/renew/release`.
+
+4. **Optional operations (NULL = not supported).** `get_diff_ranges` returns NULL for S3 backends; VFS falls back to full re-download. Same pattern as our current `page_blob_write_batch` (NULL = sequential fallback).
+
+### 5.2 Keeping azure_ops_t as Internal Implementation
+
+The `azure_ops_t` vtable remains as the **Azure-specific** implementation detail inside `azure_client.c`. A thin adapter wraps it into `storage_ops_t`. Similarly, `s3_ops_t` (internal to `s3_client.c`) would be wrapped into `storage_ops_t`.
+
+```
+VFS Layer (sqlite_objs_vfs.c)
+    ↓ calls
+storage_ops_t (generic interface)
+    ↓ dispatches to
+azure_storage_ops (wraps azure_ops_t)    OR    s3_storage_ops (wraps s3_ops_t)
+    ↓ calls                                     ↓ calls
+azure_client.c (libcurl + Azure REST)          s3_client.c (libcurl + S3 REST)
+```
+
+This layering keeps the VFS clean and allows adding new backends (GCS native, etc.) without touching VFS code.
+
+### 5.3 URI Scheme
+
+```
+file:db.sqlite?backend=s3&bucket=mybucket&region=us-east-1&aws_access_key_id=...&aws_secret_key=...
+file:db.sqlite?backend=azure&azure_account=acct&azure_container=cont&azure_sas=token
+```
+
+Or via environment variables:
+```
+STORAGE_BACKEND=s3
+AWS_ACCESS_KEY_ID=...
+AWS_SECRET_ACCESS_KEY=...
+S3_BUCKET=mybucket
+S3_REGION=us-east-1
+S3_ENDPOINT=http://localhost:9000  # for MinIO
+```
+
+**Default:** `backend=azure` for backward compatibility.
+
+### 5.4 VFS Name
+
+Keep `"sqlite-objs"` as the single VFS name. The backend is selected by configuration, not by registering separate VFS instances. This preserves API compatibility.
+
+---
+
+## 6. S3-Compatible Services — Compatibility Matrix
+
+| Feature | AWS S3 | MinIO | Cloudflare R2 | Backblaze B2 | DO Spaces | Wasabi | GCS (S3 mode) |
+|---------|--------|-------|---------------|--------------|-----------|--------|---------------|
+| **SigV4 Auth** | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| **Byte-Range GET** | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| **PutObject** | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| **Multipart Upload** | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| **ETags** | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| **If-Match (conditional write)** | ✅ (Nov 2024) | ✅ | ✅ | ⚠️ Limited | ❌ | ⚠️ Unknown | ⚠️ Partial |
+| **If-None-Match (conditional create)** | ✅ (Aug 2024) | ✅ | ✅ | ⚠️ Limited | ❌ | ⚠️ Unknown | ⚠️ Partial |
+| **Versioning** | ✅ | ✅ | ❌ | ✅ | ✅ | ✅ | ✅ |
+| **Object Lock** | ✅ | ✅ | ❌ | ✅ | ❌ | ✅ | ❌ |
+| **HeadObject** | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| **DeleteObject** | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| **Custom Endpoint** | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| **Path-Style URLs** | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+
+### Service-Specific Notes
+
+**MinIO (self-hosted):**
+- Most complete S3 compatibility. Supports nearly all S3 APIs.
+- Conditional writes fully supported.
+- Ideal for local development/testing (replaces Azurite role).
+- Object Lock supported for distributed locking patterns.
+
+**Cloudflare R2:**
+- No egress fees — excellent for read-heavy workloads.
+- Full conditional operations (If-Match, If-None-Match) on HeadObject and GetObject.
+- PutObject supports conditional writes.
+- No versioning, no Object Lock.
+- Region is always `auto` (or `us-east-1` for compatibility).
+
+**Backblaze B2:**
+- S3-compatible API with some limitations.
+- Pre-signed URLs supported. Conditional write support is limited — `If-Match` on writes may not be supported across all operations.
+- Good value for archival/backup use cases.
+
+**DigitalOcean Spaces:**
+- Basic S3 compatibility. SigV2 + SigV4 supported.
+- **No conditional write support** (`If-Match` on PutObject not documented).
+- Cross-region copy not supported.
+- Best for simple read/write, not multi-writer scenarios.
+
+**Wasabi:**
+- Hot storage pricing, no egress fees.
+- Full SigV4 support. Conditional write support is not well-documented but likely works given their "S3-compatible" claim.
+- Object Lock supported.
+
+**Google Cloud Storage (S3 mode):**
+- XML API interoperable with S3. Uses HMAC keys for SigV4 auth.
+- Conditional writes supported via GCS's native preconditions (mapped through XML API).
+- Some S3 features may not translate perfectly.
+
+### Universal Baseline (All Services Support)
+
+These features form our **minimum viable S3 backend:**
+- SigV4 authentication
+- PutObject / GetObject / HeadObject / DeleteObject
+- Byte-range GET (Range header)
+- Multipart upload (for large objects)
+- ETags (for change detection)
+- Custom endpoint URL (for non-AWS services)
+
+### Conditional Write Support (Critical for Multi-Writer)
+
+`If-Match` conditional writes are **not universal**. For services without it:
+- Single-writer scenarios work fine (no conflict possible)
+- Multi-writer requires an external lock mechanism or is simply unsupported
+
+---
+
+## 7. Recommended Phased Plan
+
+### Phase 0: SigV4 Auth Module (1 week)
+- Implement `s3_auth_sign_request()` in new `src/s3_auth.c`
+- Reuse `azure_hmac_sha256()`, base64 helpers from `azure_auth.c`
+- Implement UriEncode, canonical request builder, credential scope, 4-step HMAC chain
+- Unit tests with known AWS SigV4 test vectors (published by AWS)
+- **Deliverable:** Working SigV4 signing, validated against reference vectors
+
+### Phase 1: Read-Only S3 Backend (1 week)
+- Implement `s3_client.c` with GetObject (range + full), HeadObject
+- Wire into VFS via `storage_ops_t` adapter (reads only)
+- Test with MinIO local container
+- **Deliverable:** Can open and read S3-hosted SQLite databases
+
+### Phase 2: Read-Write S3 Backend (2 weeks)
+- Implement PutObject with `If-Match` conditional write
+- Implement multipart upload for databases > 5 MiB
+- Journal blob via simple PutObject/GetObject
+- Lock mechanism: lock-object pattern for MVP, optional DynamoDB later
+- **Deliverable:** Can create, read, write, and sync SQLite databases on S3
+
+### Phase 3: Generalize VFS Abstraction (1 week)
+- Define `storage_ops_t` interface
+- Refactor VFS to use `storage_ops_t` instead of `azure_ops_t`
+- Wrap `azure_ops_t` in Azure adapter, `s3_ops_t` in S3 adapter
+- Backend selection via URI parameter or environment variable
+- **Deliverable:** Single VFS binary supports both Azure and S3
+
+### Phase 4: Optimization & Compatibility (2 weeks)
+- Application-level page hash metadata for incremental diff on S3
+- Connection pooling for S3 (reuse curl_multi infrastructure)
+- Test matrix across MinIO, R2, B2, DO Spaces
+- Performance benchmarks: Azure page blob vs S3 for various workloads
+- **Deliverable:** Production-quality S3 support with benchmarks
+
+### Phase 5: Advanced Features (future)
+- DynamoDB lease table for multi-writer
+- S3 Express One Zone support (session-based auth)
+- WAL mode on S3 (WAL as separate object, reduces write amplification)
+- Sharded storage (database split across N objects)
+
+**Total estimated effort (Phases 0-3): 5 weeks**
+**Total with optimization (Phases 0-4): 7 weeks**
+
+---
+
+## 8. Risks and Open Questions
+
+### Critical Risks
+
+| Risk | Severity | Mitigation |
+|------|----------|------------|
+| **Write amplification for large DBs** | HIGH | Clearly document S3 is best for small databases (< 50 MiB) or read-heavy workloads. WAL mode (Phase 5) reduces this. |
+| **No universal conditional writes** | MEDIUM | Services without `If-Match` support single-writer only. Document this limitation per service. |
+| **Locking without leases** | MEDIUM | Lock-object pattern has no automatic expiry. Implement TTL-based cleanup + stale lock detection. |
+| **S3 eventual consistency** | LOW | S3 is now strongly consistent (since Dec 2020) for all operations. This is no longer a risk. |
+| **SigV4 implementation correctness** | MEDIUM | Validate against AWS published test vectors. Test with real AWS + MinIO + R2. |
+| **Multipart ETag semantics** | LOW | Our revalidation only checks "has ETag changed?" — multipart ETags work fine for this. |
+
+### Open Questions for Quetzal
+
+1. **Target database size?** Write amplification makes S3 impractical for databases > ~100 MiB with frequent small commits. What's the expected size range for S3 use cases?
+
+2. **Multi-writer requirement?** If S3 is primarily for read-replica / single-writer scenarios, we can skip DynamoDB locking entirely and use a simpler lock-object pattern.
+
+3. **Which S3-compatible services are priority?** Suggest: AWS S3 + MinIO (for testing) as Phase 2, then R2 + B2 as Phase 4. This focuses effort on the two most complete implementations.
+
+4. **Sharded storage interest?** Storing the database as N objects (1 MiB chunks) would dramatically reduce write amplification but is a significant architecture change. Worth pursuing, or out of scope?
+
+5. **Naming:** Should we rename the project from `sqlite-objs` to something cloud-agnostic? Or keep the name and just add S3 as a backend?
+
+6. **Build system:** S3 support adds `src/s3_auth.c` and `src/s3_client.c`. Should these be conditionally compiled (e.g., `make WITH_S3=1`) or always included?
+
+---
+
+## Appendix A: SigV4 vs Azure Shared Key — Code Reuse Analysis
+
+| Component | Azure (`azure_auth.c`) | SigV4 (new `s3_auth.c`) | Reusable? |
+|-----------|----------------------|------------------------|-----------|
+| HMAC-SHA256 | `azure_hmac_sha256()` :100-110 | Same function, called 4× for key derivation | ✅ Yes — extract to shared `crypto_utils.c` |
+| Base64 encode/decode | `azure_base64_encode/decode()` :31-94 | Needed for key handling | ✅ Yes — extract to shared |
+| SHA256 hash | Not used (Azure doesn't hash payload) | Required for payload hashing | ❌ New — but trivial with OpenSSL `EVP_Digest()` |
+| Header sorting | `compare_headers()` :128 | Same need, same algorithm | ✅ Yes — extract to shared |
+| Canonical request | Azure 13-line format :183-247 | Different format (6 components) | ❌ Separate implementation |
+| URL encoding | Not needed for Azure | Required per AWS spec | ❌ New ~30 lines |
+| Key derivation | Decode base64 key once | 4-step HMAC chain per request (can cache per day) | ❌ New ~20 lines |
+| Canonical resource | `/account/path` :243-279 | `/bucket/key` + sorted query | ❌ Separate implementation |
+
+**Estimated: ~60% of crypto infrastructure is reusable. ~400 new lines for SigV4-specific code.**
+
+---
+
+## Appendix B: S3 REST API Calls Needed
+
+| Operation | HTTP Method | S3 API | Headers |
+|-----------|-------------|--------|---------|
+| Read range | `GET /{key}` | GetObject | `Range: bytes=start-end` |
+| Read full | `GET /{key}` | GetObject | — |
+| Write full | `PUT /{key}` | PutObject | `If-Match: <etag>` (optional) |
+| Head | `HEAD /{key}` | HeadObject | — |
+| Delete | `DELETE /{key}` | DeleteObject | — |
+| Multipart init | `POST /{key}?uploads` | CreateMultipartUpload | — |
+| Upload part | `PUT /{key}?partNumber=N&uploadId=X` | UploadPart | `Content-Length` |
+| Complete multipart | `POST /{key}?uploadId=X` | CompleteMultipartUpload | XML body with part list |
+| Conditional read | `GET /{key}` | GetObject | `If-None-Match: <etag>` → 304 |
+| Conditional write | `PUT /{key}` | PutObject | `If-Match: <etag>` → 412 on mismatch |
+
+All operations use virtual-hosted-style URLs: `https://{bucket}.s3.{region}.amazonaws.com/{key}`
+Or path-style (for MinIO/custom endpoints): `https://{endpoint}/{bucket}/{key}`
