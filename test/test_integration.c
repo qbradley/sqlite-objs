@@ -3236,6 +3236,7 @@ TEST(mc_rapid_open_close) {
 /* Thread context for concurrent writes */
 typedef struct {
     const char *db_name;
+    const char *table_name;  /* Added: configurable table name */
     int writer_id;
     int inserts_per_writer;
     int *assigned_ids;
@@ -3259,8 +3260,12 @@ static void *concurrent_writer_thread(void *arg) {
 
     /* Insert rows for this writer */
     sqlite3_stmt *ins = NULL;
-    int rc = sqlite3_prepare_v2(db, 
-        "INSERT INTO messages(writer, seq) VALUES (?, ?);", -1, &ins, NULL);
+    char sql[256];
+    const char *table = ctx->table_name ? ctx->table_name : "messages";
+    snprintf(sql, sizeof(sql), 
+        "INSERT INTO %s(writer, seq) VALUES (?, ?);", table);
+    
+    int rc = sqlite3_prepare_v2(db, sql, -1, &ins, NULL);
     if (rc != SQLITE_OK) {
         fprintf(stderr, "  writer %d: prepare failed: %s\n", 
                 ctx->writer_id, sqlite3_errmsg(db));
@@ -3351,6 +3356,7 @@ TEST(concurrent_writers_regression) {
     for (int i = 0; i < num_writers; i++) {
         memset(assigned_ids[i], 0, sizeof(assigned_ids[i]));
         contexts[i].db_name = db_name;
+        contexts[i].table_name = "messages";  /* Added: specify table name */
         contexts[i].writer_id = i;
         contexts[i].inserts_per_writer = inserts_per_writer;
         contexts[i].assigned_ids = assigned_ids[i];
@@ -3440,6 +3446,528 @@ TEST(concurrent_writers_regression) {
     }
     ASSERT_EQ(distinct_count, persisted_count);
 
+    sqlite3_close(check);
+    cleanup_test_blobs(db_name);
+}
+
+/* ================================================================
+ * H. Phase 1: Concurrency Invariant Tests
+ * ================================================================ */
+
+/* ─────────────────────────────────────────────────────────────────
+ * H.1 Shared Invariant Helpers
+ * ───────────────────────────────────────────────────────────────── */
+
+/*
+ * check_rowid_uniqueness — verify all rowids in a table are distinct
+ * Returns: 1 if all rowids unique, 0 if duplicates found
+ */
+static int check_rowid_uniqueness(sqlite3 *db, const char *table_name) {
+    char sql[256];
+    snprintf(sql, sizeof(sql), 
+        "SELECT COUNT(*), COUNT(DISTINCT rowid) FROM %s;", table_name);
+    
+    sqlite3_stmt *stmt = NULL;
+    int rc = sqlite3_prepare_v2(db, sql, -1, &stmt, NULL);
+    if (rc != SQLITE_OK) {
+        fprintf(stderr, "  check_rowid_uniqueness: prepare failed: %s\n", 
+                sqlite3_errmsg(db));
+        return 0;
+    }
+    
+    rc = sqlite3_step(stmt);
+    if (rc != SQLITE_ROW) {
+        fprintf(stderr, "  check_rowid_uniqueness: step failed\n");
+        sqlite3_finalize(stmt);
+        return 0;
+    }
+    
+    int total_count = sqlite3_column_int(stmt, 0);
+    int distinct_count = sqlite3_column_int(stmt, 1);
+    sqlite3_finalize(stmt);
+    
+    if (total_count != distinct_count) {
+        fprintf(stderr, "  INVARIANT VIOLATION: %d rows but only %d distinct rowids\n",
+                total_count, distinct_count);
+        return 0;
+    }
+    
+    return 1;
+}
+
+/*
+ * check_persisted_rowids — verify all assigned rowids exist in the table
+ * Returns: number of missing rowids (0 = all present)
+ */
+static int check_persisted_rowids(sqlite3 *db, const char *table_name,
+                                   const int *rowids, int count) {
+    sqlite3_stmt *stmt = NULL;
+    char sql[256];
+    snprintf(sql, sizeof(sql), "SELECT COUNT(*) FROM %s WHERE rowid = ?;", table_name);
+    
+    int rc = sqlite3_prepare_v2(db, sql, -1, &stmt, NULL);
+    if (rc != SQLITE_OK) {
+        fprintf(stderr, "  check_persisted_rowids: prepare failed: %s\n",
+                sqlite3_errmsg(db));
+        return count;  /* assume all missing */
+    }
+    
+    int missing = 0;
+    for (int i = 0; i < count; i++) {
+        sqlite3_bind_int(stmt, 1, rowids[i]);
+        rc = sqlite3_step(stmt);
+        
+        if (rc == SQLITE_ROW) {
+            int found = sqlite3_column_int(stmt, 0);
+            if (found != 1) {
+                fprintf(stderr, "  MISSING ROWID: assigned rowid %d not found!\n", 
+                        rowids[i]);
+                missing++;
+            }
+        } else {
+            fprintf(stderr, "  check_persisted_rowids: step failed for rowid %d\n",
+                    rowids[i]);
+            missing++;
+        }
+        
+        sqlite3_reset(stmt);
+    }
+    
+    sqlite3_finalize(stmt);
+    return missing;
+}
+
+/*
+ * check_integrity — run PRAGMA integrity_check
+ * Returns: 1 if OK, 0 if corruption detected
+ */
+static int check_integrity(sqlite3 *db) {
+    sqlite3_stmt *stmt = NULL;
+    int rc = sqlite3_prepare_v2(db, "PRAGMA integrity_check;", -1, &stmt, NULL);
+    if (rc != SQLITE_OK) {
+        fprintf(stderr, "  check_integrity: prepare failed: %s\n", 
+                sqlite3_errmsg(db));
+        return 0;
+    }
+    
+    rc = sqlite3_step(stmt);
+    if (rc != SQLITE_ROW) {
+        fprintf(stderr, "  check_integrity: no result\n");
+        sqlite3_finalize(stmt);
+        return 0;
+    }
+    
+    const char *result = (const char *)sqlite3_column_text(stmt, 0);
+    int ok = (strcmp(result, "ok") == 0);
+    
+    if (!ok) {
+        fprintf(stderr, "  INTEGRITY CHECK FAILED: %s\n", result);
+        /* Print all error lines */
+        while (sqlite3_step(stmt) == SQLITE_ROW) {
+            fprintf(stderr, "    %s\n", sqlite3_column_text(stmt, 0));
+        }
+    }
+    
+    sqlite3_finalize(stmt);
+    return ok;
+}
+
+/* ─────────────────────────────────────────────────────────────────
+ * H.2 Enhanced Multi-Writer Stress Test (8-16 writers)
+ * ───────────────────────────────────────────────────────────────── */
+
+/*
+ * Test H1: Stress test with 8 writers × 25 inserts each = 200 total ops
+ * 
+ * This tests significantly more concurrency than the 4x10 regression test.
+ * Goals:
+ *   - Catch rowid/data loss under heavier load
+ *   - Verify invariants hold at scale
+ *   - Keep CI runtime reasonable (~5-10 sec)
+ */
+TEST(stress_8_writers_25_each) {
+    const char *db_name = "stress-8x25.db";
+    cleanup_test_blobs(db_name);
+    
+    int rc = sqlite_objs_vfs_register_uri(0);
+    ASSERT_OK(rc);
+    
+    /* Create schema */
+    sqlite3 *init = open_azurite_db(db_name, NULL, 1);
+    ASSERT_NOT_NULL(init);
+    
+    rc = exec_sql(init,
+        "CREATE TABLE stress ("
+        "  id INTEGER PRIMARY KEY AUTOINCREMENT,"
+        "  writer INTEGER NOT NULL,"
+        "  seq INTEGER NOT NULL,"
+        "  payload TEXT"
+        ");");
+    ASSERT_OK(rc);
+    sqlite3_close(init);
+    
+    /* Spawn 8 concurrent writers */
+    const int num_writers = 8;
+    const int inserts_per_writer = 25;
+    pthread_t threads[num_writers];
+    writer_context_t contexts[num_writers];
+    int assigned_ids[num_writers][inserts_per_writer];
+    
+    fprintf(stdout, "  spawning %d writers × %d inserts = %d total ops...\n",
+            num_writers, inserts_per_writer, num_writers * inserts_per_writer);
+    
+    for (int i = 0; i < num_writers; i++) {
+        memset(assigned_ids[i], 0, sizeof(assigned_ids[i]));
+        contexts[i].db_name = db_name;
+        contexts[i].table_name = "stress";  /* Use stress table */
+        contexts[i].writer_id = i;
+        contexts[i].inserts_per_writer = inserts_per_writer;
+        contexts[i].assigned_ids = assigned_ids[i];
+        contexts[i].success = 0;
+        contexts[i].result_code = SQLITE_OK;
+        
+        rc = pthread_create(&threads[i], NULL, concurrent_writer_thread, &contexts[i]);
+        ASSERT_EQ(rc, 0);
+    }
+    
+    /* Wait for all writers */
+    for (int i = 0; i < num_writers; i++) {
+        pthread_join(threads[i], NULL);
+    }
+    
+    /* Collect assigned IDs */
+    int total_assigned = 0;
+    int assigned_list[num_writers * inserts_per_writer];
+    
+    for (int i = 0; i < num_writers; i++) {
+        fprintf(stdout, "  writer %d: %d/%d inserts succeeded\n",
+                i, contexts[i].success, inserts_per_writer);
+        for (int j = 0; j < contexts[i].success; j++) {
+            assigned_list[total_assigned++] = assigned_ids[i][j];
+        }
+    }
+    ASSERT_GT(total_assigned, 0);
+    
+    /* Verify with invariant helpers */
+    sqlite3 *check = open_azurite_db(db_name, NULL, 0);
+    ASSERT_NOT_NULL(check);
+    
+    fprintf(stdout, "  checking integrity...\n");
+    ASSERT_TRUE(check_integrity(check));
+    
+    int persisted_count = 0;
+    rc = query_int(check, "SELECT COUNT(*) FROM stress;", &persisted_count);
+    ASSERT_OK(rc);
+    
+    fprintf(stdout, "  assigned: %d, persisted: %d\n", 
+            total_assigned, persisted_count);
+    ASSERT_EQ(persisted_count, total_assigned);
+    
+    fprintf(stdout, "  checking rowid uniqueness...\n");
+    ASSERT_TRUE(check_rowid_uniqueness(check, "stress"));
+    
+    fprintf(stdout, "  checking all assigned rowids persisted...\n");
+    int missing = check_persisted_rowids(check, "stress", assigned_list, total_assigned);
+    ASSERT_EQ(missing, 0);
+    
+    sqlite3_close(check);
+    cleanup_test_blobs(db_name);
+}
+
+/*
+ * Test H2: Heavy stress with 16 writers × 20 inserts = 320 ops
+ * 
+ * This is the "extended" version — heavier load for catching subtle bugs.
+ * May be slower in CI, but still practical (~10-15 sec).
+ */
+TEST(stress_16_writers_20_each) {
+    const char *db_name = "stress-16x20.db";
+    cleanup_test_blobs(db_name);
+    
+    int rc = sqlite_objs_vfs_register_uri(0);
+    ASSERT_OK(rc);
+    
+    /* Create schema */
+    sqlite3 *init = open_azurite_db(db_name, NULL, 1);
+    ASSERT_NOT_NULL(init);
+    
+    rc = exec_sql(init,
+        "CREATE TABLE stress ("
+        "  id INTEGER PRIMARY KEY AUTOINCREMENT,"
+        "  writer INTEGER NOT NULL,"
+        "  seq INTEGER NOT NULL"
+        ");");
+    ASSERT_OK(rc);
+    sqlite3_close(init);
+    
+    /* Spawn 16 concurrent writers */
+    const int num_writers = 16;
+    const int inserts_per_writer = 20;
+    pthread_t threads[num_writers];
+    writer_context_t contexts[num_writers];
+    int assigned_ids[num_writers][inserts_per_writer];
+    
+    fprintf(stdout, "  spawning %d writers × %d inserts = %d total ops...\n",
+            num_writers, inserts_per_writer, num_writers * inserts_per_writer);
+    
+    for (int i = 0; i < num_writers; i++) {
+        memset(assigned_ids[i], 0, sizeof(assigned_ids[i]));
+        contexts[i].db_name = db_name;
+        contexts[i].table_name = "stress";  /* Use stress table */
+        contexts[i].writer_id = i;
+        contexts[i].inserts_per_writer = inserts_per_writer;
+        contexts[i].assigned_ids = assigned_ids[i];
+        contexts[i].success = 0;
+        contexts[i].result_code = SQLITE_OK;
+        
+        rc = pthread_create(&threads[i], NULL, concurrent_writer_thread, &contexts[i]);
+        ASSERT_EQ(rc, 0);
+    }
+    
+    /* Wait for all writers */
+    for (int i = 0; i < num_writers; i++) {
+        pthread_join(threads[i], NULL);
+    }
+    
+    /* Collect assigned IDs */
+    int total_assigned = 0;
+    int assigned_list[num_writers * inserts_per_writer];
+    
+    for (int i = 0; i < num_writers; i++) {
+        fprintf(stdout, "  writer %d: %d/%d inserts succeeded\n",
+                i, contexts[i].success, inserts_per_writer);
+        for (int j = 0; j < contexts[i].success; j++) {
+            assigned_list[total_assigned++] = assigned_ids[i][j];
+        }
+    }
+    ASSERT_GT(total_assigned, 0);
+    
+    /* Verify with invariant helpers */
+    sqlite3 *check = open_azurite_db(db_name, NULL, 0);
+    ASSERT_NOT_NULL(check);
+    
+    fprintf(stdout, "  checking integrity...\n");
+    ASSERT_TRUE(check_integrity(check));
+    
+    int persisted_count = 0;
+    rc = query_int(check, "SELECT COUNT(*) FROM stress;", &persisted_count);
+    ASSERT_OK(rc);
+    
+    fprintf(stdout, "  assigned: %d, persisted: %d\n",
+            total_assigned, persisted_count);
+    ASSERT_EQ(persisted_count, total_assigned);
+    
+    fprintf(stdout, "  checking rowid uniqueness...\n");
+    ASSERT_TRUE(check_rowid_uniqueness(check, "stress"));
+    
+    fprintf(stdout, "  checking all assigned rowids persisted...\n");
+    int missing = check_persisted_rowids(check, "stress", assigned_list, total_assigned);
+    ASSERT_EQ(missing, 0);
+    
+    sqlite3_close(check);
+    cleanup_test_blobs(db_name);
+}
+
+/* ─────────────────────────────────────────────────────────────────
+ * H.3 Reader/Writer Interleaving Tests
+ * ───────────────────────────────────────────────────────────────── */
+
+/* Thread context for readers */
+typedef struct {
+    const char *db_name;
+    int reader_id;
+    int snapshot_duration_ms;
+    int rows_seen;
+    int iterations;
+    int success;
+    int result_code;
+} reader_context_t;
+
+/* Thread function: reader holds snapshot, yields to writers */
+static void *reader_snapshot_thread(void *arg) {
+    reader_context_t *ctx = (reader_context_t *)arg;
+    ctx->success = 0;
+    ctx->result_code = SQLITE_OK;
+    ctx->rows_seen = 0;
+    
+    sqlite3 *db = open_azurite_db(ctx->db_name, NULL, 0);
+    if (!db) {
+        fprintf(stderr, "  reader %d: failed to open database\n", ctx->reader_id);
+        ctx->result_code = SQLITE_CANTOPEN;
+        return NULL;
+    }
+    
+    for (int iter = 0; iter < ctx->iterations; iter++) {
+        /* Begin a read transaction to establish a snapshot */
+        int rc = exec_sql(db, "BEGIN;");
+        if (rc != SQLITE_OK) {
+            fprintf(stderr, "  reader %d iter %d: BEGIN failed\n", 
+                    ctx->reader_id, iter);
+            ctx->result_code = rc;
+            sqlite3_close(db);
+            return NULL;
+        }
+        
+        /* Count rows visible in this snapshot */
+        int count = 0;
+        rc = query_int(db, "SELECT COUNT(*) FROM data;", &count);
+        if (rc != SQLITE_OK) {
+            fprintf(stderr, "  reader %d iter %d: SELECT failed (%d)\n",
+                    ctx->reader_id, iter, rc);
+            ctx->result_code = rc;
+            exec_sql(db, "ROLLBACK;");
+            sqlite3_close(db);
+            return NULL;
+        }
+        ctx->rows_seen = count;
+        
+        /* Hold the snapshot for a bit (simulate long read) */
+        usleep(ctx->snapshot_duration_ms * 1000);
+        
+        /* Rollback (we're read-only) */
+        rc = exec_sql(db, "ROLLBACK;");
+        if (rc != SQLITE_OK) {
+            fprintf(stderr, "  reader %d iter %d: ROLLBACK failed (%d)\n",
+                    ctx->reader_id, iter, rc);
+            ctx->result_code = rc;
+            sqlite3_close(db);
+            return NULL;
+        }
+        
+        /* Brief pause between iterations */
+        usleep(10000);  /* 10ms */
+    }
+    
+    sqlite3_close(db);
+    ctx->success = 1;
+    return NULL;
+}
+
+/*
+ * Test H3: Reader/Writer interleaving — readers hold snapshots while writers commit
+ * 
+ * Pattern:
+ *   - 2 readers continuously query + hold snapshots (100ms each)
+ *   - 4 writers insert concurrently
+ *   - Verify: all data persisted, no corruption, readers don't block writers
+ */
+TEST(reader_writer_interleaving) {
+    const char *db_name = "reader-writer-interlv.db";
+    cleanup_test_blobs(db_name);
+    
+    int rc = sqlite_objs_vfs_register_uri(0);
+    ASSERT_OK(rc);
+    
+    /* Create schema */
+    sqlite3 *init = open_azurite_db(db_name, NULL, 1);
+    ASSERT_NOT_NULL(init);
+    
+    rc = exec_sql(init,
+        "CREATE TABLE data ("
+        "  id INTEGER PRIMARY KEY AUTOINCREMENT,"
+        "  writer INTEGER NOT NULL,"
+        "  seq INTEGER NOT NULL"
+        ");");
+    ASSERT_OK(rc);
+    sqlite3_close(init);
+    
+    fprintf(stdout, "  spawning 2 readers + 4 writers...\n");
+    
+    /* Start readers first (they'll loop and hold snapshots) */
+    const int num_readers = 2;
+    pthread_t reader_threads[num_readers];
+    reader_context_t reader_contexts[num_readers];
+    
+    for (int i = 0; i < num_readers; i++) {
+        reader_contexts[i].db_name = db_name;
+        reader_contexts[i].reader_id = i;
+        reader_contexts[i].snapshot_duration_ms = 100;  /* 100ms per snapshot */
+        reader_contexts[i].iterations = 3;  /* 3 iterations per reader */
+        reader_contexts[i].success = 0;
+        reader_contexts[i].rows_seen = 0;
+        reader_contexts[i].result_code = SQLITE_OK;
+        
+        rc = pthread_create(&reader_threads[i], NULL, 
+                           reader_snapshot_thread, &reader_contexts[i]);
+        ASSERT_EQ(rc, 0);
+    }
+    
+    /* Brief delay to let readers establish first snapshot */
+    usleep(50000);  /* 50ms */
+    
+    /* Now spawn writers */
+    const int num_writers = 4;
+    const int inserts_per_writer = 15;
+    pthread_t writer_threads[num_writers];
+    writer_context_t writer_contexts[num_writers];
+    int assigned_ids[num_writers][inserts_per_writer];
+    
+    for (int i = 0; i < num_writers; i++) {
+        memset(assigned_ids[i], 0, sizeof(assigned_ids[i]));
+        writer_contexts[i].db_name = db_name;
+        writer_contexts[i].table_name = "data";  /* Use data table */
+        writer_contexts[i].writer_id = i;
+        writer_contexts[i].inserts_per_writer = inserts_per_writer;
+        writer_contexts[i].assigned_ids = assigned_ids[i];
+        writer_contexts[i].success = 0;
+        writer_contexts[i].result_code = SQLITE_OK;
+        
+        rc = pthread_create(&writer_threads[i], NULL, 
+                           concurrent_writer_thread, &writer_contexts[i]);
+        ASSERT_EQ(rc, 0);
+    }
+    
+    /* Wait for all threads */
+    for (int i = 0; i < num_readers; i++) {
+        pthread_join(reader_threads[i], NULL);
+    }
+    for (int i = 0; i < num_writers; i++) {
+        pthread_join(writer_threads[i], NULL);
+    }
+    
+    /* Verify readers succeeded */
+    for (int i = 0; i < num_readers; i++) {
+        fprintf(stdout, "  reader %d: completed %d iterations, last saw %d rows\n",
+                i, reader_contexts[i].iterations, reader_contexts[i].rows_seen);
+        ASSERT_EQ(reader_contexts[i].success, 1);
+        ASSERT_EQ(reader_contexts[i].result_code, SQLITE_OK);
+    }
+    
+    /* Collect writer results */
+    int total_assigned = 0;
+    int assigned_list[num_writers * inserts_per_writer];
+    
+    for (int i = 0; i < num_writers; i++) {
+        fprintf(stdout, "  writer %d: %d/%d inserts succeeded\n",
+                i, writer_contexts[i].success, inserts_per_writer);
+        for (int j = 0; j < writer_contexts[i].success; j++) {
+            assigned_list[total_assigned++] = assigned_ids[i][j];
+        }
+    }
+    ASSERT_GT(total_assigned, 0);
+    
+    /* Verify data integrity */
+    sqlite3 *check = open_azurite_db(db_name, NULL, 0);
+    ASSERT_NOT_NULL(check);
+    
+    fprintf(stdout, "  checking integrity...\n");
+    ASSERT_TRUE(check_integrity(check));
+    
+    int persisted_count = 0;
+    rc = query_int(check, "SELECT COUNT(*) FROM data;", &persisted_count);
+    ASSERT_OK(rc);
+    
+    fprintf(stdout, "  assigned: %d, persisted: %d\n",
+            total_assigned, persisted_count);
+    ASSERT_EQ(persisted_count, total_assigned);
+    
+    fprintf(stdout, "  checking rowid uniqueness...\n");
+    ASSERT_TRUE(check_rowid_uniqueness(check, "data"));
+    
+    fprintf(stdout, "  checking all assigned rowids persisted...\n");
+    int missing = check_persisted_rowids(check, "data", assigned_list, total_assigned);
+    ASSERT_EQ(missing, 0);
+    
     sqlite3_close(check);
     cleanup_test_blobs(db_name);
 }
@@ -3542,6 +4070,13 @@ int main(void) {
     /* Concurrent writers regression test */
     TEST_SUITE_BEGIN("Concurrency: Regression Tests");
     RUN_TEST(concurrent_writers_regression);
+    TEST_SUITE_END();
+
+    /* Phase 1: Enhanced concurrency & invariant tests */
+    TEST_SUITE_BEGIN("Concurrency: Phase 1 Stress & Invariants");
+    RUN_TEST(stress_8_writers_25_each);
+    RUN_TEST(stress_16_writers_20_each);
+    RUN_TEST(reader_writer_interleaving);
     TEST_SUITE_END();
 
     /* Cleanup */

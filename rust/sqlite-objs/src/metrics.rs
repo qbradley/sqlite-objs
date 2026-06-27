@@ -36,6 +36,7 @@
 //!     revalidations=1\n\
 //!     revalidation_downloads=0\n\
 //!     revalidation_diffs=1\n\
+//!     revalidation_busy=0\n\
 //!     pages_invalidated=0\n\
 //!     journal_uploads=1\n\
 //!     journal_bytes_uploaded=4096\n\
@@ -126,6 +127,8 @@ pub struct VfsMetrics {
     pub revalidation_downloads: i64,
     /// Revalidations that applied an incremental diff.
     pub revalidation_diffs: i64,
+    /// Revalidations that failed with SQLITE_BUSY due to a stale snapshot.
+    pub revalidation_busy: i64,
     /// Pages invalidated by revalidation.
     pub pages_invalidated: i64,
 
@@ -146,7 +149,7 @@ pub struct VfsMetrics {
 
 impl VfsMetrics {
     /// The number of counters in the metrics struct.
-    pub const FIELD_COUNT: usize = 27;
+    pub const FIELD_COUNT: usize = 28;
 
     /// Parse the `key=value\n` text returned by FCNTL 201 / `PRAGMA sqlite_objs_stats`.
     ///
@@ -201,6 +204,7 @@ impl VfsMetrics {
                 "revalidations" => m.revalidations = v,
                 "revalidation_downloads" => m.revalidation_downloads = v,
                 "revalidation_diffs" => m.revalidation_diffs = v,
+                "revalidation_busy" => m.revalidation_busy = v,
                 "pages_invalidated" => m.pages_invalidated = v,
                 "journal_uploads" => m.journal_uploads = v,
                 "journal_bytes_uploaded" => m.journal_bytes_uploaded = v,
@@ -242,6 +246,7 @@ blob_resizes=0\n\
 revalidations=1\n\
 revalidation_downloads=0\n\
 revalidation_diffs=1\n\
+revalidation_busy=0\n\
 pages_invalidated=0\n\
 journal_uploads=1\n\
 journal_bytes_uploaded=4096\n\
@@ -273,6 +278,7 @@ azure_errors=0";
         assert_eq!(m.revalidations, 1);
         assert_eq!(m.revalidation_downloads, 0);
         assert_eq!(m.revalidation_diffs, 1);
+        assert_eq!(m.revalidation_busy, 0);
         assert_eq!(m.pages_invalidated, 0);
         assert_eq!(m.journal_uploads, 1);
         assert_eq!(m.journal_bytes_uploaded, 4096);

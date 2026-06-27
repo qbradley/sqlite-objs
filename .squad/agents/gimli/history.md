@@ -101,3 +101,35 @@ Co-designed 54 Rust integration tests. 6 categories: lifecycle, transactions, ca
 - Updated sqlite-objs-sys dependency version reference in workspace.dependencies to match
 - Ran `cargo update --workspace` to regenerate Cargo.lock with new versions
 - Both sqlite-objs and sqlite-objs-sys now at 0.1.6-alpha.1
+
+## Crate README Documentation (2026-06-27)
+
+**Created package-quality READMEs for both Rust crates:**
+
+### sqlite-objs-sys README
+- **Purpose:** Raw FFI bindings to C library — explicit safety warning directing users to safe wrapper
+- **Installation:** Version 0.1.6-alpha.1 with build requirements (C11 compiler, OpenSSL, libcurl)
+- **Build mechanics:** Documented bundled sources, pkg-config/Homebrew OpenSSL detection, automatic linking
+- **FFI surface:** All registration functions, config struct layout, FCNTL opcodes with memory ownership rules
+- **Safety notes:** Config struct is copied by C (caller may free strings), STATS FCNTL returns `sqlite3_malloc`'d memory (must free with `sqlite3_free`)
+
+### sqlite-objs README  
+- **Purpose:** Safe Rust wrapper with three usage modes (env vars, URI, explicit config)
+- **Installation:** Version 0.1.6-alpha.1 with rusqlite 0.38
+- **Feature flags:** `rusqlite` (enabled by default) gates pragmas module; `--no-default-features` for raw API
+- **Examples:** Environment-based registration, UriBuilder with cache_reuse/prefetch, explicit config with Azurite endpoint
+- **Metrics:** VfsMetrics struct with all 27 counters, pragmas module functions
+- **Advanced features:** PrefetchMode::None for lazy loading, cache_reuse for ETag revalidation
+
+**Key learnings:**
+- Cargo package `include` directive in sqlite-objs-sys ensures README is bundled in published tarball
+- `cargo package --list -p <crate>` validates what files ship with the package
+- Feature documentation must match Cargo.toml exactly — `rusqlite` is the only public feature (bin-deps is internal for example binary)
+- Safety warnings are critical for -sys crates — users should use safe wrapper unless they have specific FFI needs
+- Repository URL in workspace Cargo.toml should point to github.com/qbradley/sqlite-objs (not /rust subdirectory)
+
+**Validation:**
+- Both crates `cargo check` successfully with and without default features
+- Dependencies match workspace declarations (thiserror 2.0, rusqlite 0.38, libsqlite3-sys 0.36)
+- README code examples compile as doc tests (validated against actual lib.rs doc comments)
+

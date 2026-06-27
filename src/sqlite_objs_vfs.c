@@ -33,6 +33,54 @@
 #include <pthread.h>
 
 /* ===================================================================
+** Test Hooks — compile-time disabled in production
+** =================================================================== */
+
+#ifdef SQLITE_OBJS_TEST
+/* Test hook: override time(NULL) for deterministic lease expiry tests.
+** Default NULL = use system time(). Set to non-NULL function to inject time. */
+static time_t (*g_test_time_fn)(time_t *) = NULL;
+
+void sqlite_objs_test_set_time_fn(time_t (*fn)(time_t *)) {
+    g_test_time_fn = fn;
+}
+
+/* Test hooks: sync interleaving for deterministic crash/partial-write testing.
+** These hooks are called at the start of critical xSync operations.
+** Return nonzero to abort the operation with SQLITE_IOERR_FSYNC. */
+static void *g_test_sync_hook_ctx = NULL;
+static int (*g_test_hook_before_page_blob_resize)(void *, const char *) = NULL;
+static int (*g_test_hook_before_batch_page_write)(void *, const char *) = NULL;
+static int (*g_test_hook_before_seq_page_write)(void *, const char *) = NULL;
+static int (*g_test_hook_before_journal_upload)(void *, const char *) = NULL;
+static int (*g_test_hook_before_wal_upload)(void *, const char *) = NULL;
+
+void sqlite_objs_test_set_sync_hooks(
+    void *ctx,
+    int (*beforePageBlobResize)(void *, const char *),
+    int (*beforeBatchPageWrite)(void *, const char *),
+    int (*beforeSeqPageWrite)(void *, const char *),
+    int (*beforeJournalUpload)(void *, const char *),
+    int (*beforeWalUpload)(void *, const char *)
+) {
+    g_test_sync_hook_ctx = ctx;
+    g_test_hook_before_page_blob_resize = beforePageBlobResize;
+    g_test_hook_before_batch_page_write = beforeBatchPageWrite;
+    g_test_hook_before_seq_page_write = beforeSeqPageWrite;
+    g_test_hook_before_journal_upload = beforeJournalUpload;
+    g_test_hook_before_wal_upload = beforeWalUpload;
+}
+#endif
+
+/* Wrapper for time() that respects test hook if present */
+static time_t test_aware_time(void) {
+#ifdef SQLITE_OBJS_TEST
+    if (g_test_time_fn) return g_test_time_fn(NULL);
+#endif
+    return time(NULL);
+}
+
+/* ===================================================================
 ** Debug timing — opt-in via SQLITE_OBJS_DEBUG_TIMING=1 environment variable
 ** =================================================================== */
 
@@ -1180,7 +1228,7 @@ static int leaseRenewIfNeeded(sqliteObjsFile *p) {
     if (!hasLease(p)) return SQLITE_OK;
     int renewAfter = p->leaseDuration > 0 ? p->leaseDuration / 2
                                           : SQLITE_OBJS_LEASE_DURATION / 2;
-    time_t now = time(NULL);
+    time_t now = test_aware_time();
     if (difftime(now, p->leaseAcquiredAt) < renewAfter) {
         return SQLITE_OK;
     }
@@ -1722,6 +1770,14 @@ static int sqliteObjsSync(sqlite3_file *pFile, int flags) {
             return SQLITE_IOERR_FSYNC;
         }
 
+#ifdef SQLITE_OBJS_TEST
+        /* Test hook: before WAL upload */
+        if (g_test_hook_before_wal_upload &&
+            g_test_hook_before_wal_upload(g_test_sync_hook_ctx, p->zBlobName)) {
+            return SQLITE_IOERR_FSYNC;
+        }
+#endif
+
         double t0 = 0;
         if (sqlite_objs_debug_timing()) t0 = sqlite_objs_time_ms();
 
@@ -1776,6 +1832,14 @@ static int sqliteObjsSync(sqlite3_file *pFile, int flags) {
     if (p->eFileType & SQLITE_OPEN_MAIN_JOURNAL) {
         /* Upload journal as block blob */
         if (p->nJrnlData > 0 && p->ops && p->ops->block_blob_upload) {
+#ifdef SQLITE_OBJS_TEST
+            /* Test hook: before journal upload */
+            if (g_test_hook_before_journal_upload &&
+                g_test_hook_before_journal_upload(g_test_sync_hook_ctx, p->zBlobName)) {
+                return SQLITE_IOERR_FSYNC;
+            }
+#endif
+
             double t0 = 0;
             if (sqlite_objs_debug_timing()) t0 = sqlite_objs_time_ms();
 
@@ -1834,6 +1898,14 @@ static int sqliteObjsSync(sqlite3_file *pFile, int flags) {
     ** so this skips a ~45ms HTTP round-trip per transaction. */
     double resize_ms = 0;
     if (p->nData > p->lastSyncedSize && p->ops->page_blob_resize) {
+#ifdef SQLITE_OBJS_TEST
+        /* Test hook: before page blob resize */
+        if (g_test_hook_before_page_blob_resize &&
+            g_test_hook_before_page_blob_resize(g_test_sync_hook_ctx, p->zBlobName)) {
+            return SQLITE_IOERR_FSYNC;
+        }
+#endif
+
         sqlite3_int64 alignedSize = (p->nData + 511) & ~(sqlite3_int64)511;
         double rt0 = 0;
         if (sqlite_objs_debug_timing()) rt0 = sqlite_objs_time_ms();
@@ -1924,6 +1996,16 @@ static int sqliteObjsSync(sqlite3_file *pFile, int flags) {
 
     /* Try batch write if available (Phase 2 — will be non-NULL with curl_multi) */
     if (p->ops->page_blob_write_batch) {
+#ifdef SQLITE_OBJS_TEST
+        /* Test hook: before batch page write */
+        if (g_test_hook_before_batch_page_write &&
+            g_test_hook_before_batch_page_write(g_test_sync_hook_ctx, p->zBlobName)) {
+            sqlite3_free(rangeDataBuf);
+            if (ranges != stackRanges) sqlite3_free(ranges);
+            return SQLITE_IOERR_FSYNC;
+        }
+#endif
+
         double wt0 = 0;
         if (sqlite_objs_debug_timing()) wt0 = sqlite_objs_time_ms();
 
@@ -1975,6 +2057,16 @@ static int sqliteObjsSync(sqlite3_file *pFile, int flags) {
     }
 
     /* Sequential fallback — write each coalesced range */
+#ifdef SQLITE_OBJS_TEST
+    /* Test hook: before sequential page write */
+    if (g_test_hook_before_seq_page_write &&
+        g_test_hook_before_seq_page_write(g_test_sync_hook_ctx, p->zBlobName)) {
+        sqlite3_free(rangeDataBuf);
+        if (ranges != stackRanges) sqlite3_free(ranges);
+        return SQLITE_IOERR_FSYNC;
+    }
+#endif
+
     double write_t0 = 0;
     if (sqlite_objs_debug_timing()) write_t0 = sqlite_objs_time_ms();
 
@@ -2369,7 +2461,7 @@ static int sqliteObjsLock(sqlite3_file *pFile, int eLock) {
             return azureErrToSqlite(arc, SQLITE_IOERR_LOCK);
         }
         p->metrics.lease_acquires++;
-        p->leaseAcquiredAt = time(NULL);
+        p->leaseAcquiredAt = test_aware_time();
         p->leaseDuration = duration;
 
         /* Re-validate: if the blob changed after SQLite started reading
@@ -2975,6 +3067,7 @@ static int sqliteObjsOpen(sqlite3_vfs *pVfs, sqlite3_filename zName,
                                                       &savedFileSize) == 0
                                         && savedPageSize == p->pageSize
                                         && savedFileSize == p->nData) {
+                                       bitmapFree(&p->valid);
                                         p->valid.data = savedValid;
                                         p->valid.nAlloc = savedValidSize;
                                         /* Recount valid pages */

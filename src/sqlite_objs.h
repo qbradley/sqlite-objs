@@ -28,6 +28,7 @@
 #define SQLITE_OBJS_H
 
 #include "sqlite3.h"
+#include <time.h>  /* For time_t in test hooks */
 
 #ifdef __cplusplus
 extern "C" {
@@ -194,6 +195,70 @@ typedef struct sqlite_objs_metrics {
     /* Errors & retries */
     sqlite3_int64 azure_errors;
 } sqlite_objs_metrics;
+
+#ifdef SQLITE_OBJS_TEST
+/* ===================================================================
+** Test Hooks — available only when compiled with -DSQLITE_OBJS_TEST
+** =================================================================== */
+
+/*
+** Set a custom time function for deterministic lease expiry testing.
+** If fn is NULL, the VFS uses the system time() function (default).
+** If fn is non-NULL, the VFS calls fn(NULL) instead of time(NULL)
+** at all lease timing decision points.
+**
+** Example:
+**   static time_t fake_time = 1000;
+**   static time_t my_time_fn(time_t *t) { (void)t; return fake_time; }
+**   sqlite_objs_test_set_time_fn(my_time_fn);
+**   // Advance time to force lease expiry
+**   fake_time += 60;
+*/
+void sqlite_objs_test_set_time_fn(time_t (*fn)(time_t *));
+
+/*
+** Sync interleaving hook points for deterministic crash/partial-write testing.
+** Each hook is called at the start of the corresponding critical operation.
+** If the hook returns nonzero, the operation is aborted with SQLITE_IOERR_FSYNC.
+**
+** Hook context: opaque pointer passed through from the set call.
+** Blob name: the Azure blob being modified (main db, journal, or WAL).
+** Return: 0 = proceed normally, nonzero = abort with SQLITE_IOERR_FSYNC.
+*/
+typedef int (*sqlite_objs_test_sync_hook_fn)(void *ctx, const char *blobName);
+
+/*
+** Set sync interleaving hooks for deterministic crash/partial-write testing.
+** All parameters are optional (may be NULL to disable the hook).
+** ctx is an opaque pointer passed to all hook functions.
+**
+** Hook points:
+**   beforePageBlobResize:    before page blob resize (MAIN_DB)
+**   beforeBatchPageWrite:    before batch page write (MAIN_DB, curl_multi)
+**   beforeSeqPageWrite:      before sequential page write (MAIN_DB, fallback)
+**   beforeJournalUpload:     before journal block blob upload (MAIN_JOURNAL)
+**   beforeWalUpload:         before WAL block blob upload (WAL)
+**
+** Example:
+**   static int inject_failure(void *ctx, const char *blob) {
+**       int *call_count = (int*)ctx;
+**       (*call_count)++;
+**       if (*call_count == 2) return 1;  // Fail on second call
+**       return 0;
+**   }
+**   int count = 0;
+**   sqlite_objs_test_set_sync_hooks(&count, NULL, inject_failure, NULL, NULL, NULL);
+*/
+void sqlite_objs_test_set_sync_hooks(
+    void *ctx,
+    sqlite_objs_test_sync_hook_fn beforePageBlobResize,
+    sqlite_objs_test_sync_hook_fn beforeBatchPageWrite,
+    sqlite_objs_test_sync_hook_fn beforeSeqPageWrite,
+    sqlite_objs_test_sync_hook_fn beforeJournalUpload,
+    sqlite_objs_test_sync_hook_fn beforeWalUpload
+);
+
+#endif /* SQLITE_OBJS_TEST */
 
 #ifdef __cplusplus
 }

@@ -3499,3 +3499,130 @@ These features form our **minimum viable S3 backend:**
 
 All operations use virtual-hosted-style URLs: `https://{bucket}.s3.{region}.amazonaws.com/{key}`
 Or path-style (for MinIO/custom endpoints): `https://{endpoint}/{bucket}/{key}`
+
+---
+
+### D-TEST-PHASE1: Phase 1 Concurrency & Invariant Tests
+**Date:** 2026-06-27 | **From:** Samwise (QA/Tester)  
+**Status:** Implemented
+
+**Summary:** Implemented Phase 1 concurrency/invariant tests with 3 new test cases (8×25, 16×20 stress tests, and reader/writer interleaving) plus shared invariant validation helpers. All tests passing. No bugs found under increased stress load.
+
+**Key Results:**
+- 45 integration tests (+3 new), all passing
+- 8 writers × 25 inserts = 200 ops ✅
+- 16 writers × 20 inserts = 320 ops ✅
+- Reader/writer interleaving = 60 ops ✅
+- Invariants: rowid uniqueness, persisted rows, integrity_check all validated
+
+**Coverage Impact:** Systematic stress at 2×, 4×, and 8× scale relative to baseline 4×10 regression test.
+
+**Deliverable:** `test/test_integration.c` lines 3230-4000 (+600 lines)
+
+---
+
+### D-TEST-INVARIANTS: Validation Hazard Model & Invariant Framework
+**Date:** 2026-06-27 | **From:** Gandalf (Lead/Architect)  
+**Status:** Proposed
+
+**System Invariants (INV-1 through INV-6):**
+1. **Snapshot Isolation:** Once SQLite reads under SHARED lock, all pages from same blob version (ETag)
+2. **Lease ↔ Write Exclusivity:** Page writes only while holding valid lease
+3. **ETag Freshness:** Cached ETag reflects blob state at SHARED lock acquisition
+4. **Dirty Bitmap ↔ Cache Consistency:** Dirty pages backed in cache file (no outdated copies)
+5. **Journal Atomicity:** Full journal upload before xSync returns
+6. **No Writes Without Lease:** All page_blob_write calls include non-empty leaseId
+
+**Hazard Classification:** P0 (Lease expiry, stale snapshot write-through), P1 (Cache I/O errors, network partition), P2 (Azurite empty ETag, journal cleanup), P3 (Stale cache after crash)
+
+**Validation Priorities:**
+- Tier 1: Multi-writer snapshot isolation (covered by D-CW-003), lease expiry during flush, ETag revalidation
+- Tier 2: Crash recovery with journal, cache file corruption, concurrent lease break
+- Tier 3: Network timeouts, large transaction lease renewal
+
+**References:** `.squad/decisions/inbox/gandalf-validation-hazard-model.md`
+
+---
+
+### D-TEST-HOOKS: VFS Test Hooks Design — Deterministic Testing Infrastructure
+**Date:** 2026-06-27 | **From:** Aragorn (SQLite/C Developer)  
+**Status:** Proposed
+
+**Goal:** Enable deterministic interleavings, crash/partial-write simulation, lease expiry testing without compromising production behavior.
+
+**Proposed Hooks (all guarded by `#ifdef SQLITE_OBJS_TEST`):**
+
+1. **Deterministic Time Hook** (~20 lines) — Replace `time(NULL)` for lease expiry tests
+   - Enable: Lease expiry tests, renewal tests
+   - Risk: Low — simple wrapper
+
+2. **Crash/Partial-Write Hook** (~40 lines) — Simulate partial writes during xSync
+   - Enable: Durability tests, journal recovery
+   - Risk: Low — callback before write
+
+3. **Mock Lease Expiry** (~50 lines) — Enforce lease expiry in mock layer
+   - Enable: Concurrent writer tests with deterministic failures
+   - Risk: Low — mock-only change
+
+4. **Interleaving Control Hook** (~30 lines) — Force specific operation orderings
+   - Enable: Advanced concurrency tests
+   - Risk: Medium — requires careful barrier placement
+
+5. **Invariant Checking Hook** (~20 lines) — Assert invariants at critical points
+   - Enable: Continuous correctness validation
+   - Risk: Low — assertion callbacks
+
+**Critical Path:** Hooks 1-3 sufficient for immediate needs. Hooks 4-5 optional enhancements.
+
+**Total:** ~160 lines of test-only code, zero production overhead.
+
+**Files Affected:** `src/sqlite_objs_vfs.c` (~60 lines guarded), `src/sqlite_objs.h` (~15 lines), `test/mock_azure_ops.c` (~40 lines)
+
+**References:** `.squad/decisions/inbox/aragorn-vfs-test-hooks.md`
+
+---
+
+### D-TEST-CHAOS: Azure Chaos Validation Plan — Fault Injection Strategy
+**Date:** 2026-06-27 | **From:** Frodo (Azure Expert)  
+**Status:** Proposal — Awaiting Review
+
+**Scope Gap:** Strong Layer 1 (mock) and Layer 2 (Azurite) coverage, but lacks systematic fault injection for:
+- ETag race conditions (missing/stale ETags, concurrent modifications)
+- Lease timing edge cases (expiry during long transactions, renewal failures, break delays)
+- Network-level faults (partial writes, HEAD/PUT delays, transient errors)
+- Retry behavior validation (exponential backoff, Retry-After header, exhaustion)
+
+**3-Phase Approach:**
+
+**Phase 1 (Current, P0):** Enhanced Mock Chaos Testing (6-10 days)
+- 1.1 ETag Hazard Tests (5 tests): missing ETags, stale ETags, race conditions, revalidation, concurrent write conflicts
+- 1.2 Lease Timing Tests (5 tests): expiry during transaction, renewal failure, break delay, immediate break, acquire race
+- 1.3 Retry Behavior (5 tests): exponential backoff, Retry-After header, exhaustion, permanent errors, jitter
+- 1.4 Partial Write Simulation (3 tests): partial page write, connection drop, truncated upload
+- **Deliverable:** 18 deterministic tests in <10s, zero external dependencies
+
+**Phase 2 (MVP 2, P1):** Toxiproxy Integration (5-7 days)
+- Network-level chaos: latency, bandwidth limits, timeouts, reset, slow close
+- 7 tests, <5 min runtime in CI
+
+**Phase 3 (Post-MVP 2, P2):** Real Azure Validation (3-4 days)
+- Weekly CI against real Azure Storage
+- 6 tests, multi-region coverage
+
+**Recommendation:** Approve Phase 1 immediately. Concurrent write bug (D-CW-001) proved chaos testing is correctness-critical, not optional.
+
+**Files to Modify:**
+- `test/mock_azure_ops.h` — Add timing/ETag injection APIs
+- `test/mock_azure_ops.c` — Implement timing engine, ETag control, partial write simulation
+- `test/test_azure_client.c` — Add retry behavior tests
+- `test/test_vfs.c` or new `test/test_lease_timing.c` — Lease timing tests
+- `test/test_etag_chaos.c` (new) — ETag race condition tests
+
+**Success Metrics:**
+- 18 new chaos tests passing in <10s
+- Zero flaky tests (deterministic timing)
+- At least 2 bugs found and fixed
+
+**References:** `.squad/decisions/inbox/frodo-azure-chaos-validation.md`
+
+---

@@ -53,8 +53,8 @@ CURL_LDFLAGS    := $(shell $(PKG_CONFIG) --libs libcurl 2>/dev/null || echo "-lc
 CFLAGS_ALL   = $(CFLAGS) $(OPENSSL_CFLAGS) $(CURL_CFLAGS)
 LDFLAGS_ALL  = $(LDFLAGS) $(CURL_LDFLAGS) $(OPENSSL_LDFLAGS)
 
-# Test-specific CFLAGS
-TEST_CFLAGS = $(CFLAGS) $(OPENSSL_CFLAGS) -I$(TEST_DIR)
+# Test-specific CFLAGS (enable test hooks)
+TEST_CFLAGS = $(CFLAGS) $(OPENSSL_CFLAGS) $(CURL_CFLAGS) -I$(TEST_DIR) -DSQLITE_OBJS_TEST
 
 # ---------- Core objects ----------
 
@@ -72,9 +72,13 @@ SHELL_BIN   = sqlite-objs-shell
 
 # Unit test objects (stub client — no curl/OpenSSL needed for mocks)
 MOCK_OBJ    = $(BUILD_DIR)/mock_azure_ops.o
-TEST_OBJS   = $(SQLITE_OBJ) $(BUILD_DIR)/sqlite_objs_vfs.o \
+TEST_VFS_OBJ = $(BUILD_DIR)/sqlite_objs_vfs_test.o
+TEST_OBJS   = $(SQLITE_OBJ) $(TEST_VFS_OBJ) \
               $(BUILD_DIR)/azure_client_stub.o $(MOCK_OBJ) \
               $(BUILD_DIR)/azure_auth.o $(BUILD_DIR)/azure_error.o
+TEST_LIB_OBJS = $(SQLITE_OBJ) $(TEST_VFS_OBJ) \
+               $(BUILD_DIR)/azure_client.o \
+               $(BUILD_DIR)/azure_auth.o $(BUILD_DIR)/azure_error.o
 
 # Benchmark binaries
 SPEEDTEST1_BIN       = $(BENCH_DIR)/speedtest1
@@ -119,6 +123,9 @@ $(SQLITE_OBJ): $(SQLITE_DIR)/sqlite3.c | $(BUILD_DIR)
 
 $(BUILD_DIR)/sqlite_objs_vfs.o: $(SRC_DIR)/sqlite_objs_vfs.c $(SRC_DIR)/sqlite_objs.h $(SRC_DIR)/azure_client.h | $(BUILD_DIR)
 	$(CC) $(CFLAGS_ALL) -c -o $@ $<
+
+$(TEST_VFS_OBJ): $(SRC_DIR)/sqlite_objs_vfs.c $(SRC_DIR)/sqlite_objs.h $(SRC_DIR)/azure_client.h | $(BUILD_DIR)
+	$(CC) $(TEST_CFLAGS) -c -o $@ $<
 
 $(BUILD_DIR)/azure_client.o: $(SRC_DIR)/azure_client.c $(SRC_DIR)/azure_client_impl.h $(SRC_DIR)/azure_client.h | $(BUILD_DIR)
 	$(CC) $(CFLAGS_ALL) -c -o $@ $<
@@ -196,8 +203,8 @@ test-integration: $(BUILD_DIR)/test_integration
 	@echo "=== Running integration tests (requires Azurite) ==="
 	@./test/run-integration.sh
 
-$(BUILD_DIR)/test_integration: $(TEST_DIR)/test_integration.c $(TEST_DIR)/test_harness.h $(LIB_OBJS) | $(BUILD_DIR)
-	$(CC) $(TEST_CFLAGS) -o $@ $< $(LIB_OBJS) $(LDFLAGS_ALL)
+$(BUILD_DIR)/test_integration: $(TEST_DIR)/test_integration.c $(TEST_DIR)/test_harness.h $(TEST_LIB_OBJS) | $(BUILD_DIR)
+	$(CC) $(TEST_CFLAGS) -o $@ $< $(TEST_LIB_OBJS) $(LDFLAGS_ALL)
 
 test: test-unit test-integration
 

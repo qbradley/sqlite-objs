@@ -91,6 +91,7 @@ typedef struct {
     /* ETag simulation — version increments on every mutation */
     int             etag_version;
     char            etag[128];
+    int             omit_next_etag;  /* Chaos: suppress next response ETag */
 
     /* Lease state */
     mock_lease_state_t lease_state;
@@ -134,6 +135,9 @@ struct mock_azure_ctx {
     /* Append call recording for WAL chunking tests */
     mock_append_record_t append_records[MOCK_MAX_APPEND_RECORDS];
     int                  append_record_count;
+
+    /* Chaos testing (Phase 1/P0) */
+    int          time_offset_seconds;  /* For deterministic lease expiry tests */
 };
 
 /* ── Internal helpers ─────────────────────────────────────────────── */
@@ -161,10 +165,57 @@ static void bump_etag(mock_blob_t *b) {
 }
 
 /* Copy blob's current ETag into an azure_error_t */
-static void set_etag(azure_error_t *err, const mock_blob_t *b) {
-    if (err && b->etag[0] != '\0') {
+static void set_etag(azure_error_t *err, mock_blob_t *b) {
+    if (!err || !b) return;
+    if (b->omit_next_etag) {
+        err->etag[0] = '\0';
+        b->omit_next_etag = 0;
+        return;
+    }
+    if (b->etag[0] != '\0') {
         memcpy(err->etag, b->etag, sizeof(err->etag));
     }
+}
+
+static void set_error(azure_error_t *err, int http_status,
+                      const char *code, const char *msg);
+
+/* Get current mock time (real time + offset for chaos testing) */
+static time_t mock_time_now(const mock_azure_ctx_t *ctx) {
+    return time(NULL) + ctx->time_offset_seconds;
+}
+
+static int mock_lease_expired(const mock_azure_ctx_t *ctx, const mock_blob_t *b) {
+    if (!ctx || !b) return 0;
+    if (b->lease_state != LEASE_LEASED) return 0;
+    if (b->lease_duration < 0) return 0;
+    return difftime(mock_time_now(ctx), b->lease_acquired_at) >= b->lease_duration;
+}
+
+static void mock_clear_lease(mock_blob_t *b) {
+    b->lease_state = LEASE_AVAILABLE;
+    b->lease_id[0] = '\0';
+    b->lease_duration = 0;
+    b->lease_acquired_at = 0;
+}
+
+static azure_err_t validate_lease_id(mock_azure_ctx_t *ctx, mock_blob_t *b,
+                                     const char *lease_id, azure_error_t *err) {
+    if (mock_lease_expired(ctx, b)) {
+        mock_clear_lease(b);
+        set_error(err, 409, "LeaseExpired", "The lease has expired");
+        return AZURE_ERR_LEASE_EXPIRED;
+    }
+    if ((!lease_id || lease_id[0] == '\0') && b->lease_state == LEASE_LEASED) {
+        set_error(err, 409, "LeaseIdMissing", "A lease ID is required");
+        return AZURE_ERR_CONFLICT;
+    }
+    if (!lease_id || lease_id[0] == '\0') return AZURE_OK;
+    if (b->lease_state != LEASE_LEASED || strcmp(b->lease_id, lease_id) != 0) {
+        set_error(err, 409, "LeaseIdMismatch", "The lease ID does not match");
+        return AZURE_ERR_CONFLICT;
+    }
+    return AZURE_OK;
 }
 
 static mock_blob_t *create_blob(mock_azure_ctx_t *ctx, const char *name,
@@ -181,7 +232,7 @@ static mock_blob_t *create_blob(mock_azure_ctx_t *ctx, const char *name,
 
 static void generate_lease_id(mock_azure_ctx_t *ctx, char *out, size_t size) {
     snprintf(out, size, "mock-lease-%04d-%08x",
-             ctx->next_lease_num++, (unsigned)(time(NULL) & 0xFFFFFFFF));
+             ctx->next_lease_num++, (unsigned)(mock_time_now(ctx) & 0xFFFFFFFF));
 }
 
 static void set_error(azure_error_t *err, int http_status,
@@ -283,6 +334,8 @@ static azure_err_t mock_page_blob_create(void *vctx, const char *name,
             return AZURE_ERR_NOMEM;
         }
         b->size = size;
+        bump_etag(b);
+        set_etag(err, b);
         return AZURE_OK;
     }
 
@@ -299,6 +352,7 @@ static azure_err_t mock_page_blob_create(void *vctx, const char *name,
         }
     }
     b->size = size;
+    set_etag(err, b);
     return AZURE_OK;
 }
 
@@ -308,7 +362,6 @@ static azure_err_t mock_page_blob_write(void *vctx, const char *name,
                                          const char *if_match,
                                          azure_error_t *err) {
     mock_azure_ctx_t *ctx = (mock_azure_ctx_t *)vctx;
-    (void)lease_id;  /* Mock does not enforce lease on writes */
     (void)if_match;  /* Mock does not enforce ETag matching */
     azure_err_t rc = pre_call(ctx, OP_PAGE_BLOB_WRITE, err);
     if (rc != AZURE_OK) return rc;
@@ -330,6 +383,8 @@ static azure_err_t mock_page_blob_write(void *vctx, const char *name,
         set_error(err, 404, "BlobNotFound", "Page blob not found");
         return AZURE_ERR_NOT_FOUND;
     }
+    rc = validate_lease_id(ctx, b, lease_id, err);
+    if (rc != AZURE_OK) return rc;
 
     /* Auto-grow if needed */
     int64_t end = offset + (int64_t)len;
@@ -407,7 +462,6 @@ static azure_err_t mock_page_blob_resize(void *vctx, const char *name,
                                           const char *lease_id,
                                           azure_error_t *err) {
     mock_azure_ctx_t *ctx = (mock_azure_ctx_t *)vctx;
-    (void)lease_id;  /* Mock does not enforce lease on resize */
     azure_err_t rc = pre_call(ctx, OP_PAGE_BLOB_RESIZE, err);
     if (rc != AZURE_OK) return rc;
 
@@ -422,6 +476,8 @@ static azure_err_t mock_page_blob_resize(void *vctx, const char *name,
         set_error(err, 404, "BlobNotFound", "Page blob not found");
         return AZURE_ERR_NOT_FOUND;
     }
+    rc = validate_lease_id(ctx, b, lease_id, err);
+    if (rc != AZURE_OK) return rc;
 
     if (new_size > b->size) {
         if (ensure_capacity(b, new_size) != 0) {
@@ -566,6 +622,9 @@ static azure_err_t mock_blob_get_properties(void *vctx, const char *name,
         set_error(err, 404, "BlobNotFound", "Blob not found");
         return AZURE_ERR_NOT_FOUND;
     }
+    if (mock_lease_expired(ctx, b)) {
+        mock_clear_lease(b);
+    }
 
     if (size) *size = b->size;
 
@@ -639,6 +698,10 @@ static azure_err_t mock_lease_acquire_impl(void *vctx, const char *name,
         return AZURE_ERR_NOT_FOUND;
     }
 
+    if (mock_lease_expired(ctx, b)) {
+        mock_clear_lease(b);
+    }
+
     if (b->lease_state == LEASE_LEASED) {
         set_error(err, 409, "LeaseAlreadyPresent",
                   "There is already a lease present");
@@ -654,7 +717,7 @@ static azure_err_t mock_lease_acquire_impl(void *vctx, const char *name,
     /* Acquire the lease */
     b->lease_state = LEASE_LEASED;
     b->lease_duration = duration_secs;
-    b->lease_acquired_at = time(NULL);
+    b->lease_acquired_at = mock_time_now(ctx);
     generate_lease_id(ctx, b->lease_id, LEASE_ID_LEN);
 
     if (lease_id_out && lease_id_size > 0) {
@@ -678,6 +741,12 @@ static azure_err_t mock_lease_renew_impl(void *vctx, const char *name,
         return AZURE_ERR_NOT_FOUND;
     }
 
+    if (mock_lease_expired(ctx, b)) {
+        mock_clear_lease(b);
+        set_error(err, 409, "LeaseExpired", "The lease has expired");
+        return AZURE_ERR_LEASE_EXPIRED;
+    }
+
     if (b->lease_state != LEASE_LEASED) {
         set_error(err, 409, "LeaseNotPresent",
                   "There is currently no lease on the blob");
@@ -690,7 +759,7 @@ static azure_err_t mock_lease_renew_impl(void *vctx, const char *name,
         return AZURE_ERR_CONFLICT;
     }
 
-    b->lease_acquired_at = time(NULL);
+    b->lease_acquired_at = mock_time_now(ctx);
     return AZURE_OK;
 }
 
@@ -705,6 +774,12 @@ static azure_err_t mock_lease_release_impl(void *vctx, const char *name,
     if (!b) {
         set_error(err, 404, "BlobNotFound", "Blob not found");
         return AZURE_ERR_NOT_FOUND;
+    }
+
+    if (mock_lease_expired(ctx, b)) {
+        mock_clear_lease(b);
+        set_error(err, 409, "LeaseExpired", "The lease has expired");
+        return AZURE_ERR_LEASE_EXPIRED;
     }
 
     if (b->lease_state != LEASE_LEASED) {
@@ -926,6 +1001,7 @@ void mock_reset(mock_azure_ctx_t *ctx) {
     ctx->next_lease_num = 0;
     ctx->write_record_count = 0;
     ctx->append_record_count = 0;
+    ctx->time_offset_seconds = 0;  /* Reset chaos time offset */
 }
 
 /* ══════════════════════════════════════════════════════════════════════
@@ -1019,6 +1095,9 @@ int mock_is_leased(mock_azure_ctx_t *ctx, const char *name) {
     if (!ctx) return 0;
     mock_blob_t *b = find_blob(ctx, name);
     if (!b) return 0;
+    if (mock_lease_expired(ctx, b)) {
+        mock_clear_lease(b);
+    }
     return b->lease_state == LEASE_LEASED ? 1 : 0;
 }
 
@@ -1027,12 +1106,18 @@ mock_lease_state_t mock_get_lease_state(mock_azure_ctx_t *ctx,
     if (!ctx) return LEASE_AVAILABLE;
     mock_blob_t *b = find_blob(ctx, name);
     if (!b) return LEASE_AVAILABLE;
+    if (mock_lease_expired(ctx, b)) {
+        mock_clear_lease(b);
+    }
     return b->lease_state;
 }
 
 const char *mock_get_lease_id(mock_azure_ctx_t *ctx, const char *name) {
     if (!ctx) return NULL;
     mock_blob_t *b = find_blob(ctx, name);
+    if (b && mock_lease_expired(ctx, b)) {
+        mock_clear_lease(b);
+    }
     if (!b || b->lease_state != LEASE_LEASED) return NULL;
     return b->lease_id;
 }
@@ -1121,4 +1206,31 @@ void mock_reset_append_data(mock_azure_ctx_t *ctx, const char *name) {
     mock_blob_t *b = find_blob(ctx, name);
     if (!b || b->type != BLOB_TYPE_APPEND) return;
     b->size = 0;
+}
+
+/* ══════════════════════════════════════════════════════════════════════
+** Public API — Chaos injection (Phase 1/P0)
+** ══════════════════════════════════════════════════════════════════════ */
+
+int mock_chaos_clear_etag(mock_azure_ctx_t *ctx, const char *name) {
+    if (!ctx || !name) return -1;
+    mock_blob_t *b = find_blob(ctx, name);
+    if (!b) return -1;
+    b->omit_next_etag = 1;
+    return 0;
+}
+
+void mock_chaos_advance_time(mock_azure_ctx_t *ctx, int seconds) {
+    if (!ctx) return;
+    ctx->time_offset_seconds += seconds;
+}
+
+int mock_chaos_get_time_offset(mock_azure_ctx_t *ctx) {
+    if (!ctx) return 0;
+    return ctx->time_offset_seconds;
+}
+
+void mock_chaos_reset_time(mock_azure_ctx_t *ctx) {
+    if (!ctx) return;
+    ctx->time_offset_seconds = 0;
 }

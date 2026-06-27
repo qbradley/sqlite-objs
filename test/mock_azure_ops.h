@@ -90,6 +90,35 @@ void mock_set_fail_operation_at(mock_azure_ctx_t *ctx, const char *op_name,
 void mock_clear_failures(mock_azure_ctx_t *ctx);
 
 /* ══════════════════════════════════════════════════════════════════════
+** Chaos injection (Phase 1/P0)
+** ══════════════════════════════════════════════════════════════════════ */
+
+/*
+** Suppress the next ETag response for a blob.
+** This tests cache revalidation logic when Azure doesn't return an ETag
+** without mutating the blob's stored ETag/version.
+** Returns 0 on success, -1 if blob not found.
+*/
+int mock_chaos_clear_etag(mock_azure_ctx_t *ctx, const char *name);
+
+/*
+** Advance mock time by the specified number of seconds.
+** This allows deterministic lease expiry tests without real time delays.
+** Example: mock_chaos_advance_time(ctx, 60) simulates a 60-second delay.
+*/
+void mock_chaos_advance_time(mock_azure_ctx_t *ctx, int seconds);
+
+/*
+** Get the current mock time offset in seconds.
+*/
+int mock_chaos_get_time_offset(mock_azure_ctx_t *ctx);
+
+/*
+** Reset mock time to the real current time (clear all time advancement).
+*/
+void mock_chaos_reset_time(mock_azure_ctx_t *ctx);
+
+/* ══════════════════════════════════════════════════════════════════════
 ** Call counting
 ** ══════════════════════════════════════════════════════════════════════ */
 
