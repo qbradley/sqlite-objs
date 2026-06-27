@@ -167,6 +167,31 @@ int azure_buffer_append(azure_buffer_t *buf, const uint8_t *data, size_t len);
  * in azure_client.h — included above.
  */
 
+#ifdef SQLITE_OBJS_TEST
+/* ================================================================
+ * Test-only retry observation hook
+ *
+ * Allows tests to observe retry behavior in execute_with_retry()
+ * without mutating production logic. Called on each retry attempt.
+ * ================================================================ */
+
+typedef struct azure_retry_event {
+    const char *method;       /* HTTP method (GET, PUT, etc.) */
+    const char *blob_name;    /* Blob name */
+    azure_err_t error_code;   /* Error that triggered retry */
+    int http_status;          /* HTTP status code */
+    int attempt;              /* 0-based attempt number */
+    int max_retries;          /* Maximum retry count */
+    int delay_ms;             /* Computed backoff delay */
+    int retry_after;          /* Retry-After header value (-1 if not present) */
+} azure_retry_event_t;
+
+typedef void (*azure_retry_hook_fn)(const azure_retry_event_t *event, void *ctx);
+
+void azure_test_set_retry_hook(azure_retry_hook_fn hook, void *ctx);
+
+#endif /* SQLITE_OBJS_TEST */
+
 #ifdef __cplusplus
 }
 #endif

@@ -49,6 +49,20 @@ static const azure_ops_t *g_ops = NULL;
 static void *g_ctx = NULL;
 
 /* ================================================================
+ * Stress test parameterization (environment-controlled)
+ * ================================================================ */
+
+/* Get stress multiplier from environment (default: 1) */
+static int get_stress_multiplier(void) {
+    const char *env = getenv("SQLITE_OBJS_STRESS_MULTIPLIER");
+    if (env == NULL || *env == '\0') {
+        return 1;
+    }
+    int mult = atoi(env);
+    return (mult > 0) ? mult : 1;
+}
+
+/* ================================================================
  * Setup / Teardown
  * ================================================================ */
 
@@ -3347,9 +3361,10 @@ TEST(concurrent_writers_regression) {
     ASSERT_OK(rc);
     sqlite3_close(init);
 
-    /* Spawn concurrent writers */
-    const int num_writers = 4;
-    const int inserts_per_writer = 10;
+    /* Spawn concurrent writers (default: 4 × 10, stress mode: 4×mult × 10×mult) */
+    const int mult = get_stress_multiplier();
+    const int num_writers = 4 * mult;
+    const int inserts_per_writer = 10 * mult;
     pthread_t threads[num_writers];
     writer_context_t contexts[num_writers];
     int assigned_ids[num_writers][inserts_per_writer];
@@ -3607,9 +3622,10 @@ TEST(stress_8_writers_25_each) {
     ASSERT_OK(rc);
     sqlite3_close(init);
     
-    /* Spawn 8 concurrent writers */
-    const int num_writers = 8;
-    const int inserts_per_writer = 25;
+    /* Spawn concurrent writers (default: 8 × 25, stress mode: 8×mult × 25×mult) */
+    const int mult = get_stress_multiplier();
+    const int num_writers = 8 * mult;
+    const int inserts_per_writer = 25 * mult;
     pthread_t threads[num_writers];
     writer_context_t contexts[num_writers];
     int assigned_ids[num_writers][inserts_per_writer];
@@ -3702,8 +3718,10 @@ TEST(stress_16_writers_20_each) {
     sqlite3_close(init);
     
     /* Spawn 16 concurrent writers */
-    const int num_writers = 16;
-    const int inserts_per_writer = 20;
+    /* Spawn concurrent writers (default: 16 × 20, stress mode: 16×mult × 20×mult) */
+    const int mult = get_stress_multiplier();
+    const int num_writers = 16 * mult;
+    const int inserts_per_writer = 20 * mult;
     pthread_t threads[num_writers];
     writer_context_t contexts[num_writers];
     int assigned_ids[num_writers][inserts_per_writer];
@@ -4608,6 +4626,768 @@ TEST(invariant_check_after_crash_stress) {
 }
 
 /* ================================================================
+ * J. Phase 3: Deterministic Randomized/Property-Based Testing
+ * ================================================================ */
+
+/* ─────────────────────────────────────────────────────────────────
+ * J.1 Pseudo-Random Number Generator (Fixed Seed)
+ * ───────────────────────────────────────────────────────────────── */
+
+/*
+ * Simple LCG (Linear Congruential Generator) for deterministic randomness.
+ * Constants from Numerical Recipes (good statistical properties).
+ */
+typedef struct {
+    uint64_t state;
+} prng_t;
+
+static void prng_seed(prng_t *rng, uint64_t seed) {
+    rng->state = seed;
+}
+
+static uint32_t prng_next(prng_t *rng) {
+    rng->state = rng->state * 1664525ULL + 1013904223ULL;
+    return (uint32_t)(rng->state >> 32);
+}
+
+static int prng_range(prng_t *rng, int min, int max) {
+    if (min >= max) return min;
+    uint32_t range = (uint32_t)(max - min + 1);
+    return min + (int)(prng_next(rng) % range);
+}
+
+/* ─────────────────────────────────────────────────────────────────
+ * J.2 Model State Tracker
+ * ───────────────────────────────────────────────────────────────── */
+
+#define MAX_MODEL_ROWS 1000
+
+typedef struct {
+    int id;
+    int value;
+    int active;  /* 1 if exists, 0 if deleted */
+} model_row_t;
+
+typedef struct {
+    model_row_t rows[MAX_MODEL_ROWS];
+    int row_count;
+    int in_transaction;
+    int next_id;
+    /* Snapshot for rollback */
+    model_row_t snapshot[MAX_MODEL_ROWS];
+    int snapshot_count;
+    int snapshot_next_id;
+} model_state_t;
+
+static void model_init(model_state_t *m) {
+    memset(m, 0, sizeof(*m));
+    m->next_id = 1;
+}
+
+static void model_begin(model_state_t *m) {
+    /* Save snapshot */
+    memcpy(m->snapshot, m->rows, sizeof(m->rows));
+    m->snapshot_count = m->row_count;
+    m->snapshot_next_id = m->next_id;
+    m->in_transaction = 1;
+}
+
+static void model_commit(model_state_t *m) {
+    m->in_transaction = 0;
+}
+
+static void model_rollback(model_state_t *m) {
+    /* Restore snapshot */
+    memcpy(m->rows, m->snapshot, sizeof(m->rows));
+    m->row_count = m->snapshot_count;
+    m->next_id = m->snapshot_next_id;
+    m->in_transaction = 0;
+}
+
+static int model_insert(model_state_t *m, int value) {
+    if (m->row_count >= MAX_MODEL_ROWS) return -1;
+    
+    int id = m->next_id++;
+    m->rows[m->row_count].id = id;
+    m->rows[m->row_count].value = value;
+    m->rows[m->row_count].active = 1;
+    m->row_count++;
+    return id;
+}
+
+static int model_update(model_state_t *m, int id, int new_value) {
+    for (int i = 0; i < m->row_count; i++) {
+        if (m->rows[i].id == id && m->rows[i].active) {
+            m->rows[i].value = new_value;
+            return 1;
+        }
+    }
+    return 0;  /* Not found */
+}
+
+static int model_delete(model_state_t *m, int id) {
+    for (int i = 0; i < m->row_count; i++) {
+        if (m->rows[i].id == id && m->rows[i].active) {
+            m->rows[i].active = 0;
+            return 1;
+        }
+    }
+    return 0;  /* Not found */
+}
+
+static int model_count_active(model_state_t *m) {
+    int count = 0;
+    for (int i = 0; i < m->row_count; i++) {
+        if (m->rows[i].active) count++;
+    }
+    return count;
+}
+
+/* ─────────────────────────────────────────────────────────────────
+ * J.3 Operation Types & Execution
+ * ───────────────────────────────────────────────────────────────── */
+
+typedef enum {
+    OP_INSERT,
+    OP_UPDATE,
+    OP_DELETE,
+    OP_BEGIN,
+    OP_COMMIT,
+    OP_ROLLBACK,
+    OP_REOPEN
+} op_type_t;
+
+typedef struct {
+    op_type_t type;
+    int param1;  /* For INSERT: value; for UPDATE/DELETE: id */
+    int param2;  /* For UPDATE: new_value */
+} operation_t;
+
+static const char* op_name(op_type_t t) {
+    switch (t) {
+        case OP_INSERT: return "INSERT";
+        case OP_UPDATE: return "UPDATE";
+        case OP_DELETE: return "DELETE";
+        case OP_BEGIN: return "BEGIN";
+        case OP_COMMIT: return "COMMIT";
+        case OP_ROLLBACK: return "ROLLBACK";
+        case OP_REOPEN: return "REOPEN";
+        default: return "UNKNOWN";
+    }
+}
+
+static int execute_op(sqlite3 **db_ptr, const char *db_name, 
+                      model_state_t *model, operation_t *op,
+                      int *last_insert_id, int verbose) {
+    sqlite3 *db = *db_ptr;
+    int rc = SQLITE_OK;
+    char sql[256];
+    
+    switch (op->type) {
+        case OP_INSERT: {
+            snprintf(sql, sizeof(sql), 
+                "INSERT INTO prop_test (value) VALUES (%d);", op->param1);
+            rc = exec_sql(db, sql);
+            if (rc == SQLITE_OK) {
+                *last_insert_id = model_insert(model, op->param1);
+                if (verbose) {
+                    fprintf(stdout, "    INSERT value=%d -> id=%d\n", 
+                            op->param1, *last_insert_id);
+                }
+            }
+            break;
+        }
+        
+        case OP_UPDATE: {
+            if (model_count_active(model) == 0) {
+                /* Skip update if no rows */
+                if (verbose) fprintf(stdout, "    UPDATE skipped (no rows)\n");
+                return SQLITE_OK;
+            }
+            snprintf(sql, sizeof(sql),
+                "UPDATE prop_test SET value = %d WHERE id = %d;", 
+                op->param2, op->param1);
+            rc = exec_sql(db, sql);
+            if (rc == SQLITE_OK) {
+                int updated = model_update(model, op->param1, op->param2);
+                if (verbose) {
+                    fprintf(stdout, "    UPDATE id=%d value=%d (%s)\n",
+                            op->param1, op->param2, updated ? "found" : "not found");
+                }
+            }
+            break;
+        }
+        
+        case OP_DELETE: {
+            if (model_count_active(model) == 0) {
+                /* Skip delete if no rows */
+                if (verbose) fprintf(stdout, "    DELETE skipped (no rows)\n");
+                return SQLITE_OK;
+            }
+            snprintf(sql, sizeof(sql),
+                "DELETE FROM prop_test WHERE id = %d;", op->param1);
+            rc = exec_sql(db, sql);
+            if (rc == SQLITE_OK) {
+                int deleted = model_delete(model, op->param1);
+                if (verbose) {
+                    fprintf(stdout, "    DELETE id=%d (%s)\n",
+                            op->param1, deleted ? "found" : "not found");
+                }
+            }
+            break;
+        }
+        
+        case OP_BEGIN: {
+            /* Skip if already in transaction */
+            if (model->in_transaction) {
+                if (verbose) fprintf(stdout, "    BEGIN skipped (already in txn)\n");
+                return SQLITE_OK;
+            }
+            rc = exec_sql(db, "BEGIN;");
+            if (rc == SQLITE_OK) {
+                model_begin(model);
+                if (verbose) fprintf(stdout, "    BEGIN\n");
+            }
+            break;
+        }
+        
+        case OP_COMMIT: {
+            /* Skip if not in transaction */
+            if (!model->in_transaction) {
+                if (verbose) fprintf(stdout, "    COMMIT skipped (no active txn)\n");
+                return SQLITE_OK;
+            }
+            rc = exec_sql(db, "COMMIT;");
+            if (rc == SQLITE_OK) {
+                model_commit(model);
+                if (verbose) fprintf(stdout, "    COMMIT\n");
+            }
+            break;
+        }
+        
+        case OP_ROLLBACK: {
+            /* Skip if not in transaction */
+            if (!model->in_transaction) {
+                if (verbose) fprintf(stdout, "    ROLLBACK skipped (no active txn)\n");
+                return SQLITE_OK;
+            }
+            rc = exec_sql(db, "ROLLBACK;");
+            if (rc == SQLITE_OK) {
+                model_rollback(model);
+                if (verbose) fprintf(stdout, "    ROLLBACK\n");
+            }
+            break;
+        }
+        
+        case OP_REOPEN: {
+            sqlite3_close(db);
+            db = open_azurite_db(db_name, NULL, 0);
+            *db_ptr = db;
+            if (!db) {
+                fprintf(stderr, "    REOPEN failed\n");
+                return SQLITE_CANTOPEN;
+            }
+            /* After reopen, any uncommitted transaction is rolled back */
+            if (model->in_transaction) {
+                model_rollback(model);
+            }
+            if (verbose) fprintf(stdout, "    REOPEN\n");
+            break;
+        }
+    }
+    
+    return rc;
+}
+
+/* ─────────────────────────────────────────────────────────────────
+ * J.4 Validation: Model vs. Database
+ * ───────────────────────────────────────────────────────────────── */
+
+static int validate_model_vs_db(sqlite3 *db, model_state_t *model, 
+                                 int verbose, uint64_t seed) {
+    /* 1. Check row count */
+    int db_count = 0;
+    int rc = query_int(db, "SELECT COUNT(*) FROM prop_test;", &db_count);
+    if (rc != SQLITE_OK) {
+        fprintf(stderr, "  VALIDATION FAILED: Cannot query count (rc=%d)\n", rc);
+        fprintf(stderr, "  Seed: %lu\n", (unsigned long)seed);
+        return 0;
+    }
+    
+    int model_count = model_count_active(model);
+    if (db_count != model_count) {
+        fprintf(stderr, "  VALIDATION FAILED: Count mismatch\n");
+        fprintf(stderr, "    Model: %d rows, DB: %d rows\n", model_count, db_count);
+        fprintf(stderr, "  Seed: %lu\n", (unsigned long)seed);
+        return 0;
+    }
+    
+    if (verbose) {
+        fprintf(stdout, "    Count check: %d rows (OK)\n", db_count);
+    }
+    
+    /* 2. Check each active row exists in DB with correct value */
+    for (int i = 0; i < model->row_count; i++) {
+        if (!model->rows[i].active) continue;
+        
+        char sql[256];
+        snprintf(sql, sizeof(sql),
+            "SELECT value FROM prop_test WHERE id = %d;", model->rows[i].id);
+        
+        sqlite3_stmt *stmt = NULL;
+        rc = sqlite3_prepare_v2(db, sql, -1, &stmt, NULL);
+        if (rc != SQLITE_OK) {
+            fprintf(stderr, "  VALIDATION FAILED: Cannot prepare for id=%d\n",
+                    model->rows[i].id);
+            fprintf(stderr, "  Seed: %lu\n", (unsigned long)seed);
+            return 0;
+        }
+        
+        rc = sqlite3_step(stmt);
+        if (rc != SQLITE_ROW) {
+            fprintf(stderr, "  VALIDATION FAILED: Row id=%d not found in DB\n",
+                    model->rows[i].id);
+            fprintf(stderr, "  Seed: %lu\n", (unsigned long)seed);
+            sqlite3_finalize(stmt);
+            return 0;
+        }
+        
+        int db_value = sqlite3_column_int(stmt, 0);
+        if (db_value != model->rows[i].value) {
+            fprintf(stderr, "  VALIDATION FAILED: Value mismatch for id=%d\n",
+                    model->rows[i].id);
+            fprintf(stderr, "    Model: %d, DB: %d\n", 
+                    model->rows[i].value, db_value);
+            fprintf(stderr, "  Seed: %lu\n", (unsigned long)seed);
+            sqlite3_finalize(stmt);
+            return 0;
+        }
+        
+        sqlite3_finalize(stmt);
+    }
+    
+    /* 3. Check DB doesn't have extra rows */
+    sqlite3_stmt *stmt = NULL;
+    rc = sqlite3_prepare_v2(db, "SELECT id FROM prop_test;", -1, &stmt, NULL);
+    if (rc != SQLITE_OK) {
+        fprintf(stderr, "  VALIDATION FAILED: Cannot query all IDs\n");
+        fprintf(stderr, "  Seed: %lu\n", (unsigned long)seed);
+        return 0;
+    }
+    
+    while (sqlite3_step(stmt) == SQLITE_ROW) {
+        int db_id = sqlite3_column_int(stmt, 0);
+        int found = 0;
+        for (int i = 0; i < model->row_count; i++) {
+            if (model->rows[i].id == db_id && model->rows[i].active) {
+                found = 1;
+                break;
+            }
+        }
+        if (!found) {
+            fprintf(stderr, "  VALIDATION FAILED: DB has extra row id=%d\n", db_id);
+            fprintf(stderr, "  Seed: %lu\n", (unsigned long)seed);
+            sqlite3_finalize(stmt);
+            return 0;
+        }
+    }
+    sqlite3_finalize(stmt);
+    
+    if (verbose) {
+        fprintf(stdout, "    Model vs DB: MATCH\n");
+    }
+    
+    return 1;
+}
+
+/* ─────────────────────────────────────────────────────────────────
+ * J.5 Operation Generator
+ * ───────────────────────────────────────────────────────────────── */
+
+/*
+ * Generate a mix of operations:
+ *  - 40% INSERT
+ *  - 20% UPDATE
+ *  - 15% DELETE
+ *  - 10% BEGIN
+ *  - 8% COMMIT
+ *  - 5% ROLLBACK
+ *  - 2% REOPEN
+ */
+static void generate_operation(prng_t *rng, model_state_t *model, 
+                                operation_t *op) {
+    int dice = prng_range(rng, 1, 100);
+    
+    if (dice <= 40) {
+        /* INSERT: random value 1-1000 */
+        op->type = OP_INSERT;
+        op->param1 = prng_range(rng, 1, 1000);
+    } else if (dice <= 60) {
+        /* UPDATE: pick random existing ID if available */
+        op->type = OP_UPDATE;
+        if (model_count_active(model) > 0) {
+            /* Pick a random active row */
+            int active_idx = prng_range(rng, 0, model_count_active(model) - 1);
+            int count = 0;
+            for (int i = 0; i < model->row_count; i++) {
+                if (model->rows[i].active) {
+                    if (count == active_idx) {
+                        op->param1 = model->rows[i].id;
+                        break;
+                    }
+                    count++;
+                }
+            }
+        } else {
+            op->param1 = 1;  /* No rows, will skip */
+        }
+        op->param2 = prng_range(rng, 1, 1000);
+    } else if (dice <= 75) {
+        /* DELETE: pick random existing ID if available */
+        op->type = OP_DELETE;
+        if (model_count_active(model) > 0) {
+            int active_idx = prng_range(rng, 0, model_count_active(model) - 1);
+            int count = 0;
+            for (int i = 0; i < model->row_count; i++) {
+                if (model->rows[i].active) {
+                    if (count == active_idx) {
+                        op->param1 = model->rows[i].id;
+                        break;
+                    }
+                    count++;
+                }
+            }
+        } else {
+            op->param1 = 1;  /* No rows, will skip */
+        }
+    } else if (dice <= 85) {
+        /* BEGIN */
+        op->type = OP_BEGIN;
+    } else if (dice <= 93) {
+        /* COMMIT */
+        op->type = OP_COMMIT;
+    } else if (dice <= 98) {
+        /* ROLLBACK */
+        op->type = OP_ROLLBACK;
+    } else {
+        /* REOPEN */
+        op->type = OP_REOPEN;
+    }
+}
+
+/* ─────────────────────────────────────────────────────────────────
+ * J.6 Test: Deterministic Property Test (Compact, CI-friendly)
+ * ───────────────────────────────────────────────────────────────── */
+
+/*
+ * Test J1: Deterministic randomized operations (default: 100 ops)
+ * 
+ * Executes a pseudo-random sequence of operations with a fixed seed.
+ * Tracks expected state in a C model and validates DB matches model.
+ * Always runs integrity_check and rowid uniqueness invariants.
+ * 
+ * Runtime: ~2-3 seconds on Azurite (CI-friendly).
+ * For extended testing, use test-integration-extended target.
+ */
+TEST(prop_deterministic_basic) {
+    const char *db_name = "prop-det-basic.db";
+    cleanup_test_blobs(db_name);
+    
+    uint64_t seed = 42;  /* Fixed seed for reproducibility */
+    int num_ops = 100;
+    
+    /* Allow override via environment variable for extended testing */
+    const char *env_ops = getenv("PROP_TEST_OPS");
+    if (env_ops) {
+        num_ops = atoi(env_ops);
+        if (num_ops <= 0) num_ops = 100;
+    }
+    
+    fprintf(stdout, "  Running %d deterministic operations (seed=%lu)...\n",
+            num_ops, (unsigned long)seed);
+    
+    int rc = sqlite_objs_vfs_register_uri(0);
+    ASSERT_OK(rc);
+    
+    /* Create schema */
+    sqlite3 *db = open_azurite_db(db_name, NULL, 1);
+    ASSERT_NOT_NULL(db);
+    
+    rc = exec_sql(db, 
+        "CREATE TABLE prop_test ("
+        "  id INTEGER PRIMARY KEY AUTOINCREMENT,"
+        "  value INTEGER NOT NULL"
+        ");");
+    ASSERT_OK(rc);
+    
+    /* Initialize PRNG and model */
+    prng_t rng;
+    prng_seed(&rng, seed);
+    
+    model_state_t model;
+    model_init(&model);
+    
+    /* Execute operations */
+    int last_insert_id = 0;
+    for (int i = 0; i < num_ops; i++) {
+        operation_t op;
+        generate_operation(&rng, &model, &op);
+        
+        rc = execute_op(&db, db_name, &model, &op, &last_insert_id, 0);
+
+        if (op.type == OP_REOPEN && rc != SQLITE_OK) {
+            fprintf(stderr, "  Operation %d (REOPEN) failed unexpectedly: rc=%d\n", i, rc);
+            ASSERT_OK(rc);
+        }
+        
+        /* Allow operations to fail gracefully (transaction control, busy, etc.) */
+        /* Only fail on critical errors for data operations */
+        if (rc != SQLITE_OK && rc != SQLITE_BUSY && rc != SQLITE_LOCKED) {
+            if (op.type == OP_INSERT || op.type == OP_UPDATE || op.type == OP_DELETE) {
+                /* Data operations should succeed or return acceptable errors */
+                if (rc != SQLITE_ERROR) {  /* SQLITE_ERROR can happen for constraints */
+                    fprintf(stderr, "  Operation %d (%s) failed unexpectedly: rc=%d\n",
+                            i, op_name(op.type), rc);
+                    ASSERT_OK(rc);
+                }
+            }
+            /* Transaction control operations can fail without corrupting state. */
+        }
+    }
+    
+    /* Close any open transaction */
+    if (model.in_transaction) {
+        exec_sql(db, "ROLLBACK;");
+        model_rollback(&model);
+    }
+    
+    fprintf(stdout, "  Validating final state...\n");
+    
+    /* Validate model vs database */
+    ASSERT_TRUE(validate_model_vs_db(db, &model, 1, seed));
+    
+    /* Run integrity check */
+    ASSERT_TRUE(check_integrity(db));
+    
+    /* Check rowid uniqueness */
+    ASSERT_TRUE(check_rowid_uniqueness(db, "prop_test"));
+    
+    fprintf(stdout, "  Final state: %d rows, all invariants passed\n",
+            model_count_active(&model));
+    
+    sqlite3_close(db);
+    cleanup_test_blobs(db_name);
+}
+
+/*
+ * Test J2: Deterministic randomized operations with multiple seeds
+ * 
+ * Runs the same test with 3 different seeds to increase coverage.
+ * Each seed produces a different operation sequence.
+ * 
+ * Runtime: ~6-8 seconds on Azurite.
+ */
+TEST(prop_deterministic_multi_seed) {
+    const uint64_t seeds[] = {42, 12345, 999999};
+    const int num_seeds = 3;
+    int ops_per_seed = 80;
+    
+    for (int s = 0; s < num_seeds; s++) {
+        uint64_t seed = seeds[s];
+        char db_name[64];
+        snprintf(db_name, sizeof(db_name), "prop-seed-%lu.db", 
+                (unsigned long)seed);
+        cleanup_test_blobs(db_name);
+        
+        fprintf(stdout, "  Seed %lu: %d operations...\n",
+                (unsigned long)seed, ops_per_seed);
+        
+        int rc = sqlite_objs_vfs_register_uri(0);
+        ASSERT_OK(rc);
+        
+        sqlite3 *db = open_azurite_db(db_name, NULL, 1);
+        ASSERT_NOT_NULL(db);
+        
+        rc = exec_sql(db,
+            "CREATE TABLE prop_test ("
+            "  id INTEGER PRIMARY KEY AUTOINCREMENT,"
+            "  value INTEGER NOT NULL"
+            ");");
+        ASSERT_OK(rc);
+        
+        prng_t rng;
+        prng_seed(&rng, seed);
+        
+        model_state_t model;
+        model_init(&model);
+        
+        int last_insert_id = 0;
+        for (int i = 0; i < ops_per_seed; i++) {
+            operation_t op;
+            generate_operation(&rng, &model, &op);
+            
+            rc = execute_op(&db, db_name, &model, &op, &last_insert_id, 0);
+
+            if (op.type == OP_REOPEN && rc != SQLITE_OK) {
+                fprintf(stderr, "  Seed %lu op %d (REOPEN) failed unexpectedly: rc=%d\n",
+                        (unsigned long)seed, i, rc);
+                ASSERT_OK(rc);
+            }
+            
+            /* Allow operations to fail gracefully */
+            if (rc != SQLITE_OK && rc != SQLITE_BUSY && rc != SQLITE_LOCKED) {
+                if (op.type == OP_INSERT || op.type == OP_UPDATE || op.type == OP_DELETE) {
+                    if (rc != SQLITE_ERROR) {
+                        fprintf(stderr, "  Seed %lu op %d (%s) failed: rc=%d\n",
+                                (unsigned long)seed, i, op_name(op.type), rc);
+                        ASSERT_OK(rc);
+                    }
+                }
+            }
+        }
+        
+        if (model.in_transaction) {
+            exec_sql(db, "ROLLBACK;");
+            model_rollback(&model);
+        }
+        
+        ASSERT_TRUE(validate_model_vs_db(db, &model, 0, seed));
+        ASSERT_TRUE(check_integrity(db));
+        ASSERT_TRUE(check_rowid_uniqueness(db, "prop_test"));
+        
+        fprintf(stdout, "    Seed %lu: %d rows, OK\n",
+                (unsigned long)seed, model_count_active(&model));
+        
+        sqlite3_close(db);
+        cleanup_test_blobs(db_name);
+    }
+}
+
+/*
+ * Test J3: Transaction-heavy property test
+ * 
+ * Focuses on transaction boundaries: more BEGIN/COMMIT/ROLLBACK operations.
+ * Tests that transaction semantics are correctly maintained.
+ */
+TEST(prop_transaction_heavy) {
+    const char *db_name = "prop-txn-heavy.db";
+    cleanup_test_blobs(db_name);
+    
+    uint64_t seed = 777;
+    int num_ops = 120;
+    
+    fprintf(stdout, "  Transaction-heavy test: %d ops (seed=%lu)...\n",
+            num_ops, (unsigned long)seed);
+    
+    int rc = sqlite_objs_vfs_register_uri(0);
+    ASSERT_OK(rc);
+    
+    sqlite3 *db = open_azurite_db(db_name, NULL, 1);
+    ASSERT_NOT_NULL(db);
+    
+    rc = exec_sql(db,
+        "CREATE TABLE prop_test ("
+        "  id INTEGER PRIMARY KEY AUTOINCREMENT,"
+        "  value INTEGER NOT NULL"
+        ");");
+    ASSERT_OK(rc);
+    
+    prng_t rng;
+    prng_seed(&rng, seed);
+    
+    model_state_t model;
+    model_init(&model);
+    
+    /* Biased operation generator for more transactions */
+    int last_insert_id = 0;
+    for (int i = 0; i < num_ops; i++) {
+        operation_t op;
+        int dice = prng_range(&rng, 1, 100);
+        
+        /* 30% INSERT, 15% UPDATE, 10% DELETE, 20% BEGIN, 15% COMMIT, 10% ROLLBACK */
+        if (dice <= 30) {
+            op.type = OP_INSERT;
+            op.param1 = prng_range(&rng, 1, 500);
+        } else if (dice <= 45) {
+            op.type = OP_UPDATE;
+            if (model_count_active(&model) > 0) {
+                int active_idx = prng_range(&rng, 0, model_count_active(&model) - 1);
+                int count = 0;
+                for (int j = 0; j < model.row_count; j++) {
+                    if (model.rows[j].active) {
+                        if (count == active_idx) {
+                            op.param1 = model.rows[j].id;
+                            break;
+                        }
+                        count++;
+                    }
+                }
+            } else {
+                op.param1 = 1;
+            }
+            op.param2 = prng_range(&rng, 1, 500);
+        } else if (dice <= 55) {
+            op.type = OP_DELETE;
+            if (model_count_active(&model) > 0) {
+                int active_idx = prng_range(&rng, 0, model_count_active(&model) - 1);
+                int count = 0;
+                for (int j = 0; j < model.row_count; j++) {
+                    if (model.rows[j].active) {
+                        if (count == active_idx) {
+                            op.param1 = model.rows[j].id;
+                            break;
+                        }
+                        count++;
+                    }
+                }
+            } else {
+                op.param1 = 1;
+            }
+        } else if (dice <= 75) {
+            op.type = OP_BEGIN;
+        } else if (dice <= 90) {
+            op.type = OP_COMMIT;
+        } else {
+            op.type = OP_ROLLBACK;
+        }
+        
+        rc = execute_op(&db, db_name, &model, &op, &last_insert_id, 0);
+
+        if (op.type == OP_REOPEN && rc != SQLITE_OK) {
+            fprintf(stderr, "  Op %d (REOPEN) failed unexpectedly: rc=%d\n", i, rc);
+            ASSERT_OK(rc);
+        }
+        
+        /* Allow operations to fail gracefully */
+        if (rc != SQLITE_OK && rc != SQLITE_BUSY && rc != SQLITE_LOCKED) {
+            if (op.type == OP_INSERT || op.type == OP_UPDATE || op.type == OP_DELETE) {
+                if (rc != SQLITE_ERROR) {
+                    fprintf(stderr, "  Op %d (%s) failed: rc=%d\n",
+                            i, op_name(op.type), rc);
+                    ASSERT_OK(rc);
+                }
+            }
+        }
+    }
+    
+    if (model.in_transaction) {
+        exec_sql(db, "ROLLBACK;");
+        model_rollback(&model);
+    }
+    
+    fprintf(stdout, "  Validating...\n");
+    ASSERT_TRUE(validate_model_vs_db(db, &model, 1, seed));
+    ASSERT_TRUE(check_integrity(db));
+    ASSERT_TRUE(check_rowid_uniqueness(db, "prop_test"));
+    
+    fprintf(stdout, "  Transaction-heavy test: %d rows, OK\n",
+            model_count_active(&model));
+    
+    sqlite3_close(db);
+    cleanup_test_blobs(db_name);
+}
+
+/* ================================================================
  * Main runner
  * ================================================================ */
 
@@ -4619,6 +5399,23 @@ int main(void) {
     fprintf(stdout, "╚════════════════════════════════════════════════════════╝\n");
 
     /* Initialize the Azure client */
+    /* Check if stress mode is enabled */
+    int mult = get_stress_multiplier();
+    int iter = 1;
+    
+    if (mult > 1) {
+        fprintf(stdout, "\n");
+        fprintf(stdout, "%s╔════════════════════════════════════════════════════════╗%s\n",
+                TH_BOLD, TH_RESET);
+        fprintf(stdout, "%s║  STRESS MODE ENABLED                                   ║%s\n",
+                TH_BOLD, TH_RESET);
+        fprintf(stdout, "%s║  Multiplier: %-3d                                      ║%s\n",
+                TH_BOLD, mult, TH_RESET);
+        fprintf(stdout, "%s╚════════════════════════════════════════════════════════╝%s\n",
+                TH_BOLD, TH_RESET);
+        fprintf(stdout, "\n");
+    }
+
     setup_azure_client();
 
     /* Run Azure client tests */
@@ -4729,6 +5526,13 @@ int main(void) {
 
     TEST_SUITE_BEGIN("Invariants: Phase 2 Post-Failure Stress");
     RUN_TEST(invariant_check_after_crash_stress);
+    TEST_SUITE_END();
+
+    /* Phase 3: Deterministic randomized / property-based testing */
+    TEST_SUITE_BEGIN("Property-Based: Phase 3 Deterministic Randomized Testing");
+    RUN_TEST(prop_deterministic_basic);
+    RUN_TEST(prop_deterministic_multi_seed);
+    RUN_TEST(prop_transaction_heavy);
     TEST_SUITE_END();
 
     /* Cleanup */

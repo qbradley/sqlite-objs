@@ -3710,3 +3710,378 @@ Or path-style (for MinIO/custom endpoints): `https://{endpoint}/{bucket}/{key}`
 
 **References:** `.squad/decisions/inbox/samwise-phase2-summary.md`
 
+---
+
+### D-PHASE3-QUALITY-GATE: Rust Alpha Release Quality Gate
+**Date:** 2026-06-27 | **From:** Gandalf (Lead / Architect)  
+**Status:** ✅ APPROVED — Three-tier validation model defined
+
+**Context:** Phase 1 (concurrency stress, mock chaos, invariant checks) and Phase 2 (crash recovery, hard-fork tests) are committed. Defining release/quality gate for Rust alpha without adding low-value tests just for volume.
+
+**Recommendation:** Three-tier validation model (Fast/Core, Extended/Nightly, External/Pre-release) with **14 fast gates** required for alpha release and **6 extended gates** for production readiness.
+
+**Key Blockers Identified:**
+1. CI pipeline not configured (squad-ci.yml has placeholder only)
+2. Azure integration tests require external credentials (no CI secrets setup)
+3. No coverage threshold enforcement (current coverage ~80-85% estimated)
+4. Security hardening flags not in default build
+
+---
+
+#### 1. Three-Tier Validation Model
+
+**1.1 Fast Gates (Core — Required for Alpha Release)**
+
+Target: <5 minutes total wall time
+Frequency: Every commit (PR + push to dev/main)
+Infrastructure: Local development machine or standard CI runner (no external services)
+
+| # | Gate | Command | Time | Value | Notes |
+|---|------|---------|------|-------|-------|
+| 1 | C build | `make -j$(nproc) all` | 15s | High | Static library + shell + benchmarks |
+| 2 | Rust build | `cd rust && cargo build --workspace` | 30s | High | Both sys and high-level crates |
+| 3 | C unit tests (Layer 1) | `make test-unit` | 20s | **Critical** | 148 tests, mocked Azure, 80%+ coverage |
+| 4 | C sanitizers (ASan+UBSan) | `make sanitize` | 40s | **Critical** | Catches memory/UB bugs |
+| 5 | Rust unit tests | `cd rust && cargo test --lib` | 10s | High | Unit + doc tests |
+| 6 | Rust threading tests | `cd rust && cargo test --test threading` | 15s | **Critical** | Concurrent access patterns |
+| 7 | Rust perf matrix (memory) | `PERF_MODE=memory PERF_ITERATIONS=10 cargo test --test perf_matrix` | 30s | Medium | Schema/query patterns, no I/O |
+| 8 | Rust perf matrix (file) | `PERF_MODE=file PERF_ITERATIONS=10 cargo test --test perf_matrix` | 30s | Medium | Local disk VFS baseline |
+| 9 | Rust format check | `cd rust && cargo fmt --all -- --check` | 2s | Medium | Code style consistency |
+| 10 | Rust clippy | `cd rust && cargo clippy --workspace --all-targets -- -D warnings` | 20s | High | Lint + best practices |
+| 11 | TCL quick suite | `make test-tcl-quick` | 30s | High | ~5 core SQLite compatibility tests |
+| 12 | C integration (Azurite) | `make test-integration` | 45s | High | 10 tests + 652 crash tests vs local emulator |
+| 13 | Rust chaos tests | `cd rust && cargo test chaos` | 15s | High | Mock failure injection patterns |
+| 14 | C chaos tests | `test/test_chaos` (via test_main) | 10s | High | Mock transient/permanent failures |
+
+**Total:** ~4.5 minutes  
+**MUST-PASS for alpha release:** All 14 gates green
+
+**Key exclusions:**
+- ❌ Real Azure tests (require credentials, slower, flaky)
+- ❌ Full TCL suite (1,151 tests, ~8 minutes)
+- ❌ Static analysis tools (cppcheck, scan-build — useful but slow)
+- ❌ Code coverage report generation (adds ~20s overhead)
+
+**1.2 Extended Gates (Nightly — Production Readiness)**
+
+Target: <30 minutes total wall time
+Frequency: Nightly builds on dev branch, required for main branch merges
+Infrastructure: Requires Azurite (runs in CI as Docker service)
+
+| # | Gate | Command | Time | Value | Notes |
+|---|------|---------|------|-------|-------|
+| 15 | TCL full suite | `make test-tcl` | 8m | **Critical** | 1,151 SQLite compatibility tests |
+| 16 | Code coverage (gcov) | `make coverage` | 2m | High | HTML report, enforce ≥80% line coverage on src/ |
+| 17 | Static analysis (scan-build) | `scan-build make clean all` | 5m | High | Clang static analyzer, fail on bugs |
+| 18 | Static analysis (cppcheck) | `cppcheck --enable=all src/ test/` | 3m | Medium | Secondary static analysis |
+| 19 | MemorySanitizer (unit tests only) | `make msan` | 3m | Medium | Uninitialized memory detection (Clang-only, no libcurl) |
+| 20 | Rust perf matrix (extended) | `PERF_ITERATIONS=100 cargo test --test perf_matrix` | 5m | Medium | Longer-running perf validation |
+
+**Total:** ~26 minutes  
+**MUST-PASS for production release:** All extended gates + all fast gates
+
+**Rationale:**
+- TCL suite is **authoritative SQLite compatibility proof** — no shortcuts
+- Coverage + static analysis catch bugs that tests miss
+- MSan catches initialization bugs ASan misses (complementary, not redundant)
+
+**1.3 External Gates (Pre-Release — Real Azure Validation)**
+
+Target: <15 minutes (excludes setup time)
+Frequency: Manual pre-release validation, weekly CI against staging Azure account
+Infrastructure: Real Azure Blob Storage account with SAS token credentials
+
+| # | Gate | Environment | Time | Value | Notes |
+|---|------|-------------|------|-------|-------|
+| 21 | Rust VFS integration (Azure) | `cargo test --test vfs_integration -- --ignored` | 5m | **Critical** | 50 tests, real blob operations |
+| 22 | Rust perf matrix (Azure) | `PERF_MODE=azure cargo test --test perf_matrix` | 8m | High | Network latency, lease contention |
+| 23 | C Azure smoke test | `./sqlite-objs-shell <azure-uri>` + manual SQL | 2m | Medium | Manual validation, multi-region if possible |
+
+**Total:** ~15 minutes  
+**MUST-PASS for crates.io publish:** Azure gates + all extended gates + all fast gates
+
+**Credential requirements:**
+- `AZURE_STORAGE_ACCOUNT` — Test storage account name
+- `AZURE_STORAGE_CONTAINER` — Test container (auto-cleanup recommended)
+- `AZURE_STORAGE_SAS` — SAS token with Read/Write/Delete/Lease permissions
+
+**Blockers:**
+- ❌ No CI secret management configured yet
+- ❌ No auto-cleanup of test blobs (risk of cost accumulation)
+- ⚠️ SAS tokens expire — need rotation strategy
+
+---
+
+#### 2. Release Gate Mapping
+
+**2.1 Alpha Release (Rust crates.io 0.1.x-alpha)**
+
+Audience: Early adopters, testing against Azurite only
+Validation tier: Fast gates only (local + Azurite)
+
+**Checklist:**
+- ✅ All 14 fast gates pass
+- ✅ `scripts/release-gate.sh` (local mode) exits 0
+- ✅ No compiler warnings (`-D warnings` in Clippy, `-Werror` not required for C)
+- ✅ Rust crate version bumped (e.g., 0.1.5-alpha → 0.1.6-alpha)
+- ✅ CHANGELOG.md updated with user-facing changes
+- ❌ Coverage report reviewed (informational, no threshold enforced)
+- ❌ Azure integration tests (deferred to beta)
+
+**Time to validate:** ~5 minutes  
+**Can run on:** Any developer laptop with Azurite installed
+
+**2.2 Beta Release (Rust crates.io 0.1.x-beta)**
+
+Audience: Production testing against real Azure
+Validation tier: Fast + Extended gates
+
+**Checklist:**
+- ✅ All fast gates + all extended gates pass
+- ✅ `scripts/release-gate.sh --full` (local Azurite + TCL full) exits 0
+- ✅ Code coverage ≥80% on `src/*.c` (excluding sqlite3.c)
+- ✅ Static analysis (scan-build + cppcheck) reports 0 bugs
+- ✅ Manual Azure smoke test passed (document test account + region)
+- ⚠️ At least 1 Azure integration test run (manual, pre-release validation)
+- ✅ Security review of credential handling (no logging, memory zeroing)
+
+**Time to validate:** ~30 minutes + manual Azure test  
+**Can run on:** CI nightly builds + manual pre-release validation
+
+**2.3 Stable Release (Rust crates.io 1.0.0)**
+
+Audience: Production deployments
+Validation tier: All gates (Fast + Extended + External)
+
+**Checklist:**
+- ✅ All gates from Alpha + Beta
+- ✅ `scripts/release-gate.sh --azure` exits 0 (requires Azure credentials)
+- ✅ All 50 Azure integration tests pass (vfs_integration.rs --ignored)
+- ✅ Multi-region Azure test (US East + EU West, document latency)
+- ✅ Lease contention test (2+ concurrent writers, document behavior)
+- ✅ Long-running stability test (24-hour write workload, no crashes/leaks)
+- ✅ Security audit completed (external or internal, document findings)
+- ✅ Performance benchmarks documented (vs local SQLite + vs CosmosDB)
+
+**Time to validate:** ~1 hour + long-running tests  
+**Can run on:** CI + dedicated staging environment
+
+---
+
+#### 3. CI Pipeline Requirements (Blockers)
+
+**3.1 Current State**
+
+File: `.github/workflows/squad-ci.yml`
+Status: ❌ Placeholder only — no build/test commands configured
+
+**Impact:** No automated validation on PR/push — **critical blocker for alpha release**
+
+**3.2 Recommended CI Matrix (GitHub Actions)**
+
+Missing pieces:
+1. ❌ No GitHub secrets configured (`AZURE_TEST_ACCOUNT`, etc.)
+2. ❌ No nightly schedule trigger defined (recommend `cron: '0 2 * * *'` for 2 AM UTC)
+3. ❌ No artifact upload for coverage reports / static analysis findings
+4. ❌ No status badge in README.md
+
+**Action items:**
+1. Update `squad-ci.yml` with fast-gates job
+2. Add nightly workflow for extended gates
+3. Configure Azure secrets (manual workflow trigger only)
+4. Add coverage/SARIF upload steps
+
+---
+
+#### 4. Test Quality Observations (Avoiding Low-Value Tests)
+
+**4.1 High-Value Test Patterns (Keep Doing This)**
+
+✅ **Crash recovery tests** (Phase 2, 652 tests)
+- Fork + `_exit()` simulates hard crashes
+- Validates journal recovery, post-crash invariants
+- **Justification:** SQLite's core durability guarantee depends on this
+
+✅ **Chaos tests** (Phase 1, test_chaos.c)
+- Mock failure injection (transient, permanent, ETag suppression)
+- Lease expiry consistency checks
+- **Justification:** Azure has >10 failure modes, must be resilient
+
+✅ **Concurrency stress tests** (Phase 1, threading.rs)
+- Concurrent readers/writers, lock contention, snapshot isolation
+- **Justification:** Multi-threaded access is primary use case
+
+✅ **Perf matrix tests** (perf_matrix.rs)
+- 3 modes (memory, file, Azure), 10+ schema/query patterns
+- **Justification:** Performance regressions are bugs (no benchmarking for volume)
+
+**4.2 Low-Value Test Patterns (Avoid These)**
+
+❌ **Edge case explosion** (e.g., "Read zero bytes", "Double close")
+- **Problem:** These are defensive programming checks, not user-facing bugs
+- **Alternative:** Add assertions in code, document preconditions
+
+❌ **Redundant happy-path tests** (e.g., multiple "insert then query" variations)
+- **Problem:** Test count inflation without new coverage
+- **Alternative:** Parameterize tests, use property-based testing
+- **Current state:** Good — perf_matrix.rs already parameterized (3 modes × 10 patterns)
+
+❌ **Mock-only tests for real-world failure modes**
+- **Problem:** Azurite behaves differently than real Azure (lease timing, ETag format, error codes)
+- **Alternative:** Require at least 1 Azure integration test per major feature
+
+**4.3 Coverage Gaps Worth Filling (Priority Order)**
+
+**P0 (Alpha blockers):**
+1. ✅ **WAL mode rejection** — xFileControl must reject WAL (security-relevant)
+   - **Status:** Not tested (TEST-MATRIX.md line 82)
+   - **Fix:** Add `test_wal_mode_rejected()` to test_vfs.c
+
+2. ✅ **Lease renewal during long sync** — xSync must renew lease if >45s since acquire
+   - **Status:** Not tested (time-dependent, can't use mock)
+   - **Fix:** Add `test_lease_renewal_on_long_sync()` to test_integration.c (Azurite)
+
+3. ❌ **Memory allocation failures** — malloc/realloc can fail
+   - **Status:** Not tested (lines 41, 59 in TEST-MATRIX.md)
+   - **Fix:** Add mock allocator with failure injection (complex, defer to post-alpha)
+
+**P1 (Beta blockers):**
+4. ❌ **Network failures during xSync** — page_blob_write or block_blob_upload fails
+   - **Status:** Not tested (lines 63, 65)
+   - **Fix:** Add chaos injection for network errors during sync
+
+5. ❌ **Error paths in xClose** — flush fails, lease release fails
+   - **Status:** Not tested (lines 44, 45)
+   - **Fix:** Add failure injection in close path
+
+**P2 (Nice-to-have):**
+6. ❌ **Long path handling** — xFullPathname buffer boundary
+7. ❌ **Temp file delegation** — xOpen with SQLITE_OPEN_TEMP (delegates to default VFS)
+
+---
+
+#### 5. Security Hardening Recommendations
+
+**5.1 Compiler Flags (Not in Default Build)**
+
+**Current CFLAGS:**
+```makefile
+CFLAGS = -Wall -Wextra -Wpedantic -std=c11 -O2
+```
+
+**Recommended additions for release builds:**
+```makefile
+SECURITY_CFLAGS = \
+    -Wshadow -Wconversion -Wsign-conversion \
+    -Wformat=2 -Wformat-security \
+    -Wnull-dereference -Wstack-protector \
+    -D_FORTIFY_SOURCE=2 \
+    -fstack-protector-strong \
+    -fPIE -Wl,-z,relro,-z,now
+```
+
+**Recommendation:** Add `make release` target with security flags, use for crates.io publish
+
+**5.2 Security-Critical Test Coverage**
+
+From SECURITY-TESTING.md analysis:
+
+| Risk Area | Current Coverage | Gap | Recommendation |
+|-----------|------------------|-----|----------------|
+| **Credential logging** | ❌ No test | Grep for printf near key variables | Add `test_no_credential_leaks()` — assert log output doesn't contain `azure_key` substring |
+| **Buffer overflows** | ✅ ASan in CI | Fixed-size error buffers (256 bytes) | Keep ASan in fast gates (already present) |
+| **Integer overflow** | ✅ UBSan in CI | Size calculations in xRead/xWrite | Keep UBSan in fast gates (already present) |
+| **Format string vulns** | ✅ `-Wformat=2` | snprintf in error paths | Add to release build flags |
+
+**No new tests needed** — existing sanitizer coverage is sufficient, just need hardened release build.
+
+---
+
+#### 6. Recommendations Summary
+
+**6.1 Alpha Release Unblocking (Priority 0)**
+
+1. **Update CI pipeline** (1-2 hours)
+   - Replace squad-ci.yml placeholder with fast-gates job
+   - Add Azurite service container
+   - Configure timeout (10 minutes max)
+
+2. **Run release gate locally** (5 minutes)
+   ```bash
+   ./scripts/release-gate.sh
+   # Verify all 14 fast gates pass
+   ```
+
+3. **Document alpha limitations** (30 minutes)
+   - README.md: Add "Alpha Status" section
+   - Note: "Tested against Azurite only, real Azure support in beta"
+   - Document known issues (integration test auth failures from README-INTEGRATION.md)
+
+**6.2 Beta Release Preparation (Priority 1)**
+
+4. **Add nightly CI** (1 hour)
+   - Create `.github/workflows/nightly.yml` for extended gates
+   - Schedule cron trigger (2 AM UTC daily)
+   - Upload coverage reports as artifacts
+
+5. **Configure Azure secrets** (30 minutes)
+   - Create staging Azure storage account (or use existing dev account)
+   - Generate SAS token with 1-year expiry
+   - Add secrets to GitHub repo settings
+
+6. **Fill P0 coverage gaps** (2-3 hours)
+   - Add WAL rejection test
+   - Add lease renewal test (integration test, Azurite)
+
+**6.3 Production Readiness (Priority 2)**
+
+7. **Security hardening** (1 hour)
+   - Add `make release` target with security CFLAGS
+   - Document release build process in CONTRIBUTING.md
+   - Add security review checklist to release template
+
+8. **Long-running stability test** (1 day setup + 24-hour run)
+   - Create benchmark workload (TPC-C or speedtest1 loop)
+   - Run against real Azure for 24 hours
+   - Monitor for leaks (Valgrind), crashes (core dumps), data corruption
+
+---
+
+#### 7. Decision: Phase 3 Quality Gate
+
+**APPROVED GATES for Rust alpha release (0.1.x-alpha):**
+
+✅ **Fast gates (14 validations, <5 min)** — blocking for all releases
+⚠️ **Extended gates (6 validations, <30 min)** — blocking for beta+
+⚠️ **External gates (3 validations, <15 min)** — blocking for stable only
+
+**BLOCKERS for alpha:**
+1. CI pipeline configuration (squad-ci.yml)
+2. Local validation via `./scripts/release-gate.sh` passes
+
+**BLOCKERS for beta:**
+3. Nightly CI with extended gates
+4. Azure secrets configured
+5. P0 coverage gaps filled (WAL rejection, lease renewal)
+
+**BLOCKERS for stable:**
+6. All external gates pass
+7. Security review completed
+8. 24-hour stability test passed
+
+**Estimated time to alpha readiness:** 2-4 hours (CI config + local validation)  
+**Estimated time to beta readiness:** 1 week (nightly setup + coverage gaps + Azure setup)  
+**Estimated time to stable readiness:** 2-4 weeks (security review + long-running tests)
+
+---
+
+#### 8. Open Questions
+
+1. **Coverage threshold:** 80% line coverage on src/*.c — is this the right bar? (Current: ~80-85% estimated)
+2. **TCL test suite failures:** Are any known failures acceptable, or must be 100% pass? (Current: unknown, needs baseline run)
+3. **Azure test account:** Use shared staging account or provision per-developer? (Cost vs. isolation tradeoff)
+4. **Credential rotation:** How often to rotate SAS tokens in CI secrets? (Recommend: 90 days)
+5. **Multi-region testing:** Required for stable, or optional? (Adds complexity, unclear value for VFS layer)
+
+**References:** `.squad/decisions/inbox/gandalf-phase3-quality-gate.md`
+

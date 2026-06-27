@@ -73,11 +73,12 @@ SHELL_BIN   = sqlite-objs-shell
 # Unit test objects (stub client — no curl/OpenSSL needed for mocks)
 MOCK_OBJ    = $(BUILD_DIR)/mock_azure_ops.o
 TEST_VFS_OBJ = $(BUILD_DIR)/sqlite_objs_vfs_test.o
+TEST_AZURE_CLIENT_OBJ = $(BUILD_DIR)/azure_client_test.o
 TEST_OBJS   = $(SQLITE_OBJ) $(TEST_VFS_OBJ) \
               $(BUILD_DIR)/azure_client_stub.o $(MOCK_OBJ) \
               $(BUILD_DIR)/azure_auth.o $(BUILD_DIR)/azure_error.o
 TEST_LIB_OBJS = $(SQLITE_OBJ) $(TEST_VFS_OBJ) \
-               $(BUILD_DIR)/azure_client.o \
+               $(TEST_AZURE_CLIENT_OBJ) \
                $(BUILD_DIR)/azure_auth.o $(BUILD_DIR)/azure_error.o
 
 # Benchmark binaries
@@ -102,7 +103,7 @@ TPCC_AZURE_OBJS = $(TPCC_BUILD)/tpcc_azure.o \
 # ---------- Default target ----------
 
 .PHONY: all shell benchmarks tpcc clean test test-unit test-integration \
-        sanitize coverage help
+        test-stress test-stress-heavy test-integration-extended sanitize coverage help
 
 all: $(LIBRARY) shell benchmarks tpcc
 
@@ -129,6 +130,9 @@ $(TEST_VFS_OBJ): $(SRC_DIR)/sqlite_objs_vfs.c $(SRC_DIR)/sqlite_objs.h $(SRC_DIR
 
 $(BUILD_DIR)/azure_client.o: $(SRC_DIR)/azure_client.c $(SRC_DIR)/azure_client_impl.h $(SRC_DIR)/azure_client.h | $(BUILD_DIR)
 	$(CC) $(CFLAGS_ALL) -c -o $@ $<
+
+$(TEST_AZURE_CLIENT_OBJ): $(SRC_DIR)/azure_client.c $(SRC_DIR)/azure_client_impl.h $(SRC_DIR)/azure_client.h | $(BUILD_DIR)
+	$(CC) $(TEST_CFLAGS) -c -o $@ $<
 
 $(BUILD_DIR)/azure_auth.o: $(SRC_DIR)/azure_auth.c $(SRC_DIR)/azure_client_impl.h $(SRC_DIR)/azure_client.h | $(BUILD_DIR)
 	$(CC) $(CFLAGS_ALL) -c -o $@ $<
@@ -208,6 +212,31 @@ $(BUILD_DIR)/test_integration: $(TEST_DIR)/test_integration.c $(TEST_DIR)/test_h
 
 test: test-unit test-integration
 
+# Extended stress testing (environment-controlled parameters)
+# SQLITE_OBJS_STRESS_MULTIPLIER scales concurrent writer counts & insert sizes
+# SQLITE_OBJS_STRESS_ITERATIONS repeats entire test suite N times
+test-stress: $(BUILD_DIR)/test_integration
+	@echo "=== Running integration tests with STRESS mode (2× multiplier, 3 iterations) ==="
+	@for i in 1 2 3; do \
+		echo "=== Stress iteration $$i of 3 ==="; \
+		SQLITE_OBJS_STRESS_MULTIPLIER=2 ./test/run-integration.sh || exit $$?; \
+	done
+
+test-stress-heavy: $(BUILD_DIR)/test_integration
+	@echo "=== Running integration tests with HEAVY STRESS (4× multiplier, 5 iterations) ==="
+	@echo "⚠️  Warning: This may take 10-30 minutes depending on system performance"
+	@for i in 1 2 3 4 5; do \
+		echo "=== Heavy stress iteration $$i of 5 ==="; \
+		SQLITE_OBJS_STRESS_MULTIPLIER=4 ./test/run-integration.sh || exit $$?; \
+	done
+
+# Extended property-based testing (more operations for deeper validation)
+# PROP_TEST_OPS controls operation count per property test
+test-integration-extended: $(BUILD_DIR)/test_integration
+	@echo "=== Running integration tests with EXTENDED property testing ==="
+	@echo "⚠️  Property tests will run with 500+ operations (may take 5-10 minutes)"
+	@PROP_TEST_OPS=500 ./test/run-integration.sh
+
 # ---------- TCL Test Suite (official SQLite tests) ----------
 
 .PHONY: test-tcl test-tcl-build test-tcl-quick
@@ -275,6 +304,9 @@ help:
 	@echo "  test-unit        Run unit tests"
 	@echo "  test-integration Run integration tests (requires Azurite)"
 	@echo "  test             Run all tests"
+	@echo "  test-stress      Run integration tests with 2× stress (3 iterations)"
+	@echo "  test-stress-heavy Run integration tests with 4× stress (5 iterations)"
+	@echo "  test-integration-extended Run integration tests with extended property tests (500+ ops)"
 	@echo "  test-tcl         Run SQLite TCL test suite (sqlite-objs VFS)"
 	@echo "  test-tcl-quick   Run quick TCL test subset (~5 tests)"
 	@echo "  test-tcl-build   Build testfixture-objs only"

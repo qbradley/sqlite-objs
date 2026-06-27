@@ -7,6 +7,11 @@
 **   - Lease acquire race conditions
 **   - Lease expiry after time advancement
 **
+** Phase 3: Retry logic validation
+**   - Retry decision logic (is_retryable)
+**   - Backoff delay computation
+**   - Production retry hook observability (when SQLITE_OBJS_TEST defined)
+**
 ** These tests validate that the VFS handles edge cases correctly.
 */
 
@@ -16,6 +21,10 @@
 #include "test_harness.h"
 #include <string.h>
 #include <stdlib.h>
+
+/* Import retry logic functions from azure_error.c */
+extern int azure_is_retryable(azure_err_t code);
+extern int azure_compute_retry_delay(int attempt, int retry_after_secs);
 
 /* ── Helpers ──────────────────────────────────────────────────────── */
 
@@ -782,11 +791,174 @@ TEST(chaos_lease_state_consistent_across_accessors) {
 }
 
 /* ══════════════════════════════════════════════════════════════════════
+** SECTION 10: Phase 3 — Retry Logic Validation
+**
+** Tests for retry decision logic and backoff delay computation.
+** These test the production retry infrastructure (azure_error.c functions)
+** without requiring network access.
+**
+** Production retry execution (execute_with_retry in azure_client.c) is NOT
+** exercised by these tests — it requires real Azure or Toxiproxy. See
+** "Retry Observability Gap" documentation below.
+** ══════════════════════════════════════════════════════════════════════ */
+
+TEST(retry_logic_transient_errors_are_retryable) {
+    /* SERVER and THROTTLED errors should trigger retries */
+    ASSERT_EQ(azure_is_retryable(AZURE_ERR_SERVER), 1);
+    ASSERT_EQ(azure_is_retryable(AZURE_ERR_THROTTLED), 1);
+}
+
+TEST(retry_logic_permanent_errors_are_not_retryable) {
+    /* Permanent errors should not trigger retries */
+    ASSERT_EQ(azure_is_retryable(AZURE_ERR_NOT_FOUND), 0);
+    ASSERT_EQ(azure_is_retryable(AZURE_ERR_CONFLICT), 0);
+    ASSERT_EQ(azure_is_retryable(AZURE_ERR_AUTH), 0);
+    ASSERT_EQ(azure_is_retryable(AZURE_ERR_PRECONDITION), 0);
+    ASSERT_EQ(azure_is_retryable(AZURE_ERR_BAD_REQUEST), 0);
+    ASSERT_EQ(azure_is_retryable(AZURE_ERR_INVALID_ARG), 0);
+    ASSERT_EQ(azure_is_retryable(AZURE_ERR_NOMEM), 0);
+}
+
+TEST(retry_logic_network_errors_are_not_retryable) {
+    /* Network errors are NOT retryable per current implementation */
+    ASSERT_EQ(azure_is_retryable(AZURE_ERR_NETWORK), 0);
+    ASSERT_EQ(azure_is_retryable(AZURE_ERR_TIMEOUT), 0);
+}
+
+TEST(retry_delay_exponential_backoff) {
+    /* Base: 500ms, exponential: 500, 1000, 2000, 4000, 8000 (+ jitter) */
+    int delay0 = azure_compute_retry_delay(0, -1);
+    int delay1 = azure_compute_retry_delay(1, -1);
+    int delay2 = azure_compute_retry_delay(2, -1);
+    int delay3 = azure_compute_retry_delay(3, -1);
+    int delay4 = azure_compute_retry_delay(4, -1);
+    
+    /* Base: 500ms * 2^0 = 500ms, plus jitter 0-500ms → 500-1000ms */
+    ASSERT_GE(delay0, 500);
+    ASSERT_LT(delay0, 1000);
+    
+    /* Base: 500ms * 2^1 = 1000ms, plus jitter 0-500ms → 1000-1500ms */
+    ASSERT_GE(delay1, 1000);
+    ASSERT_LT(delay1, 1500);
+    
+    /* Base: 500ms * 2^2 = 2000ms, plus jitter 0-500ms → 2000-2500ms */
+    ASSERT_GE(delay2, 2000);
+    ASSERT_LT(delay2, 2500);
+    
+    /* Base: 500ms * 2^3 = 4000ms, plus jitter 0-500ms → 4000-4500ms */
+    ASSERT_GE(delay3, 4000);
+    ASSERT_LT(delay3, 4500);
+    
+    /* Base: 500ms * 2^4 = 8000ms, plus jitter 0-500ms → 8000-8500ms */
+    ASSERT_GE(delay4, 8000);
+    ASSERT_LT(delay4, 8500);
+}
+
+TEST(retry_delay_caps_at_max) {
+    /* Attempt 10: 500ms * 2^10 = 512000ms, but capped at 30000ms */
+    int delay10 = azure_compute_retry_delay(10, -1);
+    ASSERT_LE(delay10, 30000);
+    ASSERT_GE(delay10, 30000 - 500); /* max minus jitter range */
+}
+
+TEST(retry_delay_honors_retry_after_header) {
+    /* Retry-After: 10 seconds → 10000ms */
+    int delay_after10 = azure_compute_retry_delay(0, 10);
+    ASSERT_EQ(delay_after10, 10000);
+    
+    /* Retry-After: 5 seconds → 5000ms */
+    int delay_after5 = azure_compute_retry_delay(0, 5);
+    ASSERT_EQ(delay_after5, 5000);
+    
+    /* Retry-After overrides backoff even on high attempts */
+    int delay_after3 = azure_compute_retry_delay(10, 3);
+    ASSERT_EQ(delay_after3, 3000);
+}
+
+TEST(retry_delay_caps_retry_after_at_max) {
+    /* Retry-After: 100 seconds → capped at 30000ms */
+    int delay = azure_compute_retry_delay(0, 100);
+    ASSERT_EQ(delay, 30000);
+}
+
+TEST(retry_delay_overflow_safe) {
+    /* Retry-After: INT_MAX seconds → capped at 30000ms, no overflow */
+    int delay = azure_compute_retry_delay(0, 2147483);
+    ASSERT_EQ(delay, 30000);
+}
+
+/* ══════════════════════════════════════════════════════════════════════
+** SECTION 11: Phase 3 — Retry Observability Gap Documentation
+**
+** Production retry execution logic (execute_with_retry in azure_client.c)
+** is NOT tested by the unit test suite because:
+**
+**   1. execute_with_retry() is only invoked through production azure_client_t
+**      operations (az_page_blob_create, az_page_blob_write, etc.)
+**   
+**   2. Creating a real azure_client_t requires:
+**      - Valid Azure storage account credentials (SAS token or account key)
+**      - Network access to Azure Blob Storage or Azurite emulator
+**      - Container creation permissions
+**   
+**   3. Unit tests use mock_azure_ops, which bypass execute_with_retry entirely
+**      — mock operations succeed/fail immediately without retry logic
+**
+** What IS tested:
+**   ✓ Retry decision logic (azure_is_retryable) — see tests above
+**   ✓ Backoff delay computation (azure_compute_retry_delay) — see tests above
+**   ✓ Permanent error no-retry behavior via mock (chaos_permanent_error_*)
+**
+** What is NOT tested:
+**   ✗ Actual retry loop execution (5 attempts with sleep between)
+**   ✗ Retry exhaustion after 5 failed attempts
+**   ✗ Early exit on permanent errors in execute_with_retry
+**   ✗ Retry-After header parsing and backoff adjustment
+**
+** Testing retry execution requires one of:
+**   A. Integration tests against real Azure (test_integration.c runs)
+**   B. Toxiproxy-based chaos injection (simulate transient 503 errors)
+**   C. Test-only build of azure_client with injectable failure
+**
+** Phase 3 adds a test-only observation hook (azure_test_set_retry_hook)
+** behind SQLITE_OBJS_TEST. This allows future integration/Toxiproxy tests
+** to observe retry attempts without stderr parsing.
+**
+** To enable retry execution observability in integration tests:
+**   1. Compile with -DSQLITE_OBJS_TEST
+**   2. Call azure_test_set_retry_hook() before test operations
+**   3. Hook receives callback on each retry attempt with full context
+**   4. Validate retry count, delays, error codes, etc.
+**
+** Example (pseudocode for future integration test):
+**
+**   #ifdef SQLITE_OBJS_TEST
+**   static int retry_count = 0;
+**   static void retry_observer(const azure_retry_event_t *ev, void *ctx) {
+**       retry_count++;
+**       ASSERT_EQ(ev->error_code, AZURE_ERR_SERVER);
+**       ASSERT_GE(ev->delay_ms, 500);  // exponential backoff enforced
+**   }
+**   azure_test_set_retry_hook(retry_observer, NULL);
+**   #endif
+**
+**   // Trigger transient error scenario (Toxiproxy: return 503 x4, then 200)
+**   azure_err_t rc = ops->page_blob_create(ctx, "test.db", 4096, &err);
+**   ASSERT_AZURE_OK(rc);  // Should succeed after 4 retries
+**
+**   #ifdef SQLITE_OBJS_TEST
+**   ASSERT_EQ(retry_count, 4);
+**   azure_test_set_retry_hook(NULL, NULL);  // cleanup
+**   #endif
+**
+** ══════════════════════════════════════════════════════════════════════ */
+
+/* ══════════════════════════════════════════════════════════════════════
 ** Test runner
 ** ══════════════════════════════════════════════════════════════════════ */
 
 static void run_chaos_tests(void) {
-    printf("\n%s=== Chaos Testing (Phase 1/P0 + Phase 2) ===%s\n", TH_BOLD, TH_RESET);
+    printf("\n%s=== Chaos Testing (Phase 1/P0 + Phase 2 + Phase 3) ===%s\n", TH_BOLD, TH_RESET);
     
     /* ETag chaos */
     RUN_TEST(chaos_clear_etag_basic);
@@ -836,4 +1008,14 @@ static void run_chaos_tests(void) {
     RUN_TEST(chaos_get_properties_reflects_expired_lease);
     RUN_TEST(chaos_helper_accessors_auto_clear_expired_lease);
     RUN_TEST(chaos_lease_state_consistent_across_accessors);
+    
+    /* Phase 3: Retry logic validation */
+    RUN_TEST(retry_logic_transient_errors_are_retryable);
+    RUN_TEST(retry_logic_permanent_errors_are_not_retryable);
+    RUN_TEST(retry_logic_network_errors_are_not_retryable);
+    RUN_TEST(retry_delay_exponential_backoff);
+    RUN_TEST(retry_delay_caps_at_max);
+    RUN_TEST(retry_delay_honors_retry_after_header);
+    RUN_TEST(retry_delay_caps_retry_after_at_max);
+    RUN_TEST(retry_delay_overflow_safe);
 }

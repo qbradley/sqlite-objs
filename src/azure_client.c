@@ -97,6 +97,19 @@ static double az_time_ms(void) {
     return tv.tv_sec * 1000.0 + tv.tv_usec / 1000.0;
 }
 
+#ifdef SQLITE_OBJS_TEST
+/* ================================================================
+ * Test-only retry observation hook
+ * ================================================================ */
+static azure_retry_hook_fn g_retry_hook = NULL;
+static void *g_retry_hook_ctx = NULL;
+
+void azure_test_set_retry_hook(azure_retry_hook_fn hook, void *ctx) {
+    g_retry_hook = hook;
+    g_retry_hook_ctx = ctx;
+}
+#endif /* SQLITE_OBJS_TEST */
+
 /* Per-request stats for debug timing */
 static int g_http_request_count = 0;
 static int g_tls_reuse_count = 0;
@@ -657,6 +670,24 @@ static azure_err_t execute_with_retry(
         /* Transient/throttled error — retry with backoff */
         if (attempt < AZURE_MAX_RETRIES) {
             int delay_ms = azure_compute_retry_delay(attempt, rh.retry_after);
+            
+#ifdef SQLITE_OBJS_TEST
+            /* Invoke test-only retry observation hook */
+            if (g_retry_hook) {
+                azure_retry_event_t event = {
+                    .method = method,
+                    .blob_name = blob_name,
+                    .error_code = rc,
+                    .http_status = err->http_status,
+                    .attempt = attempt,
+                    .max_retries = AZURE_MAX_RETRIES,
+                    .delay_ms = delay_ms,
+                    .retry_after = rh.retry_after
+                };
+                g_retry_hook(&event, g_retry_hook_ctx);
+            }
+#endif
+
             fprintf(stderr, "[sqlite-objs] %s %s: %s (HTTP %d) — "
                     "retry %d/%d in %dms\n",
                     method, blob_name, azure_err_str(rc),
