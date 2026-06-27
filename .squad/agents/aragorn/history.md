@@ -136,3 +136,36 @@ The final implementation is more nuanced than fail-fast on every ETag mismatch. 
 **Key insight:** SQLite's transaction model requires snapshot isolation. Must refresh stale snapshots before reads, but fail fast (SQLITE_BUSY) if staleness detected after reads — cannot re-download mid-transaction.
 
 **Result:** 42/42 integration tests pass, concurrent-writer regression test serializes all 4 writers with all 40 inserts persisted, no data loss.
+
+### Phase 2 VFS Test Hooks — Sync Interleaving (2026-06-27)
+
+**Context:** Phase 1 test infrastructure added chaos primitives (ETag clearing, time offset). Phase 2 extends this with deterministic crash/partial-write simulation via sync interleaving hooks.
+
+**Implementation:** Added test-only hook API behind `SQLITE_OBJS_TEST` for observing/aborting xSync operations at critical points:
+- `beforePageBlobResize` — before MAIN_DB page blob resize (line 1903)
+- `beforeBatchPageWrite` — before batch page write via curl_multi (line 2001)
+- `beforeSeqPageWrite` — before sequential page write fallback (line 2062)
+- `beforeJournalUpload` — before journal block blob upload (line 1837)
+- `beforeWalUpload` — before WAL block blob upload (line 1775)
+
+**API Design:**
+- Hook function signature: `int (*)(void *ctx, const char *blobName)`
+- Return 0 = proceed normally, nonzero = abort with `SQLITE_IOERR_FSYNC`
+- Single registration function `sqlite_objs_test_set_sync_hooks()` with ctx + 5 hook parameters
+- Global hook state stored in static variables (test-only, zero production symbol leakage verified)
+
+**Key Principles:**
+- Hooks guarded by `#ifdef SQLITE_OBJS_TEST` at declaration, storage, registration, and call sites
+- Return SQLite error codes (not process abort) to enable controlled failure injection
+- No assert() for validation — test suites include mock/stub paths where preconditions may not hold
+- Production builds have zero hook symbols (verified via `nm` on production object files)
+- Test builds include hook symbols (verified via `nm` on test object files)
+
+**Files Modified:**
+- `src/sqlite_objs.h` lines 219-259: Hook typedef and registration API
+- `src/sqlite_objs_vfs.c` lines 48-72: Hook storage and registration implementation
+- `src/sqlite_objs_vfs.c` lines 1775, 1837, 1903, 2001, 2062: Hook call sites in xSync paths
+
+**Validation:** All 312 unit tests pass. Production build has no hook symbols; test build has 6 hook symbols (`g_test_sync_hook_ctx` + 5 function pointers + `sqlite_objs_test_set_sync_hooks`).
+
+**Use Case:** Enables deterministic chaos testing for crash recovery, partial writes, and multi-operation interleaving (e.g., fail after resize but before page write, fail journal upload after MAIN_DB sync).

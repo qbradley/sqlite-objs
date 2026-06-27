@@ -26,6 +26,7 @@
 #include <stdlib.h>
 #include <unistd.h>
 #include <pthread.h>
+#include <sys/wait.h>
 
 /* ================================================================
  * Azurite configuration (well-known dev credentials)
@@ -3973,6 +3974,640 @@ TEST(reader_writer_interleaving) {
 }
 
 /* ================================================================
+ * I. Phase 2: Crash Recovery & Partial-Write Testing
+ * ================================================================ */
+
+/* ─────────────────────────────────────────────────────────────────
+ * I.1 Sync Hook Infrastructure for Crash Simulation
+ * ───────────────────────────────────────────────────────────────── */
+
+/* Context for crash simulation hooks */
+typedef struct {
+    int call_count;              /* Total hook invocations */
+    int fail_at_call;            /* Inject failure at this call number (0 = disabled) */
+    const char *target_blob;     /* Only fail for this blob name (NULL = all) */
+    int injected;                /* Flag: failure was injected */
+} crash_hook_ctx_t;
+
+/* Generic sync hook that fails at a specific call number */
+static int crash_inject_at_call(void *ctx, const char *blob_name) {
+    crash_hook_ctx_t *hook = (crash_hook_ctx_t *)ctx;
+    hook->call_count++;
+    
+    fprintf(stdout, "      [HOOK] call %d on blob '%s'\n",
+            hook->call_count, blob_name ? blob_name : "(null)");
+    
+    /* Skip if we're targeting a specific blob and this isn't it */
+    if (hook->target_blob && blob_name && strcmp(blob_name, hook->target_blob) != 0) {
+        return 0;  /* proceed normally */
+    }
+
+    /* Inject failure if this is the target call */
+    if (hook->fail_at_call > 0 && hook->call_count == hook->fail_at_call) {
+        hook->injected = 1;
+        fprintf(stdout, "      [CRASH INJECT] failing call %d on blob '%s'\n",
+                hook->call_count, blob_name ? blob_name : "(null)");
+        return 1;  /* abort with SQLITE_IOERR_FSYNC */
+    }
+    
+    return 0;  /* proceed normally */
+}
+
+static void assert_child_exited(pid_t pid, int expected_code) {
+    int status = 0;
+    ASSERT_EQ(waitpid(pid, &status, 0), pid);
+    ASSERT_TRUE(WIFEXITED(status));
+    ASSERT_EQ(WEXITSTATUS(status), expected_code);
+}
+
+/* ─────────────────────────────────────────────────────────────────
+ * I.2 Crash Recovery Tests
+ * ───────────────────────────────────────────────────────────────── */
+
+/*
+ * Test I1: Crash during batch page write — verify rollback journal recovery
+ * 
+ * Pattern:
+ *   1. Create DB with initial data
+ *   2. Start transaction, insert new rows
+ *   3. Inject crash during batch page write (xSync)
+ *   4. Verify: transaction rolled back, no partial state, integrity OK
+ */
+TEST(crash_batch_write_rollback) {
+    const char *db_name = "crash-batch-write.db";
+    cleanup_test_blobs(db_name);
+    
+    int rc = sqlite_objs_vfs_register_uri(0);
+    ASSERT_OK(rc);
+    
+    /* Create initial data */
+    sqlite3 *db = open_azurite_db(db_name, NULL, 1);
+    ASSERT_NOT_NULL(db);
+    
+    rc = exec_sql(db,
+        "CREATE TABLE recovery ("
+        "  id INTEGER PRIMARY KEY,"
+        "  data TEXT"
+        ");");
+    ASSERT_OK(rc);
+    
+    rc = exec_sql(db,
+        "INSERT INTO recovery VALUES (1, 'committed-1'),"
+        "                             (2, 'committed-2'),"
+        "                             (3, 'committed-3');");
+    ASSERT_OK(rc);
+    sqlite3_close(db);
+    
+    fprintf(stdout, "  initial: 3 rows committed\n");
+    
+    pid_t pid = fork();
+    ASSERT_GE(pid, 0);
+    if (pid == 0) {
+        sqlite3 *child_db = open_azurite_db(db_name, NULL, 0);
+        if (!child_db) _exit(90);
+
+        crash_hook_ctx_t hook = {0};
+        hook.fail_at_call = 1;
+        sqlite_objs_test_set_sync_hooks(&hook, NULL, crash_inject_at_call,
+                                         crash_inject_at_call, NULL, NULL);
+
+        int child_rc = exec_sql(child_db, "BEGIN IMMEDIATE;");
+        if (child_rc != SQLITE_OK) _exit(91);
+        child_rc = exec_sql(child_db,
+            "INSERT INTO recovery VALUES (4, 'uncommitted-4'),"
+            "                             (5, 'uncommitted-5');");
+        if (child_rc != SQLITE_OK) _exit(92);
+
+        fprintf(stdout, "  child attempting COMMIT (hook will fire on sync)...\n");
+        child_rc = exec_sql(child_db, "COMMIT;");
+        fprintf(stdout, "  child COMMIT result: %d (injected=%d)\n", child_rc, hook.injected);
+        _exit((hook.injected && child_rc != SQLITE_OK) ? 10 : 93);
+    }
+    assert_child_exited(pid, 10);
+    
+    /* Reopen and verify recovery */
+    fprintf(stdout, "  reopening to verify recovery...\n");
+    db = open_azurite_db(db_name, NULL, 0);
+    ASSERT_NOT_NULL(db);
+    
+    ASSERT_TRUE(check_integrity(db));
+    
+    int count = 0;
+    rc = query_int(db, "SELECT COUNT(*) FROM recovery;", &count);
+    ASSERT_OK(rc);
+    fprintf(stdout, "  after recovery: %d rows (expected 3)\n", count);
+    ASSERT_EQ(count, 3);
+    
+    /* Verify uncommitted rows are NOT present */
+    rc = query_int(db, "SELECT COUNT(*) FROM recovery WHERE id >= 4;", &count);
+    ASSERT_OK(rc);
+    ASSERT_EQ(count, 0);
+    
+    sqlite3_close(db);
+    cleanup_test_blobs(db_name);
+}
+
+/*
+ * Test I2: Crash during journal upload — verify partial journal ignored
+ * 
+ * Pattern:
+ *   1. Create DB with data
+ *   2. Start transaction
+ *   3. Inject crash during journal upload
+ *   4. Verify: transaction not committed, no corruption
+ */
+TEST(crash_journal_upload) {
+    const char *db_name = "crash-journal.db";
+    cleanup_test_blobs(db_name);
+    
+    int rc = sqlite_objs_vfs_register_uri(0);
+    ASSERT_OK(rc);
+    
+    /* Create initial data */
+    sqlite3 *db = open_azurite_db(db_name, NULL, 1);
+    ASSERT_NOT_NULL(db);
+    
+    rc = exec_sql(db,
+        "CREATE TABLE recovery ("
+        "  id INTEGER PRIMARY KEY,"
+        "  value INTEGER"
+        ");");
+    ASSERT_OK(rc);
+    
+    rc = exec_sql(db, "INSERT INTO recovery VALUES (1, 100);");
+    ASSERT_OK(rc);
+    sqlite3_close(db);
+    
+    fprintf(stdout, "  initial: 1 row committed\n");
+    
+    pid_t pid = fork();
+    ASSERT_GE(pid, 0);
+    if (pid == 0) {
+        sqlite3 *child_db = open_azurite_db(db_name, NULL, 0);
+        if (!child_db) _exit(90);
+
+        crash_hook_ctx_t hook = {0};
+        hook.fail_at_call = 1;
+        sqlite_objs_test_set_sync_hooks(&hook, NULL, NULL, NULL,
+                                         crash_inject_at_call, NULL);
+
+        int child_rc = exec_sql(child_db, "BEGIN IMMEDIATE;");
+        if (child_rc != SQLITE_OK) _exit(91);
+        child_rc = exec_sql(child_db, "UPDATE recovery SET value = 999 WHERE id = 1;");
+        if (child_rc != SQLITE_OK) _exit(92);
+
+        fprintf(stdout, "  child attempting COMMIT (hook will fire on journal upload)...\n");
+        child_rc = exec_sql(child_db, "COMMIT;");
+        fprintf(stdout, "  child COMMIT result: %d (injected=%d)\n", child_rc, hook.injected);
+        _exit((hook.injected && child_rc != SQLITE_OK) ? 10 : 93);
+    }
+    assert_child_exited(pid, 10);
+    
+    /* Verify recovery */
+    fprintf(stdout, "  reopening after crash...\n");
+    db = open_azurite_db(db_name, NULL, 0);
+    ASSERT_NOT_NULL(db);
+    
+    ASSERT_TRUE(check_integrity(db));
+    
+    int value = 0;
+    rc = query_int(db, "SELECT value FROM recovery WHERE id = 1;", &value);
+    ASSERT_OK(rc);
+    fprintf(stdout, "  value: %d (expected 100, not 999)\n", value);
+    ASSERT_EQ(value, 100);
+    
+    sqlite3_close(db);
+    cleanup_test_blobs(db_name);
+}
+
+/*
+ * Test I3: Multiple crash/recovery cycles — verify cumulative integrity
+ * 
+ * Pattern:
+ *   1. Commit batch 1 (succeeds)
+ *   2. Commit batch 2 with crash (fails)
+ *   3. Recover and verify batch 1 intact
+ *   4. Commit batch 3 (succeeds)
+ *   5. Verify all committed data present, no partial state
+ */
+TEST(crash_recovery_multiple_cycles) {
+    const char *db_name = "crash-multi-cycle.db";
+    cleanup_test_blobs(db_name);
+    
+    int rc = sqlite_objs_vfs_register_uri(0);
+    ASSERT_OK(rc);
+    
+    /* Cycle 1: Successful commit */
+    sqlite3 *db = open_azurite_db(db_name, NULL, 1);
+    ASSERT_NOT_NULL(db);
+    
+    rc = exec_sql(db,
+        "CREATE TABLE cycles ("
+        "  batch INTEGER,"
+        "  seq INTEGER"
+        ");");
+    ASSERT_OK(rc);
+    
+    rc = exec_sql(db, "INSERT INTO cycles VALUES (1, 1), (1, 2), (1, 3);");
+    ASSERT_OK(rc);
+    sqlite3_close(db);
+    
+    fprintf(stdout, "  cycle 1: 3 rows committed\n");
+    
+    pid_t pid = fork();
+    ASSERT_GE(pid, 0);
+    if (pid == 0) {
+        sqlite3 *child_db = open_azurite_db(db_name, NULL, 0);
+        if (!child_db) _exit(90);
+
+        crash_hook_ctx_t hook = {0};
+        hook.fail_at_call = 1;
+        sqlite_objs_test_set_sync_hooks(&hook, NULL, crash_inject_at_call,
+                                         crash_inject_at_call, NULL, NULL);
+
+        int child_rc = exec_sql(child_db, "BEGIN IMMEDIATE;");
+        if (child_rc != SQLITE_OK) _exit(91);
+        child_rc = exec_sql(child_db, "INSERT INTO cycles VALUES (2, 1), (2, 2), (2, 3);");
+        if (child_rc != SQLITE_OK) _exit(92);
+
+        fprintf(stdout, "  child attempting COMMIT (hook will crash)...\n");
+        child_rc = exec_sql(child_db, "COMMIT;");
+        fprintf(stdout, "  child cycle 2 COMMIT result=%d, injected=%d\n", child_rc, hook.injected);
+        _exit((hook.injected && child_rc != SQLITE_OK) ? 10 : 93);
+    }
+    assert_child_exited(pid, 10);
+    
+    /* Verify recovery: batch 1 present, batch 2 absent */
+    fprintf(stdout, "  verifying recovery...\n");
+    db = open_azurite_db(db_name, NULL, 0);
+    ASSERT_NOT_NULL(db);
+    
+    ASSERT_TRUE(check_integrity(db));
+    
+    int count = 0;
+    rc = query_int(db, "SELECT COUNT(*) FROM cycles WHERE batch = 1;", &count);
+    ASSERT_OK(rc);
+    ASSERT_EQ(count, 3);
+    
+    rc = query_int(db, "SELECT COUNT(*) FROM cycles WHERE batch = 2;", &count);
+    ASSERT_OK(rc);
+    ASSERT_EQ(count, 0);
+    
+    /* Cycle 3: Successful commit after recovery */
+    rc = exec_sql(db, "INSERT INTO cycles VALUES (3, 1), (3, 2);");
+    ASSERT_OK(rc);
+    sqlite3_close(db);
+    
+    fprintf(stdout, "  cycle 3: 2 rows committed\n");
+    
+    /* Final verification */
+    db = open_azurite_db(db_name, NULL, 0);
+    ASSERT_NOT_NULL(db);
+    
+    ASSERT_TRUE(check_integrity(db));
+    
+    rc = query_int(db, "SELECT COUNT(*) FROM cycles;", &count);
+    ASSERT_OK(rc);
+    fprintf(stdout, "  final count: %d (expected 5)\n", count);
+    ASSERT_EQ(count, 5);
+    
+    ASSERT_TRUE(check_rowid_uniqueness(db, "cycles"));
+    
+    sqlite3_close(db);
+    cleanup_test_blobs(db_name);
+}
+
+/* ─────────────────────────────────────────────────────────────────
+ * I.4 Partial Write Recovery Tests
+ * ───────────────────────────────────────────────────────────────── */
+
+/*
+ * Test I4: Page blob resize crash — verify DB remains at old size
+ * 
+ * Pattern:
+ *   1. Create small DB
+ *   2. Insert enough data to trigger resize
+ *   3. Crash during resize operation
+ *   4. Verify: DB reopens at old size, no corruption
+ */
+TEST(crash_page_blob_resize) {
+    const char *db_name = "crash-resize.db";
+    cleanup_test_blobs(db_name);
+    
+    int rc = sqlite_objs_vfs_register_uri(0);
+    ASSERT_OK(rc);
+    
+    /* Create small DB */
+    sqlite3 *db = open_azurite_db(db_name, NULL, 1);
+    ASSERT_NOT_NULL(db);
+    
+    rc = exec_sql(db,
+        "CREATE TABLE resize_test (data BLOB);");
+    ASSERT_OK(rc);
+    
+    /* Insert small amount to establish baseline */
+    rc = exec_sql(db, "INSERT INTO resize_test VALUES (zeroblob(1024));");
+    ASSERT_OK(rc);
+    sqlite3_close(db);
+    
+    pid_t pid = fork();
+    ASSERT_GE(pid, 0);
+    if (pid == 0) {
+        sqlite3 *child_db = open_azurite_db(db_name, NULL, 0);
+        if (!child_db) _exit(90);
+
+        crash_hook_ctx_t hook = {0};
+        hook.fail_at_call = 1;
+        sqlite_objs_test_set_sync_hooks(&hook, crash_inject_at_call,
+                                         NULL, NULL, NULL, NULL);
+
+        fprintf(stdout, "  child attempting large INSERT (may trigger resize)...\n");
+        int child_rc = exec_sql(child_db, "INSERT INTO resize_test VALUES (zeroblob(100000));");
+        fprintf(stdout, "  child large INSERT result: %d (injected=%d)\n", child_rc, hook.injected);
+        _exit((hook.injected && child_rc != SQLITE_OK) ? 10 : 93);
+    }
+    assert_child_exited(pid, 10);
+    
+    /* Verify recovery */
+    fprintf(stdout, "  reopening after resize crash...\n");
+    db = open_azurite_db(db_name, NULL, 0);
+    ASSERT_NOT_NULL(db);
+    
+    ASSERT_TRUE(check_integrity(db));
+    
+    /* Small row should still be there */
+    int count = 0;
+    rc = query_int(db, "SELECT COUNT(*) FROM resize_test;", &count);
+    ASSERT_OK(rc);
+    fprintf(stdout, "  row count: %d (expected 1)\n", count);
+    ASSERT_EQ(count, 1);
+
+    rc = query_int(db, "SELECT COUNT(*) FROM resize_test WHERE length(data) = 100000;", &count);
+    ASSERT_OK(rc);
+    ASSERT_EQ(count, 0);
+    
+    sqlite3_close(db);
+    cleanup_test_blobs(db_name);
+}
+
+/* ─────────────────────────────────────────────────────────────────
+ * I.5 Advanced Reader/Writer Interleaving (Phase 2 Extension)
+ * ───────────────────────────────────────────────────────────────── */
+
+/*
+ * Test I5: Long-running snapshot isolation — verify writer commits don't affect reader
+ * 
+ * Pattern:
+ *   1. Reader opens long-running snapshot (simulated via explicit BEGIN)
+ *   2. Writer commits new data
+ *   3. Reader still sees old snapshot
+ *   4. Reader commits (read-only)
+ *   5. New reader sees updated data
+ */
+TEST(snapshot_isolation_long_running) {
+    const char *db_name = "snapshot-isolation.db";
+    cleanup_test_blobs(db_name);
+    
+    int rc = sqlite_objs_vfs_register_uri(0);
+    ASSERT_OK(rc);
+    
+    /* Create initial data */
+    sqlite3 *db = open_azurite_db(db_name, NULL, 1);
+    ASSERT_NOT_NULL(db);
+    
+    rc = exec_sql(db,
+        "CREATE TABLE snapshot ("
+        "  id INTEGER PRIMARY KEY,"
+        "  value TEXT"
+        ");");
+    ASSERT_OK(rc);
+    
+    rc = exec_sql(db, "INSERT INTO snapshot VALUES (1, 'initial');");
+    ASSERT_OK(rc);
+    sqlite3_close(db);
+    
+    /* Reader establishes snapshot */
+    sqlite3 *reader = open_azurite_db(db_name, NULL, 0);
+    ASSERT_NOT_NULL(reader);
+    
+    rc = exec_sql(reader, "BEGIN DEFERRED;");
+    ASSERT_OK(rc);
+    
+    /* Read to lock snapshot */
+    int count = 0;
+    rc = query_int(reader, "SELECT COUNT(*) FROM snapshot;", &count);
+    ASSERT_OK(rc);
+    ASSERT_EQ(count, 1);
+    
+    fprintf(stdout, "  reader: snapshot established (1 row)\n");
+    
+    /* Writer commits new data */
+    sqlite3 *writer = open_azurite_db(db_name, NULL, 0);
+    ASSERT_NOT_NULL(writer);
+    
+    rc = exec_sql(writer, "INSERT INTO snapshot VALUES (2, 'new-data');");
+    ASSERT_OK(rc);
+    sqlite3_close(writer);
+    
+    fprintf(stdout, "  writer: committed new row\n");
+    
+    /* Reader should still see old snapshot */
+    rc = query_int(reader, "SELECT COUNT(*) FROM snapshot;", &count);
+    ASSERT_OK(rc);
+    fprintf(stdout, "  reader (same snapshot): %d rows (expected 1)\n", count);
+    ASSERT_EQ(count, 1);
+    
+    rc = exec_sql(reader, "ROLLBACK;");
+    ASSERT_OK(rc);
+    sqlite3_close(reader);
+    
+    /* New reader sees updated data */
+    sqlite3 *reader2 = open_azurite_db(db_name, NULL, 0);
+    ASSERT_NOT_NULL(reader2);
+    
+    rc = query_int(reader2, "SELECT COUNT(*) FROM snapshot;", &count);
+    ASSERT_OK(rc);
+    fprintf(stdout, "  new reader: %d rows (expected 2)\n", count);
+    ASSERT_EQ(count, 2);
+    
+    sqlite3_close(reader2);
+    cleanup_test_blobs(db_name);
+}
+
+/*
+ * Test I6: Stale snapshot detection — verify ETag mismatch forces re-read
+ * 
+ * Pattern:
+ *   1. Client A reads DB (caches ETag)
+ *   2. Client B modifies DB (ETag changes)
+ *   3. Client A attempts to read with stale cache
+ *   4. Verify: Client A detects ETag mismatch and re-reads
+ */
+TEST(stale_snapshot_etag_revalidation) {
+    const char *db_name = "stale-snapshot.db";
+    cleanup_test_blobs(db_name);
+    
+    int rc = sqlite_objs_vfs_register_uri(0);
+    ASSERT_OK(rc);
+    
+    /* Client A creates initial data */
+    sqlite3 *clientA = open_azurite_db(db_name, NULL, 1);
+    ASSERT_NOT_NULL(clientA);
+    
+    rc = exec_sql(clientA,
+        "CREATE TABLE etag_test (id INTEGER PRIMARY KEY, data TEXT);");
+    ASSERT_OK(rc);
+    
+    rc = exec_sql(clientA, "INSERT INTO etag_test VALUES (1, 'version-1');");
+    ASSERT_OK(rc);
+    
+    /* Close to flush */
+    sqlite3_close(clientA);
+    
+    fprintf(stdout, "  client A: created DB with version-1\n");
+    
+    /* Client A reopens (may cache ETag) */
+    clientA = open_azurite_db(db_name, NULL, 0);
+    ASSERT_NOT_NULL(clientA);
+    
+    int count = 0;
+    rc = query_int(clientA, "SELECT COUNT(*) FROM etag_test;", &count);
+    ASSERT_OK(rc);
+    ASSERT_EQ(count, 1);
+    
+    /* Client B modifies DB */
+    sqlite3 *clientB = open_azurite_db(db_name, NULL, 0);
+    ASSERT_NOT_NULL(clientB);
+    
+    rc = exec_sql(clientB, "INSERT INTO etag_test VALUES (2, 'version-2');");
+    ASSERT_OK(rc);
+    sqlite3_close(clientB);
+    
+    fprintf(stdout, "  client B: inserted version-2\n");
+    
+    /* Client A should detect stale cache and see new data */
+    rc = query_int(clientA, "SELECT COUNT(*) FROM etag_test;", &count);
+    ASSERT_OK(rc);
+    fprintf(stdout, "  client A (after B's write): %d rows (expected 2)\n", count);
+    ASSERT_EQ(count, 2);
+    
+    sqlite3_close(clientA);
+    cleanup_test_blobs(db_name);
+}
+
+/* ─────────────────────────────────────────────────────────────────
+ * I.7 Invariant Stress Tests After Failures
+ * ───────────────────────────────────────────────────────────────── */
+
+/*
+ * Test I7: Concurrent writes with intermittent crashes — verify final consistency
+ * 
+ * Pattern:
+ *   1. Multiple writers insert data
+ *   2. Randomly inject crashes (some succeed, some fail)
+ *   3. Verify: all committed data persisted, no partial commits, rowid uniqueness
+ */
+TEST(invariant_check_after_crash_stress) {
+    const char *db_name = "invariant-crash-stress.db";
+    cleanup_test_blobs(db_name);
+    
+    int rc = sqlite_objs_vfs_register_uri(0);
+    ASSERT_OK(rc);
+    
+    /* Create schema */
+    sqlite3 *db = open_azurite_db(db_name, NULL, 1);
+    ASSERT_NOT_NULL(db);
+    
+    rc = exec_sql(db,
+        "CREATE TABLE stress ("
+        "  id INTEGER PRIMARY KEY AUTOINCREMENT,"
+        "  batch INTEGER,"
+        "  value INTEGER"
+        ");");
+    ASSERT_OK(rc);
+    sqlite3_close(db);
+    
+    fprintf(stdout, "  running 10 batches with selective crash injection...\n");
+    
+    int committed_batches = 0;
+    int crashed_batches = 0;
+    
+    for (int batch = 1; batch <= 10; batch++) {
+        db = open_azurite_db(db_name, NULL, 0);
+        ASSERT_NOT_NULL(db);
+        
+        /* Inject crash on batches 3, 6, 9 */
+        int should_crash = (batch == 3 || batch == 6 || batch == 9);
+
+        if (should_crash) {
+            sqlite3_close(db);
+            pid_t pid = fork();
+            ASSERT_GE(pid, 0);
+            if (pid == 0) {
+                sqlite3 *child_db = open_azurite_db(db_name, NULL, 0);
+                if (!child_db) _exit(90);
+
+                crash_hook_ctx_t hook = {0};
+                hook.fail_at_call = 1;
+                sqlite_objs_test_set_sync_hooks(&hook, NULL, crash_inject_at_call,
+                                                 crash_inject_at_call, NULL, NULL);
+
+                char child_sql[256];
+                snprintf(child_sql, sizeof(child_sql),
+                         "INSERT INTO stress (batch, value) VALUES (%d, %d), (%d, %d);",
+                         batch, batch * 10, batch, batch * 10 + 1);
+                int child_rc = exec_sql(child_db, child_sql);
+                fprintf(stdout, "    child batch %d: rc=%d injected=%d\n",
+                        batch, child_rc, hook.injected);
+                _exit((hook.injected && child_rc != SQLITE_OK) ? 10 : 93);
+            }
+
+            assert_child_exited(pid, 10);
+            fprintf(stdout, "    batch %d: crashed as expected\n", batch);
+            crashed_batches++;
+            continue;
+        }
+
+        char sql[256];
+        snprintf(sql, sizeof(sql),
+                 "INSERT INTO stress (batch, value) VALUES (%d, %d), (%d, %d);",
+                 batch, batch * 10, batch, batch * 10 + 1);
+
+        rc = exec_sql(db, sql);
+        fprintf(stdout, "    batch %d: committed\n", batch);
+        ASSERT_OK(rc);
+        committed_batches++;
+        sqlite3_close(db);
+    }
+    /* Final verification */
+    fprintf(stdout, "  verifying final state (%d committed, %d crashed)...\n",
+            committed_batches, crashed_batches);
+    ASSERT_GT(crashed_batches, 0);
+    
+    db = open_azurite_db(db_name, NULL, 0);
+    ASSERT_NOT_NULL(db);
+    
+    ASSERT_TRUE(check_integrity(db));
+    
+    int total_rows = 0;
+    rc = query_int(db, "SELECT COUNT(*) FROM stress;", &total_rows);
+    ASSERT_OK(rc);
+    fprintf(stdout, "  total rows: %d (expected %d)\n",
+            total_rows, committed_batches * 2);
+    ASSERT_EQ(total_rows, committed_batches * 2);
+    
+    ASSERT_TRUE(check_rowid_uniqueness(db, "stress"));
+    
+    /* Verify no partial batches */
+    rc = query_int(db, "SELECT COUNT(DISTINCT batch) FROM stress;", &total_rows);
+    ASSERT_OK(rc);
+    ASSERT_EQ(total_rows, committed_batches);
+    
+    sqlite3_close(db);
+    cleanup_test_blobs(db_name);
+}
+
+/* ================================================================
  * Main runner
  * ================================================================ */
 
@@ -4077,6 +4712,23 @@ int main(void) {
     RUN_TEST(stress_8_writers_25_each);
     RUN_TEST(stress_16_writers_20_each);
     RUN_TEST(reader_writer_interleaving);
+    TEST_SUITE_END();
+
+    /* Phase 2: Crash recovery & advanced invariants */
+    TEST_SUITE_BEGIN("Crash Recovery: Phase 2 Deterministic Testing");
+    RUN_TEST(crash_batch_write_rollback);
+    RUN_TEST(crash_journal_upload);
+    RUN_TEST(crash_recovery_multiple_cycles);
+    RUN_TEST(crash_page_blob_resize);
+    TEST_SUITE_END();
+
+    TEST_SUITE_BEGIN("Snapshot Isolation: Phase 2 Advanced Scenarios");
+    RUN_TEST(snapshot_isolation_long_running);
+    RUN_TEST(stale_snapshot_etag_revalidation);
+    TEST_SUITE_END();
+
+    TEST_SUITE_BEGIN("Invariants: Phase 2 Post-Failure Stress");
+    RUN_TEST(invariant_check_after_crash_stress);
     TEST_SUITE_END();
 
     /* Cleanup */

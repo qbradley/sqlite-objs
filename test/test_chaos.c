@@ -404,8 +404,8 @@ TEST(chaos_transient_failure_single_operation_recovers) {
     azure_err_t rc = g_ops->page_blob_create(g_ctx, name, 4096, &err);
     ASSERT_AZURE_OK(rc);
     
-    /* Inject failure at the next call (total call #3: create blob, get_properties internally, then this read) */
-    mock_set_fail_at(g_ctx, 3, AZURE_ERR_NETWORK);
+    /* Inject failure on the first page_blob_read call */
+    mock_set_fail_operation_at(g_ctx, "page_blob_read", 1, AZURE_ERR_NETWORK);
     
     /* Next read should fail with network error */
     azure_buffer_t buf = {0};
