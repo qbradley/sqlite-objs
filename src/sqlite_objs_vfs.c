@@ -158,6 +158,7 @@ typedef struct sqliteObjsFile {
     char leaseId[64];                   /* Azure lease ID (empty = no lease) */
     time_t leaseAcquiredAt;             /* For renewal timing */
     int leaseDuration;                  /* Actual lease duration acquired (seconds) */
+    int readsSinceSharedLock;           /* MAIN_DB reads after current SHARED lock */
 
     /* R2: Skip redundant resize — track last synced blob size */
     sqlite3_int64 lastSyncedSize;       /* Blob size after last successful resize/open */
@@ -1409,6 +1410,9 @@ static int sqliteObjsRead(sqlite3_file *pFile, void *pBuf, int iAmt,
     
     /* MAIN_DB — read from cache file */
     g_xread_count++;
+    if (p->eLock >= SQLITE_LOCK_SHARED) {
+        p->readsSinceSharedLock++;
+    }
     
     if (p->cacheFd < 0) {
         memset(pBuf, 0, iAmt);
@@ -1928,8 +1932,9 @@ static int sqliteObjsSync(sqlite3_file *pFile, int flags) {
             p->ops_ctx, p->zBlobName,
             ranges, nRanges,
             hasLease(p) ? p->leaseId : NULL,
-            /* Don't send If-Match when we hold a lease — the lease provides
-            ** exclusive access, and Azurite may reject If-Match + lease combo */
+            /* Do not send If-Match while holding a lease: multi-range writes
+            ** and prior resizes change the ETag during xSync. The lease plus
+            ** post-lease revalidation provides the writer exclusion contract. */
             (hasLease(p) || !p->etag[0]) ? NULL : p->etag,
             &aerr);
 
@@ -1989,7 +1994,8 @@ static int sqliteObjsSync(sqlite3_file *pFile, int flags) {
             p->ops_ctx, p->zBlobName,
             ranges[i].offset, ranges[i].data, ranges[i].len,
             hasLease(p) ? p->leaseId : NULL,
-            /* Don't send If-Match when we hold a lease */
+            /* Do not send If-Match while holding a lease; each successful
+            ** Put Page changes the ETag before the next range is sent. */
             (hasLease(p) || !p->etag[0]) ? NULL : p->etag,
             &aerr);
 
@@ -2078,22 +2084,164 @@ static int sqliteObjsFileSize(sqlite3_file *pFile, sqlite3_int64 *pSize) {
 }
 
 /*
-** Re-validate the local cache after acquiring an Azure lease.
+** Replace the MAIN_DB cache with the current blob contents.
 **
+** This is safe before SQLite has read pages for the current transaction. Once
+** reads have occurred, callers must not refresh in-place because SQLite's
+** pager may already hold pages from the previous snapshot.
+*/
+static int refreshMainDbCache(sqliteObjsFile *p, int64_t blobSize,
+                              const char *etag) {
+    if (p->eFileType != SQLITE_OPEN_MAIN_DB) return SQLITE_OK;
+    if (p->cacheFd < 0) return SQLITE_OK;
+
+    if (etag && etag[0] != '\0') {
+        memcpy(p->etag, etag, sizeof(p->etag));
+    }
+
+    if (blobSize <= 0) {
+        if (ftruncate(p->cacheFd, 0) != 0) return SQLITE_IOERR;
+        p->nData = 0;
+        p->snapshot[0] = '\0';
+        bitmapClearAll(&p->dirty);
+        bitmapClearAll(&p->valid);
+        p->lastSyncedSize = 0;
+        return SQLITE_OK;
+    }
+
+    p->metrics.revalidation_downloads++;
+    unsigned char *tempBuf = (unsigned char *)malloc((size_t)blobSize);
+    if (!tempBuf) return SQLITE_NOMEM;
+
+    azure_error_t aerr;
+    azure_error_init(&aerr);
+    azure_err_t arc;
+    if (p->ops->page_blob_read_multi) {
+        arc = p->ops->page_blob_read_multi(
+            p->ops_ctx, p->zBlobName, blobSize, tempBuf, &aerr);
+    } else if (p->ops->page_blob_read) {
+        azure_buffer_t buf = {0};
+        arc = p->ops->page_blob_read(p->ops_ctx, p->zBlobName,
+                                      0, (size_t)blobSize, &buf, &aerr);
+        if (arc == AZURE_OK) {
+            if (!buf.data || buf.size == 0) {
+                arc = AZURE_ERR_INVALID_ARG;
+            } else {
+                int64_t copyLen = (int64_t)buf.size;
+                if (copyLen > blobSize) copyLen = blobSize;
+                memcpy(tempBuf, buf.data, (size_t)copyLen);
+            }
+        }
+        free(buf.data);
+    } else {
+        free(tempBuf);
+        return SQLITE_IOERR;
+    }
+
+    if (arc != AZURE_OK) {
+        p->metrics.azure_errors++;
+        free(tempBuf);
+        return azureErrToSqlite(arc, SQLITE_IOERR_READ);
+    }
+
+    p->metrics.blob_reads++;
+    p->metrics.blob_bytes_read += blobSize;
+
+    if (lseek(p->cacheFd, 0, SEEK_SET) != 0) {
+        free(tempBuf);
+        return SQLITE_IOERR;
+    }
+    if (ftruncate(p->cacheFd, 0) != 0) {
+        free(tempBuf);
+        return SQLITE_IOERR;
+    }
+
+    int64_t totalWritten = 0;
+    while (totalWritten < blobSize) {
+        ssize_t nWritten = write(p->cacheFd, tempBuf + totalWritten,
+                                (size_t)(blobSize - totalWritten));
+        if (nWritten <= 0) {
+            free(tempBuf);
+            return SQLITE_IOERR;
+        }
+        totalWritten += nWritten;
+        p->metrics.disk_writes++;
+        p->metrics.disk_bytes_written += nWritten;
+    }
+
+    if (fsync(p->cacheFd) != 0) {
+        free(tempBuf);
+        return SQLITE_IOERR;
+    }
+
+    free(tempBuf);
+
+    p->nData = blobSize;
+    p->nDownloads++;
+    p->snapshot[0] = '\0';
+
+    unsigned char header[100];
+    ssize_t nRead = pread(p->cacheFd, header, sizeof(header), 0);
+    if (nRead == (ssize_t)sizeof(header)) {
+        int detected = detectPageSize(header, sizeof(header));
+        if (detected > 0) p->pageSize = detected;
+    }
+
+    bitmapsEnsureCapacity(p);
+    bitmapClearAll(&p->dirty);
+    p->lastSyncedSize = p->nData;
+    if (p->valid.data) {
+        bitmapEnsureCapacity(&p->valid, p->nData, p->pageSize);
+        validMarkAll(p);
+    }
+
+    return SQLITE_OK;
+}
+
+/*
+** Re-validate the local cache after taking SHARED.
+**
+** Between xOpen and the first read of a transaction, another client may have
+** modified the blob. If the ETag has changed, refresh before SQLite reads any
+** pages so the pager sees a consistent current snapshot.
+*/
+static int revalidateBeforeRead(sqliteObjsFile *p) {
+    if (p->eFileType != SQLITE_OPEN_MAIN_DB) return SQLITE_OK;
+    if (p->cacheFd < 0) return SQLITE_OK;
+    if (p->etag[0] == '\0') return SQLITE_OK;
+    if (!p->ops || !p->ops->blob_get_properties) return SQLITE_OK;
+
+    p->metrics.revalidations++;
+
+    int64_t blobSize = 0;
+    azure_error_t aerr;
+    azure_error_init(&aerr);
+    azure_err_t arc = p->ops->blob_get_properties(
+        p->ops_ctx, p->zBlobName, &blobSize, NULL, NULL, &aerr);
+    if (arc != AZURE_OK) {
+        p->metrics.azure_errors++;
+        return azureErrToSqlite(arc, SQLITE_IOERR_READ);
+    }
+    if (aerr.etag[0] == '\0' || strcmp(p->etag, aerr.etag) == 0) {
+        return SQLITE_OK;
+    }
+    return refreshMainDbCache(p, blobSize, aerr.etag);
+}
+
+/*
 ** Between xOpen (which downloads the blob without a lease) and xLock
 ** (which acquires the lease for writes), another client may have modified
-** the blob.  If the blob's ETag has changed, re-download the entire blob
-** into the cache file so that subsequent reads see the latest data.
-**
-** This prevents the stale-read race condition where a client reads
-** data that was overwritten by a concurrent writer.
+** the blob. If the blob's ETag has changed after this transaction has read
+** pages, fail with SQLITE_BUSY so SQLite retries from a fresh, internally
+** consistent snapshot instead of mixing pages read before and after the
+** concurrent commit.
 **
 ** Parameters:
 **   p          — the open MAIN_DB file
 **   leaseEtag  — ETag returned by the lease_acquire response (may be empty)
 **
-** Returns SQLITE_OK if cache is valid (or successfully refreshed),
-** or an appropriate error code on failure.
+** Returns SQLITE_OK if the cache is valid, SQLITE_BUSY if the snapshot is
+** stale, or an appropriate error code on failure.
 */
 static int revalidateAfterLease(sqliteObjsFile *p, const char *leaseEtag) {
     /* Only applies to MAIN_DB files with cache and a stored ETag */
@@ -2130,208 +2278,36 @@ static int revalidateAfterLease(sqliteObjsFile *p, const char *leaseEtag) {
         return SQLITE_OK;  /* Cache is still valid */
     }
 
-    /* ETag mismatch — blob has changed since xOpen.  Re-download. */
-    double t0 = 0;
+    if (p->readsSinceSharedLock == 0) {
+        return refreshMainDbCache(p, blobSize, aerr.etag);
+    }
+
+    /* ETag mismatch — blob has changed since the current SHARED snapshot.
+    **
+    ** CRITICAL FIX FOR CONCURRENCY BUG:
+    ** We cannot re-download the blob at this point because SQLite may have
+    ** already read pages at SHARED lock level (before this RESERVED lock).
+    ** Re-downloading would create an inconsistent snapshot where some pages
+    ** come from the OLD blob (read before lock) and some from the NEW blob
+    ** (re-downloaded now), violating snapshot isolation.
+    **
+    ** This causes the duplicate rowid / lost insert bug: Connection B reads
+    ** pages from an old snapshot, then Connection A commits changes, then
+    ** Connection B locks RESERVED and we re-download here. But SQLite's pager
+    ** has already cached old pages (freelist, btree root, etc.), so the rowid
+    ** allocator and btree state are inconsistent with the fresh blob.
+    **
+    ** Instead, fail this transaction with SQLITE_BUSY so SQLite's busy
+    ** handling can retry from a fresh, consistent snapshot.
+    */
     if (sqlite_objs_debug_timing()) {
-        t0 = sqlite_objs_time_ms();
         fprintf(stderr, "[TIMING] revalidateAfterLease: ETag mismatch "
-                "(cached=%.32s, current=%.32s, blob=%s) — re-downloading\n",
+                "(cached=%.32s, current=%.32s, blob=%s) — "
+                "failing transaction with SQLITE_BUSY to preserve snapshot isolation\n",
                 p->etag, aerr.etag, p->zBlobName);
     }
-
-    /* Defensive: if dirty pages exist something is very wrong — SQLite should
-    ** not write without RESERVED, and we just acquired RESERVED now. */
-    if (bitmapHasAny(&p->dirty)) {
-        return SQLITE_IOERR_READ;
-    }
-
-    /* Update stored ETag */
-    memcpy(p->etag, aerr.etag, sizeof(p->etag));
-
-    if (blobSize <= 0) {
-        /* Blob was truncated to empty */
-        if (ftruncate(p->cacheFd, 0) != 0) return SQLITE_IOERR;
-        p->nData = 0;
-        p->snapshot[0] = '\0';
-        bitmapClearAll(&p->dirty);
-        bitmapClearAll(&p->valid);
-        p->lastSyncedSize = 0;
-        return SQLITE_OK;
-    }
-
-    /* ---- Lazy mode: try to mark changed pages invalid instead of downloading ---- */
-    if (p->prefetchMode == SQLITE_OBJS_PREFETCH_NONE
-        && p->snapshot[0] != '\0'
-        && p->ops->blob_get_page_ranges_diff && p->ops->page_blob_read) {
-        azure_diff_range_t *diffRanges = NULL;
-        int diffCount = 0;
-        azure_error_t derr;
-        azure_error_init(&derr);
-        azure_err_t darc = p->ops->blob_get_page_ranges_diff(
-            p->ops_ctx, p->zBlobName, p->snapshot,
-            &diffRanges, &diffCount, &derr);
-        if (darc == AZURE_OK && diffCount >= 0) {
-            /* Calculate how many pages changed */
-            int nTotalPages = (int)((blobSize + p->pageSize - 1) / p->pageSize);
-            int nChangedPages = 0;
-            for (int i = 0; i < diffCount; i++) {
-                int64_t rangeLen = diffRanges[i].end - diffRanges[i].start + 1;
-                nChangedPages += (int)((rangeLen + p->pageSize - 1) / p->pageSize);
-            }
-
-            if (nTotalPages > 0 &&
-                (nChangedPages * 100 / nTotalPages) <= SQLITE_OBJS_DIFF_THRESHOLD_PCT) {
-                /* Small diff — mark changed pages invalid, don't download */
-                /* Resize cache if blob grew */
-                if (blobSize > p->nData) {
-                    ftruncate(p->cacheFd, (off_t)blobSize);
-                }
-                p->nData = blobSize;
-                bitmapEnsureCapacity(&p->valid, p->nData, p->pageSize);
-                for (int i = 0; i < diffCount; i++) {
-                    int64_t rs = diffRanges[i].start;
-                    int64_t re = diffRanges[i].end + 1;
-                    int startPg = (int)(rs / p->pageSize);
-                    int endPg = (int)((re + p->pageSize - 1) / p->pageSize);
-                    for (int pg = startPg; pg < endPg; pg++) {
-                        bitmapClearBit(&p->valid, pg);
-                    }
-                }
-                /* Truncate if blob shrank */
-                if (blobSize < p->nData) {
-                    ftruncate(p->cacheFd, (off_t)blobSize);
-                    p->nData = blobSize;
-                }
-                free(diffRanges);
-                p->snapshot[0] = '\0';
-                bitmapsEnsureCapacity(p);
-                bitmapClearAll(&p->dirty);
-                p->lastSyncedSize = p->nData;
-                p->metrics.revalidation_diffs++;
-                p->metrics.pages_invalidated += nChangedPages;
-                if (sqlite_objs_debug_timing()) {
-                    double elapsed = sqlite_objs_time_ms() - t0;
-                    fprintf(stderr, "[TIMING] revalidateAfterLease(lazy): "
-                            "invalidated %d/%d pages in %.1fms (blob=%s)\n",
-                            nChangedPages, nTotalPages, elapsed, p->zBlobName);
-                }
-                return SQLITE_OK;
-            }
-            /* >50% changed — fall through to full download */
-        }
-        free(diffRanges);
-        p->snapshot[0] = '\0';
-    }
-
-    /* ---- Incremental diff path (prefetch=all): download changed pages ---- */
-    if (p->prefetchMode == SQLITE_OBJS_PREFETCH_ALL) {
-        if (applyIncrementalDiff(p, blobSize, "revalidateAfterLease") == SQLITE_OK) {
-            p->metrics.revalidation_diffs++;
-            /* All pages now valid after full diff apply */
-            if (p->valid.data) {
-                bitmapEnsureCapacity(&p->valid, p->nData, p->pageSize);
-                validMarkAll(p);
-            }
-            return SQLITE_OK;
-        }
-        p->snapshot[0] = '\0';
-    }
-
-    /* ---- Full re-download path (original behavior) ---- */
-    p->metrics.revalidation_downloads++;
-    unsigned char *tempBuf = (unsigned char *)malloc(blobSize);
-    if (!tempBuf) return SQLITE_NOMEM;
-
-    azure_error_init(&aerr);
-    if (p->ops->page_blob_read_multi) {
-        arc = p->ops->page_blob_read_multi(
-            p->ops_ctx, p->zBlobName, blobSize, tempBuf, &aerr);
-    } else if (p->ops->page_blob_read) {
-        azure_buffer_t buf = {0};
-        arc = p->ops->page_blob_read(p->ops_ctx, p->zBlobName,
-                                      0, (size_t)blobSize, &buf, &aerr);
-        if (arc == AZURE_OK) {
-            if (!buf.data || buf.size == 0) {
-                arc = AZURE_ERR_INVALID_ARG;
-            } else {
-                int64_t copyLen = (int64_t)buf.size;
-                if (copyLen > blobSize) copyLen = blobSize;
-                memcpy(tempBuf, buf.data, (size_t)copyLen);
-            }
-        }
-        free(buf.data);
-    } else {
-        free(tempBuf);
-        return SQLITE_IOERR;
-    }
-
-    if (arc != AZURE_OK) {
-        p->metrics.azure_errors++;
-        free(tempBuf);
-        return azureErrToSqlite(arc, SQLITE_IOERR_READ);
-    }
-
-    p->metrics.blob_reads++;
-    p->metrics.blob_bytes_read += blobSize;
-
-    /* Rewrite cache file with fresh data */
-    if (lseek(p->cacheFd, 0, SEEK_SET) != 0) {
-        free(tempBuf);
-        return SQLITE_IOERR;
-    }
-    if (ftruncate(p->cacheFd, 0) != 0) {
-        free(tempBuf);
-        return SQLITE_IOERR;
-    }
-
-    ssize_t totalWritten = 0;
-    while (totalWritten < blobSize) {
-        ssize_t nWritten = write(p->cacheFd, tempBuf + totalWritten,
-                                blobSize - totalWritten);
-        if (nWritten <= 0) {
-            free(tempBuf);
-            return SQLITE_IOERR;
-        }
-        totalWritten += nWritten;
-    }
-
-    if (fsync(p->cacheFd) != 0) {
-        free(tempBuf);
-        return SQLITE_IOERR;
-    }
-
-    free(tempBuf);
-
-    p->nData = blobSize;
-    p->nDownloads++;
-
-    /* Re-detect page size from fresh data */
-    unsigned char header[100];
-    ssize_t nRead = pread(p->cacheFd, header, sizeof(header), 0);
-    if (nRead == (ssize_t)sizeof(header)) {
-        int detected = detectPageSize(header, sizeof(header));
-        if (detected > 0) p->pageSize = detected;
-    }
-
-    /* Reset dirty bitmap and size tracking */
-    bitmapsEnsureCapacity(p);
-    bitmapClearAll(&p->dirty);
-    p->lastSyncedSize = p->nData;
-
-    /* Full download = all pages valid */
-    if (p->valid.data) {
-        bitmapEnsureCapacity(&p->valid, p->nData, p->pageSize);
-        validMarkAll(p);
-    }
-
-    if (sqlite_objs_debug_timing()) {
-        double elapsed = sqlite_objs_time_ms() - t0;
-        fprintf(stderr, "[TIMING] revalidateAfterLease: re-download complete "
-                "%.1fms (%lld bytes, blob=%s)\n",
-                elapsed, (long long)blobSize, p->zBlobName);
-    }
-
-    return SQLITE_OK;
+    p->metrics.revalidation_busy++;
+    return SQLITE_BUSY;
 }
 
 /*
@@ -2346,8 +2322,11 @@ static int sqliteObjsLock(sqlite3_file *pFile, int eLock) {
     /* Already at or above requested level */
     if (p->eLock >= eLock) return SQLITE_OK;
 
-    /* SHARED — no Azure action needed */
+    /* SHARED — refresh stale snapshots before SQLite reads pages. */
     if (eLock == SQLITE_LOCK_SHARED) {
+        p->readsSinceSharedLock = 0;
+        int rv = revalidateBeforeRead(p);
+        if (rv != SQLITE_OK) return rv;
         p->eLock = eLock;
         return SQLITE_OK;
     }
@@ -2393,8 +2372,9 @@ static int sqliteObjsLock(sqlite3_file *pFile, int eLock) {
         p->leaseAcquiredAt = time(NULL);
         p->leaseDuration = duration;
 
-        /* Re-validate: if the blob changed since xOpen, re-download
-        ** before SQLite reads any data under this new lease. */
+        /* Re-validate: if the blob changed after SQLite started reading
+        ** this transaction snapshot, fail cleanly instead of refreshing
+        ** underneath the pager. */
         int rv = revalidateAfterLease(p, aerr.etag);
         if (rv != SQLITE_OK) {
             /* Re-validation failed — release the lease we just acquired
@@ -2512,6 +2492,7 @@ static char *formatMetrics(const sqlite_objs_metrics *m) {
         "revalidations=%lld\n"
         "revalidation_downloads=%lld\n"
         "revalidation_diffs=%lld\n"
+        "revalidation_busy=%lld\n"
         "pages_invalidated=%lld\n"
         "journal_uploads=%lld\n"
         "journal_bytes_uploaded=%lld\n"
@@ -2539,6 +2520,7 @@ static char *formatMetrics(const sqlite_objs_metrics *m) {
         (long long)m->revalidations,
         (long long)m->revalidation_downloads,
         (long long)m->revalidation_diffs,
+        (long long)m->revalidation_busy,
         (long long)m->pages_invalidated,
         (long long)m->journal_uploads,
         (long long)m->journal_bytes_uploaded,

@@ -80,3 +80,59 @@ if (aerr.etag[0] != '\0') {
 
 **Result**: All 41 integration tests now pass. The key insight is that Azure blob leases and If-Match ETags are mutually exclusive strategies for write protection — use one or the other, never both.
 
+
+### Concurrency Bug — Snapshot Isolation Violation (2026-06-27)
+
+**Problem**: Concurrent writers to the same sqlite-objs database experienced lost inserts, duplicate rowids, and silent data loss. Reproduction showed 40 inserts → 17 distinct IDs.
+
+**Root Cause**: The `revalidateAfterLease()` function in `src/sqlite_objs_vfs.c` was re-downloading the entire blob when it detected an ETag mismatch during `xLock(RESERVED)`. This happened AFTER SQLite had already read pages at SHARED lock level, creating a **mixed snapshot** that violated SQLite's snapshot isolation guarantee.
+
+**The Race**:
+1. Connection A opens DB → downloads blob at ETag E1
+2. Connection B opens DB → downloads same blob at ETag E1
+3. Connection B: BEGIN → locks SHARED → reads pages (freelist, btree root, etc.)
+4. Connection A: locks RESERVED → writes → commits → blob now at ETag E2
+5. Connection B: tries to lock RESERVED
+   - `revalidateAfterLease()` sees E1 (cached) vs E2 (blob)
+   - **BUG**: Re-downloads blob at E2, overwrites cache
+   - But SQLite's pager already has E1 pages cached!
+   - Result: freelist/rowid state from E1, but blob data from E2
+   - Outcome: duplicate rowids, corrupted btree, lost inserts
+
+**The Fix**: Changed `revalidateAfterLease()` to **return SQLITE_BUSY immediately** when ETag mismatch is detected, instead of re-downloading. This forces the client to retry the transaction with a fresh connection that downloads a consistent snapshot in xOpen.
+
+**Code Changes**:
+- `src/sqlite_objs_vfs.c`: Modified `revalidateAfterLease()` to fail fast with SQLITE_BUSY
+- Removed ~185 lines of unreachable re-download code (lazy diff, incremental diff, full download)
+- `src/sqlite_objs.h`: Added `revalidation_busy` metric to track stale transaction failures
+
+**Why This Is Correct**: SQLite requires snapshot isolation — all reads within a transaction must see a consistent point-in-time database state. Re-downloading mid-transaction breaks this. Failing with SQLITE_BUSY matches how local SQLite behaves with shared memory locking.
+
+**Expected Behavior**: With `busy_timeout=5000`, concurrent writers will automatically retry. Connection gets SQLITE_BUSY → retries → re-opens with fresh snapshot → succeeds. All inserts persist with unique rowids.
+
+**File References**:
+- `src/sqlite_objs_vfs.c` lines 2098-2165 (`revalidateAfterLease()`)
+- `src/sqlite_objs.h` line 185 (new `revalidation_busy` metric)
+- See `FIX-SUMMARY.md` for full analysis
+
+**Key Principle**: When blob storage state changes between xOpen and xLock(RESERVED), we must fail the transaction cleanly rather than attempting to fix it mid-flight. Snapshot isolation is non-negotiable.
+
+### Correction — Refresh Before Reads, BUSY After Reads (2026-06-27)
+
+The final implementation is more nuanced than fail-fast on every ETag mismatch. `xLock(SHARED)` now HEAD-checks and refreshes the MAIN_DB cache before SQLite reads pages, preserving existing sequential multi-client behavior. `revalidateAfterLease()` only returns SQLITE_BUSY when the blob changed after pages were read under the current SHARED lock; otherwise it can safely refresh before any pager-visible reads occur. This final design passes all 295 unit tests and all 42 Azurite integration tests.
+
+### Concurrent Writer Snapshot Isolation Fix (2026-06-27)
+
+**Problem:** Concurrent writers losing inserts due to mixed snapshot (stale pages in pager cache, fresh pages in VFS cache). Data corruption from stale cache overwriting committed changes.
+
+**Solution implemented:** VFS-level snapshot isolation enforcement via stale-cache detection.
+
+**Changes to `src/sqlite_objs_vfs.c`:**
+- `xLock(SHARED)` calls `revalidateBeforeRead()` to HEAD-check blob and refresh cache before SQLite reads pages
+- `sqliteObjsRead()` tracks MAIN_DB reads after current SHARED lock
+- `revalidateAfterLease()` returns `SQLITE_BUSY` if ETag mismatch detected after pages already read
+- Added `revalidation_busy` metric to track retries
+
+**Key insight:** SQLite's transaction model requires snapshot isolation. Must refresh stale snapshots before reads, but fail fast (SQLITE_BUSY) if staleness detected after reads — cannot re-download mid-transaction.
+
+**Result:** 42/42 integration tests pass, concurrent-writer regression test serializes all 4 writers with all 40 inserts persisted, no data loss.

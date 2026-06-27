@@ -95,3 +95,9 @@ Co-designed 54 Rust integration tests. 6 categories: lifecycle, transactions, ca
 - Feature flag required for rusqlite: `--features bin-deps` when building binaries
 - Unsafe FFI required for file_control() (no public rusqlite method)
 - Metrics parser is forward-compatible (unknown keys ignored)
+
+**Version Bump to 0.1.6-alpha.1 (2026-06-27):**
+- Updated workspace version from 0.1.5-alpha to 0.1.6-alpha.1 in rust/Cargo.toml
+- Updated sqlite-objs-sys dependency version reference in workspace.dependencies to match
+- Ran `cargo update --workspace` to regenerate Cargo.lock with new versions
+- Both sqlite-objs and sqlite-objs-sys now at 0.1.6-alpha.1

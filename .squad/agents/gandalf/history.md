@@ -80,3 +80,25 @@ Aragorn completed implementation of lazy cache filling feature per architecture 
 - Test infrastructure extended to validate bitmap consistency and .state file recovery.
 
 **Deliverables validated:** 264 tests pass (247 unit + 17 integration). Zero regressions vs baseline.
+
+### Concurrent-Writer Data Loss Diagnosis (2026-06-27)
+
+- **Bug:** 4 concurrent same-process writers lose inserts (17/40 persisted). Silent data loss — no errors returned.
+- **Root cause identified:** `revalidateAfterLease()` has a timing gap. When Azurite's lease-acquire response omits ETag, the HEAD-based fallback can race with the previous writer's just-completed page writes. Connection proceeds with stale cache, overwrites prior writer's pages on xSync.
+- **Secondary factor:** Same-process connections don't share ETag state. Each has independent `p->etag` — no way to detect that a sibling connection just modified the blob.
+- **Correctness contract confirmed:** Lease model (D3) intends full serialization. Concurrent writers must either serialize correctly or fail with SQLITE_BUSY. Silent data loss is never acceptable.
+- **Fix guidance delivered:** (1) Force HEAD on every revalidation (remove leaseEtag fast-path for Azurite), (2) Add shared per-blob ETag in pVfsData for same-process detection, (3) Verify write responses return updated ETags, (4) Regression test: 4-thread concurrent insert scenario.
+- **Decision written:** `.squad/decisions/inbox/gandalf-concurrency-contract.md`
+- **Key file paths:** `src/sqlite_objs_vfs.c:2098-2230` (revalidateAfterLease), `src/sqlite_objs_vfs.c:1921-1968` (xSync batch write + ETag capture), `src/sqlite_objs_vfs.c:2343-2416` (xLock with lease acquire).
+
+### Concurrent Writer Data Loss — Root Cause Diagnosis (2026-06-27)
+
+**Investigation completed:** External user reported concurrent rusqlite connections losing inserts (40 expected, 17 persisted, duplicates seen).
+
+**Root cause identified:** Per-connection in-memory cache without cross-connection invalidation. Race condition between lease acquisition and ETag revalidation when Azurite's lease-acquire response lacks ETag header. Allows connection B to proceed with stale cache after connection A commits, overwriting A's changes.
+
+**Fix trajectory:** Aragorn implemented VFS-side fix (fail-fast on stale snapshots with SQLITE_BUSY), Frodo confirmed Azure lease/If-Match behavior, Samwise added regression test. Final design: lease + SHARED-lock revalidation + SQLITE_BUSY on post-read staleness preserves snapshot isolation.
+
+**Decisions captured:** D-CW-001 (Fail-Fast), D-CW-002 (Concurrent Write Safety Contract), D-CW-003 (Regression Test)
+
+**Result:** 42/42 integration tests passing, 4 pthreads × 10 inserts → 40 distinct IDs persisted, no data loss.

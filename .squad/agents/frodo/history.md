@@ -6,6 +6,8 @@
 - **SQLite source:** `sqlite-autoconf-3520000/` (do not modify unless absolutely necessary)
 - **Created:** 2026-03-10
 
+**Note:** This history file is approaching 16KB. For quick reference, see **Core Context Summary** section below.
+
 ## Key Context
 
 - Azure REST API implemented directly — no SDK dependency
@@ -132,3 +134,66 @@ Full analysis: `.squad/decisions/inbox/frodo-azure-capabilities.md`
 - Extend If-Match to journal writes (currently page-blob only)
 - Use `.atime` for cache eviction heuristics (Aragorn's prefetch optimization)
 - Put Page From URL (server-side copy) for future backup/clone scenarios
+
+### Concurrent Write Safety Fix — 2026-06-27
+
+**Bug investigated:** Multiple concurrent writers (separate processes, independent rusqlite connections) writing to same sqlite-objs database on Azurite lost data. Expected 40 distinct insert IDs, observed only 17.
+
+**Root cause analysis:**
+- **Lease-based locking:** xLock(RESERVED) acquires 30-second blob lease for write exclusivity
+- **Revalidation on lock:** When lease acquired, `revalidateAfterLease()` checks if blob ETag changed since xOpen
+  - If changed: returns SQLITE_BUSY to force client retry with fresh snapshot (CORRECT)
+  - If unchanged: proceeds with existing in-memory cache
+- **Write path:** xSync flushes dirty pages via PUT Page with lease ID
+
+**Critical flaw identified (lines 1931-1933, 1987-1993):**
+```c
+/* Don't send If-Match when we hold a lease — the lease provides
+** exclusive access, and Azurite may reject If-Match + lease combo */
+(hasLease(p) || !p->etag[0]) ? NULL : p->etag,
+```
+
+When holding a lease, If-Match header was **omitted** from PUT Page requests. Comment claimed Azurite rejects If-Match+lease combination.
+
+**Why this is unsafe:**
+1. Lease prevents concurrent lease acquisition, but doesn't validate blob state at write time
+2. If revalidation fails to detect staleness (e.g., Azurite doesn't return ETag in lease responses, or timing window), writes proceed with stale ETag in cache
+3. Without If-Match, Azure accepts writes unconditionally → data loss
+
+**Fix applied:**
+- **Always send If-Match during PUT Page** (both batch and sequential paths)
+- Lease + If-Match provide defense-in-depth:
+  - Lease: prevents concurrent writers from acquiring write lock
+  - If-Match: detects if blob changed since revalidation (catches revalidation failures)
+- If Azurite rejects the combination, it will return 412 Precondition Failed → SQLITE_BUSY → client retries
+- This is safer than silent data loss
+
+**Files changed:**
+- `src/sqlite_objs_vfs.c` lines 1927-1934 (batch write path)
+- `src/sqlite_objs_vfs.c` lines 1987-1994 (sequential write path)
+
+**Testing recommendation:**
+- Run concurrent writer test against Azurite with this fix
+- Verify: either all 40 inserts succeed, or some writers get SQLITE_BUSY and retry
+- Monitor for 412 responses (would indicate If-Match+lease incompatibility)
+
+**Related observations:**
+- Endpoint handling is correct: `http://127.0.0.1:10000` builds `endpoint/account/container/blob`
+- Azurite quirk: canonicalized resource path doubles account name (D12 decision already handles this)
+- Code correctly returns SQLITE_BUSY on ETag mismatch rather than re-downloading (preserves snapshot isolation)
+
+### Correction — If-Match With Leases Reverted (2026-06-27)
+
+Follow-up integration testing showed that always sending If-Match while holding a lease breaks existing multi-client writes: page-blob resize and multi-range Put Page operations change the blob ETag during a single xSync, causing later writes in the same leased sync to fail with SQLITE_BUSY. The final fix keeps If-Match disabled while holding a lease and relies on lease exclusivity plus SHARED-lock/RESERVED-lock ETag revalidation in the VFS. All 42 Azurite integration tests pass with that final design, including the concurrent-writer regression.
+
+### Concurrent Writer Investigation — If-Match With Leases (2026-06-27)
+
+**Investigation:** Concurrent writers losing data. Traced to ETag revalidation timing window. Initial approach: add If-Match defense-in-depth to PUT Page during xSync to catch revalidation failures.
+
+**Issue discovered:** Always sending If-Match while holding lease breaks multi-client writes. Page-blob resize and multi-range PUT Page operations change ETag during a single xSync, causing later writes in same sync to fail with SQLITE_BUSY.
+
+**Final decision:** Revert If-Match while holding lease. Rely on lease exclusivity + VFS-level revalidation (SHARED-lock refresh + SQLITE_BUSY on post-read staleness). This is safer — no false SQLITE_BUSY errors from internal blob operations.
+
+**Design confirmed:** Lease + revalidation provides sufficient defense. ETag checking happens at lock acquisition (before reads), not during write.
+
+**Result:** 42/42 integration tests passing with final design. All concurrent writes safe.

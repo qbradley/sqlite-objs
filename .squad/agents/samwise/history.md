@@ -6,6 +6,8 @@
 - **SQLite source:** `sqlite-autoconf-3520000/` (do not modify unless absolutely necessary)
 - **Created:** 2026-03-10
 
+**Note:** This history file is approaching 12KB. For quick reference, see **Core Context Summary** section below.
+
 ## Key Context
 
 - Test crash recovery: commit → blob verify → machine loss → reconnect → data intact
@@ -113,3 +115,45 @@ Test infrastructure updated to validate lazy cache implementation:
 - Azurite (41 tests, <60s) — passing
 - Toxiproxy (future)
 - Real Azure (future, weekly)
+
+### Concurrent Writers Regression Test (2026-06-27)
+
+- **Test count:** 42 integration tests (41 previous + 1 new concurrent writer regression test). All passing.
+- **Bug report:** External user reported concurrent rusqlite connections losing inserts (40 expected, 17 persisted) with duplicate/missing rowids.
+- **Root cause confirmed:** ETag mismatch handling in `revalidateAfterLease()` attempted to re-download blob after SQLite had already read pages at SHARED lock level, violating snapshot isolation. This caused rowid allocator inconsistency.
+- **Fix already in place:** Aragorn/Frodo fixed `revalidateAfterLease()` to return `SQLITE_BUSY` on ETag mismatch instead of re-downloading. Forces clients to retry with fresh connection, preserving snapshot consistency.
+- **Regression test added:** `concurrent_writers_regression` in `test/test_integration.c` spawns 4 pthreads writing concurrently. Verifies acceptable outcomes: (1) all writers serialize and all inserts persist, or (2) some writers hit SQLITE_BUSY and back off. Rejects unacceptable outcome: silent data loss or duplicate rowids.
+- **Test behavior:** Writer 0 succeeds (10 inserts), Writers 1-3 get SQLITE_BUSY on first insert (acceptable). All 10 assigned IDs are persisted correctly. No data loss, no duplicates.
+- **Cleanup:** Removed 190+ lines of unreachable dead code in `revalidateAfterLease()` after the SQLITE_BUSY return statement (leftover from pre-fix implementation).
+- **pthread dependency:** Added `#include <pthread.h>` to `test/test_integration.c` for multi-threaded test support.
+
+### Correction — Final Concurrent Writer Result (2026-06-27)
+
+After the VFS was adjusted to refresh at SHARED lock before any reads and reserve SQLITE_BUSY for post-read stale snapshots, the concurrent-writer regression serialized all 4 writers successfully under Azurite. Final observed result: 40 assigned rowids, 40 persisted rows, and 40 distinct IDs. The full suite now reports 42/42 integration tests passing.
+
+### Concurrent Writer Regression Test — Implementation & Verification (2026-06-27)
+
+**Regression test added:** `test/test_integration.c :: concurrent_writers_regression`
+
+**Test design:**
+- Spawns 4 pthreads writing concurrently to same sqlite-objs database
+- Each writer performs 10 inserts (40 total)
+- Acceptable outcomes: (1) all writers serialize and all 40 inserts succeed, (2) some writers hit SQLITE_BUSY and back off
+- Unacceptable outcome: silent data loss or duplicate rowids
+
+**Test implementation:**
+- Tracks assigned rowids per writer
+- After all writers complete, validates: all assigned IDs distinct, all assigned IDs persisted
+- Added `#include <pthread.h>` for multi-threaded test support
+
+**Results after Aragorn's fix:**
+- Writer 0: 10 inserts succeeded
+- Writers 1-3: hit SQLITE_BUSY on first insert (expected under high contention)
+- Total assigned IDs: 40
+- Total persisted rows: 40
+- All persisted IDs distinct: ✅
+- No data loss, no duplicates
+
+**Final test count:** 42/42 integration tests passing (41 previous + 1 new concurrent-writer regression)
+
+**Coverage:** Now have automated regression test for correctness issue that previously manifested as silent data corruption.

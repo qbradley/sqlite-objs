@@ -3843,6 +3843,7 @@ TEST(metrics_all_fields_present) {
     ASSERT_TRUE(strstr(stats, "revalidations=") != NULL);
     ASSERT_TRUE(strstr(stats, "revalidation_downloads=") != NULL);
     ASSERT_TRUE(strstr(stats, "revalidation_diffs=") != NULL);
+    ASSERT_TRUE(strstr(stats, "revalidation_busy=") != NULL);
     ASSERT_TRUE(strstr(stats, "pages_invalidated=") != NULL);
     ASSERT_TRUE(strstr(stats, "journal_uploads=") != NULL);
     ASSERT_TRUE(strstr(stats, "journal_bytes_uploaded=") != NULL);

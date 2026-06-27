@@ -25,6 +25,7 @@
 #include <string.h>
 #include <stdlib.h>
 #include <unistd.h>
+#include <pthread.h>
 
 /* ================================================================
  * Azurite configuration (well-known dev credentials)
@@ -3228,6 +3229,222 @@ TEST(mc_rapid_open_close) {
 }
 
 /* ================================================================
+ * G. Concurrent Writers Regression Test
+ * Tests for bug: concurrent writers lose inserts / duplicate rowids
+ * ================================================================ */
+
+/* Thread context for concurrent writes */
+typedef struct {
+    const char *db_name;
+    int writer_id;
+    int inserts_per_writer;
+    int *assigned_ids;
+    int success;
+    int result_code;
+} writer_context_t;
+
+/* Thread function: each writer opens connection, inserts N rows */
+static void *concurrent_writer_thread(void *arg) {
+    writer_context_t *ctx = (writer_context_t *)arg;
+    ctx->success = 0;
+    ctx->result_code = SQLITE_OK;
+
+    /* Open independent connection */
+    sqlite3 *db = open_azurite_db(ctx->db_name, NULL, 0);
+    if (!db) {
+        fprintf(stderr, "  writer %d: failed to open database\n", ctx->writer_id);
+        ctx->result_code = SQLITE_CANTOPEN;
+        return NULL;
+    }
+
+    /* Insert rows for this writer */
+    sqlite3_stmt *ins = NULL;
+    int rc = sqlite3_prepare_v2(db, 
+        "INSERT INTO messages(writer, seq) VALUES (?, ?);", -1, &ins, NULL);
+    if (rc != SQLITE_OK) {
+        fprintf(stderr, "  writer %d: prepare failed: %s\n", 
+                ctx->writer_id, sqlite3_errmsg(db));
+        ctx->result_code = rc;
+        sqlite3_close(db);
+        return NULL;
+    }
+
+    int ids_written = 0;
+    for (int seq = 0; seq < ctx->inserts_per_writer; seq++) {
+        sqlite3_bind_int(ins, 1, ctx->writer_id);
+        sqlite3_bind_int(ins, 2, seq);
+        
+        rc = sqlite3_step(ins);
+        if (rc == SQLITE_DONE) {
+            ctx->assigned_ids[seq] = (int)sqlite3_last_insert_rowid(db);
+            ids_written++;
+            sqlite3_reset(ins);
+        } else if (rc == SQLITE_BUSY || rc == SQLITE_LOCKED) {
+            /* Acceptable: lease conflict, retry budget exhausted */
+            fprintf(stderr, "  writer %d seq %d: %s (acceptable)\n",
+                    ctx->writer_id, seq, 
+                    rc == SQLITE_BUSY ? "SQLITE_BUSY" : "SQLITE_LOCKED");
+            ctx->result_code = rc;
+            sqlite3_reset(ins);
+            break;
+        } else {
+            fprintf(stderr, "  writer %d seq %d: unexpected error %d: %s\n",
+                    ctx->writer_id, seq, rc, sqlite3_errmsg(db));
+            ctx->result_code = rc;
+            sqlite3_reset(ins);
+            break;
+        }
+    }
+
+    sqlite3_finalize(ins);
+    sqlite3_close(db);
+    
+    ctx->success = ids_written;
+    return NULL;
+}
+
+/*
+ * Test G1: Concurrent writers must serialize or fail clearly
+ *
+ * REGRESSION TEST for bug: "concurrent writers lose inserts / duplicate rowids"
+ *
+ * Expected outcomes (both acceptable):
+ *   1. All writers serialize — all N inserts persist with distinct IDs
+ *   2. Some writers hit SQLITE_BUSY/SQLITE_LOCKED and back off
+ *
+ * UNACCEPTABLE outcome (the bug):
+ *   - Some inserts silently lost (fewer persisted rows than committed)
+ *   - Duplicate rowids (concurrent autoincrement collision)
+ *
+ * This test spawns multiple threads writing concurrently to the same database.
+ * After all threads complete, it verifies:
+ *   - Every assigned rowid is persisted in the database
+ *   - All persisted rowids are distinct (no duplicates)
+ */
+TEST(concurrent_writers_regression) {
+    const char *db_name = "concurrent-writers-bug.db";
+    cleanup_test_blobs(db_name);
+
+    int rc = sqlite_objs_vfs_register_uri(0);
+    ASSERT_OK(rc);
+
+    /* Create schema */
+    sqlite3 *init = open_azurite_db(db_name, NULL, 1);
+    ASSERT_NOT_NULL(init);
+
+    rc = exec_sql(init,
+        "CREATE TABLE messages ("
+        "  id INTEGER PRIMARY KEY AUTOINCREMENT,"
+        "  writer INTEGER NOT NULL,"
+        "  seq INTEGER NOT NULL"
+        ");");
+    ASSERT_OK(rc);
+    sqlite3_close(init);
+
+    /* Spawn concurrent writers */
+    const int num_writers = 4;
+    const int inserts_per_writer = 10;
+    pthread_t threads[num_writers];
+    writer_context_t contexts[num_writers];
+    int assigned_ids[num_writers][inserts_per_writer];
+
+    for (int i = 0; i < num_writers; i++) {
+        memset(assigned_ids[i], 0, sizeof(assigned_ids[i]));
+        contexts[i].db_name = db_name;
+        contexts[i].writer_id = i;
+        contexts[i].inserts_per_writer = inserts_per_writer;
+        contexts[i].assigned_ids = assigned_ids[i];
+        contexts[i].success = 0;
+        contexts[i].result_code = SQLITE_OK;
+
+        rc = pthread_create(&threads[i], NULL, concurrent_writer_thread, &contexts[i]);
+        if (rc != 0) {
+            fprintf(stderr, "  pthread_create failed for writer %d: %d\n", i, rc);
+            ASSERT_EQ(rc, 0);
+        }
+    }
+
+    /* Wait for all writers to complete */
+    for (int i = 0; i < num_writers; i++) {
+        pthread_join(threads[i], NULL);
+    }
+
+    /* Collect all assigned IDs (only from successful inserts) */
+    int total_assigned = 0;
+    int assigned_list[num_writers * inserts_per_writer];
+    
+    for (int i = 0; i < num_writers; i++) {
+        fprintf(stdout, "  writer %d: %d inserts succeeded\n", 
+                i, contexts[i].success);
+        ASSERT_TRUE(contexts[i].result_code == SQLITE_OK ||
+                    contexts[i].result_code == SQLITE_BUSY ||
+                    contexts[i].result_code == SQLITE_LOCKED);
+        for (int j = 0; j < contexts[i].success; j++) {
+            assigned_list[total_assigned++] = assigned_ids[i][j];
+        }
+    }
+    ASSERT_GT(total_assigned, 0);
+
+    /* Verify: every assigned ID must be persisted */
+    sqlite3 *check = open_azurite_db(db_name, NULL, 0);
+    ASSERT_NOT_NULL(check);
+
+    int persisted_count = 0;
+    rc = query_int(check, "SELECT COUNT(*) FROM messages;", &persisted_count);
+    ASSERT_OK(rc);
+
+    fprintf(stdout, "  total assigned IDs: %d\n", total_assigned);
+    fprintf(stdout, "  total persisted rows: %d\n", persisted_count);
+
+    /* CRITICAL: persisted count must equal assigned count */
+    if (persisted_count != total_assigned) {
+        fprintf(stderr, 
+            "  REGRESSION BUG DETECTED: %d IDs assigned but only %d persisted\n",
+            total_assigned, persisted_count);
+        fprintf(stderr, 
+            "  This indicates concurrent writers lost committed inserts!\n");
+    }
+    ASSERT_EQ(persisted_count, total_assigned);
+
+    /* Verify: all assigned IDs are present in database */
+    sqlite3_stmt *stmt = NULL;
+    rc = sqlite3_prepare_v2(check, 
+        "SELECT COUNT(*) FROM messages WHERE id = ?;", -1, &stmt, NULL);
+    ASSERT_OK(rc);
+
+    for (int i = 0; i < total_assigned; i++) {
+        sqlite3_bind_int(stmt, 1, assigned_list[i]);
+        rc = sqlite3_step(stmt);
+        ASSERT_EQ(rc, SQLITE_ROW);
+        
+        int found = sqlite3_column_int(stmt, 0);
+        if (found != 1) {
+            fprintf(stderr, "  assigned ID %d not found in database!\n", 
+                    assigned_list[i]);
+        }
+        ASSERT_EQ(found, 1);
+        sqlite3_reset(stmt);
+    }
+    sqlite3_finalize(stmt);
+
+    /* Verify: all persisted IDs are distinct (no duplicates) */
+    int distinct_count = 0;
+    rc = query_int(check, "SELECT COUNT(DISTINCT id) FROM messages;", &distinct_count);
+    ASSERT_OK(rc);
+
+    if (distinct_count != persisted_count) {
+        fprintf(stderr, 
+            "  REGRESSION BUG DETECTED: %d rows but only %d distinct IDs\n",
+            persisted_count, distinct_count);
+        fprintf(stderr, "  This indicates duplicate rowids from concurrent writers!\n");
+    }
+    ASSERT_EQ(distinct_count, persisted_count);
+
+    sqlite3_close(check);
+    cleanup_test_blobs(db_name);
+}
+
+/* ================================================================
  * Main runner
  * ================================================================ */
 
@@ -3320,6 +3537,11 @@ int main(void) {
     RUN_TEST(mc_wide_rows);
     RUN_TEST(mc_many_small_tables);
     RUN_TEST(mc_rapid_open_close);
+    TEST_SUITE_END();
+
+    /* Concurrent writers regression test */
+    TEST_SUITE_BEGIN("Concurrency: Regression Tests");
+    RUN_TEST(concurrent_writers_regression);
     TEST_SUITE_END();
 
     /* Cleanup */

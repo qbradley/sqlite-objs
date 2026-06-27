@@ -182,6 +182,7 @@ typedef struct sqlite_objs_metrics {
     sqlite3_int64 revalidations;
     sqlite3_int64 revalidation_downloads;
     sqlite3_int64 revalidation_diffs;
+    sqlite3_int64 revalidation_busy;      /* Transactions failed due to stale snapshot */
     sqlite3_int64 pages_invalidated;
 
     /* Journal & WAL uploads */
