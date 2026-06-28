@@ -35,6 +35,10 @@ jobs:
         run: npm install -g azurite
 
       - name: Run full release gate
+        env:
+          AZURE_STORAGE_ACCOUNT: ${{ secrets.AZURE_STORAGE_ACCOUNT }}
+          AZURE_STORAGE_CONTAINER: ${{ secrets.AZURE_STORAGE_CONTAINER }}
+          AZURE_STORAGE_SAS: ${{ secrets.AZURE_STORAGE_SAS }}
         run: |
           ./scripts/release-gate.sh --full
           if grep -q "Skipped: 0" build/release-gate-report.txt; then

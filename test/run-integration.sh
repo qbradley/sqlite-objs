@@ -14,7 +14,7 @@
 # Environment variables (optional):
 #   AZURITE_PORT      — Port for blob service (default: 10000)
 #   AZURITE_SILENT    — Set to 1 to suppress Azurite output
-#   AZURITE_LOOSE     — Set to 0 for strict Azurite validation (default: 1)
+#   AZURITE_LOOSE     — Set to 1 for loose compatibility mode (default: 0)
 #
 # Part of the sqlite-objs project. License: MIT
 
@@ -26,7 +26,7 @@ set -e
 
 AZURITE_PORT="${AZURITE_PORT:-10000}"
 AZURITE_SILENT="${AZURITE_SILENT:-0}"
-AZURITE_LOOSE="${AZURITE_LOOSE:-1}"
+AZURITE_LOOSE="${AZURITE_LOOSE:-0}"
 CONTAINER_NAME="sqlite-objs-test"
 ACCOUNT_NAME="devstoreaccount1"
 AZURITE_ENDPOINT="http://127.0.0.1:${AZURITE_PORT}"

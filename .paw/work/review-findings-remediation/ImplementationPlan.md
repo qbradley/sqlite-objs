@@ -173,7 +173,7 @@ For each targeted invariant test added in Phases 1-3, record evidence that it fa
 ### Phase 4 Notes:
 
 - Property tests now fail on unexpected `SQLITE_ERROR` for generated data operations instead of treating it as acceptable.
-- Azurite integration startup now prints whether loose/API-version compatibility mode is enabled and supports `AZURITE_LOOSE=0` for strict mode.
+- Azurite integration startup now defaults to strict mode, prints the selected fidelity mode, and supports opt-in `AZURITE_LOOSE=1` compatibility mode.
 - Release gate output distinguishes fast/local pass-with-skips from full release readiness and exempts sanitizer execution from the `timeout` wrapper that conflicts with ASan signal handling.
 - Preview/release/docs workflows now run repository-appropriate validation instead of placeholder echo commands; promotion now reads the Rust workspace version instead of nonexistent Node package metadata.
 - Verification: `make test-integration` passed 57 tests; `./scripts/release-gate.sh` passed with explicit skipped-gate reporting; workflow YAML parsed with Python/PyYAML and shell scripts passed `bash -n`.
