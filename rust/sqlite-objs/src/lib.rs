@@ -440,7 +440,7 @@ impl UriBuilder {
     pub fn build(self) -> String {
         let mut uri = format!(
             "file:{}?azure_account={}&azure_container={}",
-            self.database,
+            percent_encode(&self.database),
             percent_encode(&self.account),
             percent_encode(&self.container)
         );
@@ -610,6 +610,16 @@ mod tests {
         let cache_pos = uri.find("cache_dir=").unwrap();
         let sas_pos = uri.find("azure_sas=").unwrap();
         assert!(cache_pos > sas_pos);
+    }
+
+    #[test]
+    fn test_uri_builder_encodes_database_name() {
+        let uri = UriBuilder::new("my database?.db", "account", "container")
+            .sas_token("token")
+            .build();
+
+        assert!(uri.starts_with("file:my%20database%3F.db?"));
+        assert!(!uri.starts_with("file:my database?.db?"));
     }
 
     #[test]

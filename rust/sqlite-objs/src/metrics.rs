@@ -178,6 +178,10 @@ impl VfsMetrics {
                 }
             };
 
+            // Trim whitespace from key and value after splitting
+            let key = key.trim();
+            let value = value.trim();
+
             let v: i64 = value.parse().map_err(|_| ParseError {
                 message: format!("invalid integer for key '{key}': {value}"),
             })?;
