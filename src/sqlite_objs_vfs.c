@@ -1262,6 +1262,13 @@ static int leaseRenewIfNeeded(sqliteObjsFile *p) {
 ** are NULL. For journal/WAL filenames we can recover the per-file ops from
 ** the main database file via sqlite3_database_file_object().
 */
+static int sqliteObjsIsRecoveryArtifactName(const char *zName) {
+    if (!zName) return 0;
+    size_t n = strlen(zName);
+    return (n >= 8 && strcmp(zName + n - 8, "-journal") == 0)
+        || (n >= 4 && strcmp(zName + n - 4, "-wal") == 0);
+}
+
 static int resolveOps(sqliteObjsVfsData *pVfsData, const char *zName,
                       const azure_ops_t **ppOps, void **ppCtx) {
     if (pVfsData->ops) {
@@ -1273,10 +1280,7 @@ static int resolveOps(sqliteObjsVfsData *pVfsData, const char *zName,
     ** sqlite3_database_file_object() is only valid for journal/WAL filenames
     ** (those that end with "-journal" or "-wal"). */
     if (zName) {
-        size_t n = strlen(zName);
-        int isJournalOrWal = (n >= 8 && strcmp(zName + n - 8, "-journal") == 0)
-                          || (n >= 4 && strcmp(zName + n - 4, "-wal") == 0);
-        if (isJournalOrWal) {
+        if (sqliteObjsIsRecoveryArtifactName(zName)) {
             sqlite3_file *pDbFile = sqlite3_database_file_object(zName);
             if (pDbFile) {
                 sqliteObjsFile *pMain = (sqliteObjsFile *)pDbFile;
@@ -3644,6 +3648,7 @@ static int sqliteObjsAccess(sqlite3_vfs *pVfs, const char *zName,
     const azure_ops_t *ops;
     void *ops_ctx;
     if (resolveOps(pVfsData, zName, &ops, &ops_ctx) && ops->blob_exists) {
+        int isRecoveryArtifact = sqliteObjsIsRecoveryArtifactName(zName);
         /* R1: Update journal existence cache, but never let cached absence
         ** suppress a remote check needed for hot-journal discovery. */
         pthread_mutex_lock(&pVfsData->journalCacheMutex);
@@ -3656,7 +3661,7 @@ static int sqliteObjsAccess(sqlite3_vfs *pVfs, const char *zName,
         azure_err_t arc = ops->blob_exists(ops_ctx, zName, &exists, &aerr);
         if (arc != AZURE_OK) {
             *pResOut = 0;
-            if (jce) {
+            if (isRecoveryArtifact) {
                 return azureErrToSqlite(arc, SQLITE_IOERR_ACCESS);
             }
             return SQLITE_OK;  /* Non-journal access checks stay best-effort. */

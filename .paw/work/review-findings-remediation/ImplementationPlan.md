@@ -67,7 +67,8 @@ For each targeted invariant test added in Phases 1-3, record evidence that it fa
 
 ### Phase 1 Notes:
 
-- Added mock/VFS coverage that first caches `test.db-journal` as absent, then creates remote journal state and verifies `xAccess` performs an authoritative `blob_exists` check.
+- Added mock/VFS coverage that first caches `test.db-journal` as absent, then creates remote journal state and verifies both direct `xAccess` and SQLite reopen paths perform authoritative `blob_exists` checks.
+- Added recovery-artifact fail-closed coverage for `blob_exists` failures when no journal cache entry exists.
 - Added `TRUNCATE` journal cleanup coverage proving remote journal deletion and delete-failure propagation.
 - Added WAL checkpoint/truncate delete-failure coverage.
 - Fail-first/equivalent evidence: the new stale-cached-absence test directly exercises the previously unsafe cache path; the new journal/WAL cleanup failure tests target code paths that previously ignored or skipped remote cleanup errors.
