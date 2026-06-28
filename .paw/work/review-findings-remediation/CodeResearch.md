@@ -36,7 +36,7 @@ Research all implementation surfaces needed to address the 2026-06-28 invariant 
 
 ## Verification Commands
 
-- **Test Command**: `make test-unit`, `make test-integration`, `make test`, `make test-stress`, `make test-stress-heavy`, `make test-integration-extended`, `make test-tcl`, `make test-tcl-quick`, and `cd rust && cargo test` are documented validation commands (`Makefile:197-213`, `Makefile:218-238`, `Makefile:242-254`, `README.md:56-85`, `TEST_DOCS_INDEX.md:72-98`).
+- **Test Command**: `make test-unit`, `make test-integration`, `make test`, `make test-stress`, `make test-stress-heavy`, `make test-integration-extended`, `make test-tcl`, `make test-tcl-quick`, `make sanitize`, and `cd rust && cargo test` are documented or Makefile-defined validation commands (`Makefile:197-213`, `Makefile:218-238`, `Makefile:242-254`, `Makefile:271-277`, `README.md:56-85`, `TEST_DOCS_INDEX.md:72-98`).
 - **Lint Command**: Rust docs list `cargo fmt` and `cargo clippy`; no C lint target was found in the Makefile target list (`rust/DEVELOPMENT.md:113-130`, `Makefile:299-314`).
 - **Build Command**: `make all` builds the C library/shell/benchmarks/TPC-C targets; `cd rust && cargo build` builds the Rust workspace (`Makefile:103-108`, `README.md:36-48`, `rust/README.md:12-22`).
 - **Type Check**: No dedicated type-check target was found. Rust development docs list `cargo build --release`; `cargo check` is not documented as a primary command (`rust/DEVELOPMENT.md:113-119`).
@@ -109,7 +109,7 @@ Research all implementation surfaces needed to address the 2026-06-28 invariant 
 - Workspace MSRV is declared as Rust `1.70`, and crate manifests inherit `rust-version.workspace`; Rust README also documents Rust 1.70 or later (`rust/Cargo.toml:5-11`, `rust/sqlite-objs/Cargo.toml:1-10`, `rust/README.md:12-22`).
 - `pragmas` is gated behind the `rusqlite` feature; Cargo features expose `rusqlite` and `bin-deps`, and crate docs/README describe enabling `features = ["rusqlite"]` for helper APIs (`rust/sqlite-objs/src/lib.rs:88-91`, `rust/sqlite-objs/Cargo.toml:24-30`, `rust/sqlite-objs/README.md:95-115`).
 - The Rust pragma helpers use raw-reference syntax for file-control arguments in `get_stats` and `get_download_count` (`rust/sqlite-objs/src/pragmas.rs:57-75`, `rust/sqlite-objs/src/pragmas.rs:118-144`).
-- C defines download-count file-control opcode 200, and `xFileControl` returns `p->nDownloads` for that opcode (`src/sqlite_objs.h:120-125`, `src/sqlite_objs_vfs.c:2723-2727`).
+- C defines download-count file-control opcode 200, and `xFileControl` writes `p->nDownloads` through the caller-provided `int *pArg` before returning `SQLITE_OK` for that opcode (`src/sqlite_objs.h:120-125`, `src/sqlite_objs_vfs.c:2723-2727`).
 - The Rust library helper `pragmas::get_download_count` checks the `sqlite3_file_control` return code and returns `SqliteObjsError::Sqlite` on failure, while the ignored integration-test helper in `vfs_integration.rs` calls `sqlite3_file_control` and returns the default/local count without checking the return code (`rust/sqlite-objs/src/pragmas.rs:118-144`, `rust/sqlite-objs/tests/vfs_integration.rs:95-114`).
 - Ignored Rust Azure integration tests use the local download-count helper for cache-reuse assertions (`rust/sqlite-objs/tests/vfs_integration.rs:1033-1055`, `rust/sqlite-objs/tests/vfs_integration.rs:1057-1091`, `rust/sqlite-objs/tests/vfs_integration.rs:1136-1178`).
 

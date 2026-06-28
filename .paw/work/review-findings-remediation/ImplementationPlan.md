@@ -34,6 +34,10 @@ Rollback-journal and WAL cleanup/recovery decisions use authoritative remote sta
 - [ ] **Phase 4: Test Gate and Release Automation Integrity** - Make tests/gates/workflows fail or report accurately for critical coverage.
 - [ ] **Phase 5: Documentation and Final Validation** - Update project docs, create as-built Docs.md, and run final validation.
 
+## Cross-Phase Verification Standard
+
+For each targeted invariant test added in Phases 1-3, record evidence that it fails against the pre-fix behavior or otherwise demonstrates coverage of the previously untested invariant. Acceptable evidence includes a failing baseline run before the fix, a focused fault-injection/mutation check, or an implementation note explaining why the test necessarily exercises the audited failure mode.
+
 ## Phase Candidates
 
 ---
@@ -42,18 +46,19 @@ Rollback-journal and WAL cleanup/recovery decisions use authoritative remote sta
 
 ### Changes Required:
 
-- **`src/sqlite_objs_vfs.c`**: Rework rollback-journal existence caching so cached-absent state cannot suppress authoritative remote checks required for hot-journal discovery. Preserve useful cache updates from `xDelete` and journal `xSync`, but treat crash-recovery open/access paths as requiring either a HEAD or a safely scoped cache decision.
-- **`src/sqlite_objs_vfs.c`**: Decide and implement data-safe rollback-journal `xTruncate` semantics for non-WAL modes. Preferred behavior: when a main journal is truncated to zero, delete the remote journal blob or upload authoritative zero-length state, update the journal cache, and propagate remote cleanup failure instead of returning success.
+- **`src/sqlite_objs_vfs.c`**: Rework rollback-journal existence caching so cached-absent state cannot suppress authoritative remote checks required for hot-journal discovery. Preserve useful cache updates from `xDelete` and journal `xSync`, but bypass cached-absent state for SQLite journal open/access checks that determine recovery so those paths perform an authoritative remote check.
+- **`src/sqlite_objs_vfs.c`**: Implement an explicit rollback-journal mode policy. Supported rollback-journal cleanup should be data-safe: `DELETE` deletes the remote journal; `TRUNCATE` requests are normalized to safe remote deletion or authoritative zero-length state; `PERSIST` is either normalized/rejected to `DELETE` or must upload a zeroed-header state that tests prove cannot replay as hot. Unsupported modes must be rejected or documented rather than silently leaving stale remote data.
 - **`src/sqlite_objs_vfs.c`**: Propagate WAL `blob_delete` failures from `xTruncate(0)` when stale WAL could remain visible; keep empty-WAL success behavior intact when delete is unnecessary or the blob is already absent.
 - **`test/test_vfs.c`**: Add unit tests for stale cached-absent journal state followed by remote journal presence, journal-mode `TRUNCATE`/zero-length cleanup behavior, and cleanup failure propagation.
 - **`test/test_wal.c`**: Add WAL checkpoint/truncate failure test using mock `blob_delete` injection.
-- **`test/test_integration.c`**: Add at least one representative recovery test where remote journal state exists beyond the pre-write hook boundary and reopen behavior proves authoritative discovery.
+- **`test/test_vfs.c` or `test/test_wal.c`**: Add at least one mock/fault-injection recovery test where representative remote journal/WAL state exists beyond the pre-write hook boundary and reopen behavior proves authoritative discovery. Add an Azurite integration variant only if the mechanism can create the same representative remote state reliably.
 
 ### Success Criteria:
 
 #### Automated Verification:
 - [ ] Tests pass: `make test-unit`
 - [ ] Targeted integration passes: `make test-integration`
+- [ ] Targeted invariant tests have fail-first or equivalent coverage evidence recorded per the cross-phase verification standard.
 
 #### Manual Verification:
 - [ ] Hot-journal discovery cannot be bypassed solely by stale cached absence.
@@ -73,6 +78,7 @@ Rollback-journal and WAL cleanup/recovery decisions use authoritative remote sta
 - **`src/azure_client.c`**: Normalize batch-write cleanup with a single cleanup/unlock path so every allocation/setup/lease-loss/error branch releases `done`, request arrays, CURL handles, and the client mutex exactly once.
 - **`src/azure_client.c` / test seam**: Add a testable hook or injectable failure path for batch per-attempt allocation/renewal failure if existing hooks cannot cover it without unsafe memory pressure.
 - **`test/test_azure_client.c` or `test/test_coalesce.c`**: Add focused tests that exercise batch lease renewal without deadlock and verify client usability after injected setup failure.
+- **`test/test_azure_client.c`, `test/test_coalesce.c`, or `test/test_vfs.c`**: Add or extend error-propagation coverage so representative remediated batch/write/lease/auth/retry failures still map to actionable SQLite-facing or Azure-client error codes after the refactor.
 - **`test/test_chaos.c`**: Extend retry/lease tests if this is the most appropriate location for renewal failure classification.
 
 ### Success Criteria:
@@ -80,6 +86,7 @@ Rollback-journal and WAL cleanup/recovery decisions use authoritative remote sta
 #### Automated Verification:
 - [ ] Tests pass: `make test-unit`
 - [ ] Sanitizer passes: `make sanitize`
+- [ ] Targeted invariant tests have fail-first or equivalent coverage evidence recorded per the cross-phase verification standard.
 
 #### Manual Verification:
 - [ ] Batch-write lease renewal path has no recursive acquisition of the same non-recursive mutex.
@@ -92,7 +99,7 @@ Rollback-journal and WAL cleanup/recovery decisions use authoritative remote sta
 
 ### Changes Required:
 
-- **`rust/sqlite-objs/src/lib.rs`**: Add process-wide registration coordination for safe wrapper APIs. Prefer deterministic idempotent behavior for repeated same-mode registration, and return a clear error for attempted incompatible reconfiguration through safe APIs. If true reconfiguration remains needed for tests, expose it only through an explicitly unsafe or clearly named API.
+- **`rust/sqlite-objs/src/lib.rs`**: Add process-wide registration coordination for safe wrapper APIs. Prefer deterministic idempotent behavior for repeated same-mode registration, and return a clear error for attempted incompatible reconfiguration through safe APIs. If true reconfiguration remains needed for tests, expose it only through an explicitly unsafe or clearly named API. Scope this phase to the Rust safe API boundary; direct C API re-registration over global VFS state should be documented unless a targeted C-level fix is added.
 - **`rust/sqlite-objs/src/lib.rs`**: Validate non-empty account/container and presence of either SAS token or account key in `SqliteObjsConfig` before FFI; keep NUL-byte validation.
 - **`rust/sqlite-objs/src/lib.rs`**: Add fallible URI-building or validation for required account/container/auth fields while preserving existing builder ergonomics where possible. If `build()` must remain infallible for compatibility, add `try_build()` and update docs/tests to recommend it for validated URIs.
 - **`rust/sqlite-objs/src/pragmas.rs`**: Replace newer raw-reference/C-string literal syntax with Rust 1.70-compatible code, or raise documented MSRV consistently. Preferred for lower churn: keep Rust 1.70 and use compatible `CStr`/pointer construction.
@@ -104,6 +111,8 @@ Rollback-journal and WAL cleanup/recovery decisions use authoritative remote sta
 #### Automated Verification:
 - [ ] Tests pass: `cd rust && cargo test --workspace`
 - [ ] Feature-gated tests pass: `cd rust && cargo test --workspace --all-features`
+- [ ] MSRV policy check passes: `cd rust && cargo +1.70.0 check --workspace --all-features` if Rust 1.70 remains documented; otherwise all MSRV documentation is updated and checked against the newly documented minimum.
+- [ ] Targeted invariant tests have fail-first or equivalent coverage evidence recorded per the cross-phase verification standard.
 
 #### Manual Verification:
 - [ ] Safe Rust API cannot accidentally reset global C VFS state for active users.
@@ -117,10 +126,11 @@ Rollback-journal and WAL cleanup/recovery decisions use authoritative remote sta
 ### Changes Required:
 
 - **`test/test_integration.c`**: Make deterministic property tests fail on unexpected `SQLITE_ERROR` for generated insert/update/delete operations unless a scenario has an explicitly documented expected constraint/error reason.
-- **`test/run-integration.sh`**: Make Azurite loose/API-version behavior explicit and configurable. Preferred behavior: default to stricter mode; allow opt-in `AZURITE_LOOSE=1` for compatibility, and print the selected mode.
+- **`test/run-integration.sh`**: Make Azurite loose/API-version behavior explicit and configurable. First verify whether the suite passes without `--loose`/`--skipApiVersionCheck`; if it does, default to strict mode with opt-in `AZURITE_LOOSE=1`. If strict mode exposes broader compatibility work, keep loose mode but print/flag the fidelity limitation and document it.
 - **`scripts/release-gate.sh`**: Make skipped critical gates visible in the final result and prevent "alpha ready" language when important release-readiness gates are skipped. Preserve fast local usability by distinguishing "fast gate passed" from "full release gate passed".
 - **`.github/workflows/squad-ci.yml`**: Keep CI local-fast by default, but ensure it reports fast-gate semantics accurately and installs/runs the available Azurite-backed gate intentionally.
-- **`.github/workflows/squad-release.yml`, `squad-insider-release.yml`, `squad-preview.yml`, `squad-docs.yml`, `squad-promote.yml`**: Replace placeholder Node/package assumptions with repository-appropriate build/test/release validation, or convert them into explicit disabled/manual workflows that fail with actionable configuration messages rather than echoing success-shaped placeholders.
+- **`.github/workflows/squad-release.yml`, `squad-insider-release.yml`, `squad-preview.yml`, `squad-docs.yml`**: Replace placeholder echo commands with repository-appropriate build/test/docs validation, or convert them into explicit disabled/manual workflows that fail with actionable configuration messages rather than echoing success-shaped placeholders.
+- **`.github/workflows/squad-promote.yml`**: Rework the functional preview-to-main promotion gates so they no longer depend on nonexistent Node `package.json` metadata or missing `CHANGELOG.md` assumptions; preserve intentional forbidden-path checks and promotion logic where still applicable.
 
 ### Success Criteria:
 
@@ -142,6 +152,7 @@ Rollback-journal and WAL cleanup/recovery decisions use authoritative remote sta
 ### Changes Required:
 
 - **`.paw/work/review-findings-remediation/Docs.md`**: Create the as-built technical reference with implementation details, changed invariants, and validation commands. Load `paw-docs-guidance` before writing.
+- **Final society-of-thought review**: Run the configured final PAW society-of-thought review after implementation and local validation, and resolve or document any findings before final milestone pause.
 - **`README.md`**: Correct production build instructions, WAL support/limitations, validation tiers, and any changed behavior for journal/WAL cleanup or Rust APIs.
 - **`benchmark/README.md`, `benchmark/tpcc/README.md`, `demo/README.md`, `demo/azure-demo.sh`**: Replace nonexistent `make all-production` references or add a compatible Makefile target if that is the chosen documentation-compatible fix.
 - **`TEST_DOCS_INDEX.md`, `TEST_QUICK_REFERENCE.md`, and related test docs**: Update validation gate semantics, Azurite strict/loose mode notes, and newly added invariant tests.
@@ -157,6 +168,7 @@ Rollback-journal and WAL cleanup/recovery decisions use authoritative remote sta
 - [ ] Tests pass: `cd rust && cargo test --workspace`
 - [ ] Tests pass: `cd rust && cargo test --workspace --all-features`
 - [ ] Gate smoke passes: `./scripts/release-gate.sh`
+- [ ] Final society-of-thought review completes with no unresolved high-severity correctness, safety, or validation gaps from the original audit.
 
 #### Manual Verification:
 - [ ] Documentation references only existing targets or intentionally added targets.
