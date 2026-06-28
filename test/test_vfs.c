@@ -1593,11 +1593,11 @@ TEST(vfs_journal_remote_presence_checked_on_reopen) {
     ASSERT_EQ(exists, 0);
     close_test_db(db);
 
-    unsigned char remote_journal[] = "representative-remote-journal";
+    unsigned char remote_journal = 0;
     azure_error_t err;
     azure_error_init(&err);
     azure_err_t arc = g_ops->block_blob_upload(
-        g_ctx, "test.db-journal", remote_journal, sizeof(remote_journal), &err);
+        g_ctx, "test.db-journal", &remote_journal, 0, &err);
     ASSERT_AZURE_OK(arc);
 
     mock_reset_call_counts(g_ctx);

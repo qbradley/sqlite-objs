@@ -17,7 +17,7 @@
  */
 
 #include "test_harness.h"
-#include "azure_client.h"
+#include "azure_client_impl.h"
 #include "sqlite_objs.h"
 #include "sqlite3.h"
 
@@ -565,6 +565,26 @@ TEST(lease_break) {
     rc = g_ops->lease_release(g_ctx, blob_name, new_lease_id, &err);
     ASSERT_AZURE_OK(rc);
     cleanup_blob(blob_name);
+}
+
+TEST(batch_reqs_alloc_failure_releases_mutex) {
+    uint8_t data[1024];
+    memset(data, 0xA5, sizeof(data));
+    azure_page_range_t ranges[2] = {
+        { .offset = 0, .data = data, .len = 512 },
+        { .offset = 512, .data = data + 512, .len = 512 }
+    };
+
+    azure_error_t err;
+    azure_error_init(&err);
+    azure_test_fail_next_batch_reqs_alloc(1);
+    azure_err_t rc = g_ops->page_blob_write_batch(
+        g_ctx, "batch-oom.db", ranges, 2, NULL, NULL, &err);
+    ASSERT_AZURE_ERR(rc, AZURE_ERR_NOMEM);
+
+    int lock_rc = pthread_mutex_trylock(&g_client->mutex);
+    ASSERT_EQ(lock_rc, 0);
+    pthread_mutex_unlock(&g_client->mutex);
 }
 
 /* ================================================================
@@ -5428,6 +5448,7 @@ int main(void) {
     RUN_TEST(error_not_found);
     RUN_TEST(page_blob_resize);
     RUN_TEST(lease_break);
+    RUN_TEST(batch_reqs_alloc_failure_releases_mutex);
     TEST_SUITE_END();
 
     /* Run VFS integration tests */

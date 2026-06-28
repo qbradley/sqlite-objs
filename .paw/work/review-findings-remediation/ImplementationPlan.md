@@ -29,7 +29,7 @@ Rollback-journal and WAL cleanup/recovery decisions use authoritative remote sta
 ## Phase Status
 
 - [x] **Phase 1: Recovery Artifact Safety** - Fix rollback-journal/WAL cleanup and discovery invariants with targeted tests.
-- [ ] **Phase 2: Azure Batch Synchronization Safety** - Fix production batch-write lease renewal and mutex cleanup paths with targeted coverage.
+- [x] **Phase 2: Azure Batch Synchronization Safety** - Fix production batch-write lease renewal and mutex cleanup paths with targeted coverage.
 - [ ] **Phase 3: Rust Wrapper Safety and Compatibility** - Harden safe registration/configuration/MSRV/test helper behavior.
 - [ ] **Phase 4: Test Gate and Release Automation Integrity** - Make tests/gates/workflows fail or report accurately for critical coverage.
 - [ ] **Phase 5: Documentation and Final Validation** - Update project docs, create as-built Docs.md, and run final validation.
@@ -67,7 +67,7 @@ For each targeted invariant test added in Phases 1-3, record evidence that it fa
 
 ### Phase 1 Notes:
 
-- Added mock/VFS coverage that first caches `test.db-journal` as absent, then creates remote journal state and verifies both direct `xAccess` and SQLite reopen paths perform authoritative `blob_exists` checks.
+- Added mock/VFS coverage that first caches `test.db-journal` as absent, then creates remote journal blob state and verifies both direct `xAccess` and SQLite reopen paths perform authoritative journal discovery.
 - Added recovery-artifact fail-closed coverage for `blob_exists` failures when no journal cache entry exists.
 - Added `TRUNCATE` journal cleanup coverage proving remote journal deletion and delete-failure propagation.
 - Added WAL checkpoint/truncate delete-failure coverage.
@@ -92,14 +92,21 @@ For each targeted invariant test added in Phases 1-3, record evidence that it fa
 ### Success Criteria:
 
 #### Automated Verification:
-- [ ] Tests pass: `make test-unit`
-- [ ] Sanitizer passes: `make sanitize`
-- [ ] Targeted invariant tests have fail-first or equivalent coverage evidence recorded per the cross-phase verification standard.
+- [x] Tests pass: `make test-unit`
+- [x] Sanitizer passes: `make sanitize`
+- [x] Targeted invariant tests have fail-first or equivalent coverage evidence recorded per the cross-phase verification standard.
 
 #### Manual Verification:
-- [ ] Batch-write lease renewal path has no recursive acquisition of the same non-recursive mutex.
-- [ ] Every batch-write return path after mutex acquisition has an auditable unlock/cleanup route.
-- [ ] Client remains usable after injected batch setup failure.
+- [x] Batch-write lease renewal path has no recursive acquisition of the same non-recursive mutex.
+- [x] Every batch-write return path after mutex acquisition has an auditable unlock/cleanup route.
+- [x] Client remains usable after injected batch setup failure.
+
+### Phase 2 Notes:
+
+- Replaced recursive lease renewal inside production batch writes with a mutex-held renewal path using a temporary CURL easy handle instead of `execute_with_retry`.
+- Fixed the per-attempt batch request allocation failure path to unlock the Azure client mutex before returning.
+- Added integration coverage that injects batch request allocation failure and verifies the client mutex is released.
+- Fail-first/equivalent evidence: the allocation-failure hook targets the previously leaked-mutex branch directly; existing batch partial-failure tests continue to verify VFS error propagation and the integration test proves the remediated cleanup path leaves the client usable.
 
 ---
 

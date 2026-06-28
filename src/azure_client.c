@@ -103,10 +103,15 @@ static double az_time_ms(void) {
  * ================================================================ */
 static azure_retry_hook_fn g_retry_hook = NULL;
 static void *g_retry_hook_ctx = NULL;
+static int g_fail_next_batch_reqs_alloc = 0;
 
 void azure_test_set_retry_hook(azure_retry_hook_fn hook, void *ctx) {
     g_retry_hook = hook;
     g_retry_hook_ctx = ctx;
+}
+
+void azure_test_fail_next_batch_reqs_alloc(int fail) {
+    g_fail_next_batch_reqs_alloc = fail ? 1 : 0;
 }
 #endif /* SQLITE_OBJS_TEST */
 
@@ -1892,6 +1897,197 @@ static void batch_free_req(batch_req_t *req)
 }
 
 /*
+ * Renew a lease while az_page_blob_write_batch already owns c->mutex.
+ *
+ * This intentionally does not call execute_with_retry()/execute_single():
+ * those helpers lock c->mutex around the shared easy handle.  Batch writes
+ * hold the mutex to protect the persistent multi handle, so renewing through
+ * the normal helper would recursively lock the same non-recursive mutex.
+ * Use a temporary easy handle instead.
+ */
+static azure_err_t batch_lease_renew_locked(
+    azure_client_t *c,
+    const char *name,
+    const char *lease_id,
+    azure_error_t *err)
+{
+    if (!c || !name || !lease_id || !*lease_id || !err) {
+        if (err) {
+            azure_error_init(err);
+            err->code = AZURE_ERR_INVALID_ARG;
+            snprintf(err->error_message, sizeof(err->error_message),
+                     "batch lease renewal requires client, name, and lease_id");
+        }
+        return AZURE_ERR_INVALID_ARG;
+    }
+
+    azure_err_t rc = AZURE_OK;
+    azure_response_headers_t rh;
+    CURL *curl = NULL;
+    struct curl_slist *headers = NULL;
+    azure_buffer_t body;
+    int bodyInit = 0;
+
+    for (int attempt = 0; attempt <= AZURE_MAX_RETRIES; attempt++) {
+        azure_error_init(err);
+        memset(&rh, 0, sizeof(rh));
+        rh.retry_after = -1;
+        curl = NULL;
+        headers = NULL;
+        bodyInit = 0;
+
+        char url[4096];
+        build_blob_url(c, name, url, sizeof(url));
+        size_t url_len = strlen(url);
+        int n = snprintf(url + url_len, sizeof(url) - url_len, "?comp=lease");
+        if (n > 0) url_len += (size_t)n;
+        if (c->use_sas) {
+            snprintf(url + url_len, sizeof(url) - url_len,
+                     "&%s", c->sas_token);
+        }
+
+        char date_buf[64];
+        azure_rfc1123_time(date_buf, sizeof(date_buf));
+
+        char auth_hdr[512] = "";
+        if (!c->use_sas) {
+            char h_date[128], h_ver[64], h_action[64], h_lid[192];
+            snprintf(h_date, sizeof(h_date), "x-ms-date:%s", date_buf);
+            snprintf(h_ver, sizeof(h_ver), "x-ms-version:%s", AZURE_API_VERSION);
+            snprintf(h_action, sizeof(h_action), "x-ms-lease-action:renew");
+            snprintf(h_lid, sizeof(h_lid), "x-ms-lease-id:%s", lease_id);
+
+            const char *xms[] = { h_action, h_date, h_lid, h_ver, NULL };
+
+            char path[1024];
+            if (c->endpoint[0]) {
+                snprintf(path, sizeof(path), "/%s/%s/%s",
+                         c->account, c->container, name);
+            } else {
+                snprintf(path, sizeof(path), "/%s/%s",
+                         c->container, name);
+            }
+
+            rc = azure_auth_sign_request(
+                c, "PUT", path, "comp=lease",
+                "", "", "", NULL, (const char *const *)xms,
+                auth_hdr, sizeof(auth_hdr));
+            if (rc != AZURE_OK) {
+                err->code = rc;
+                return rc;
+            }
+        }
+
+        curl = curl_easy_init();
+        if (!curl) {
+            err->code = AZURE_ERR_NETWORK;
+            snprintf(err->error_message, sizeof(err->error_message),
+                     "curl_easy_init() failed for batch lease renewal");
+            return AZURE_ERR_NETWORK;
+        }
+
+        azure_buffer_init(&body);
+        bodyInit = 1;
+        char h[600];
+
+        snprintf(h, sizeof(h), "x-ms-date: %s", date_buf);
+        SLIST_APPEND(headers, h);
+        snprintf(h, sizeof(h), "x-ms-version: %s", AZURE_API_VERSION);
+        SLIST_APPEND(headers, h);
+        SLIST_APPEND(headers, "x-ms-lease-action: renew");
+        snprintf(h, sizeof(h), "x-ms-lease-id: %s", lease_id);
+        SLIST_APPEND(headers, h);
+        SLIST_APPEND(headers, "Content-Length: 0");
+        SLIST_APPEND(headers, "Content-Type:");
+        if (auth_hdr[0]) {
+            snprintf(h, sizeof(h), "Authorization: %s", auth_hdr);
+            SLIST_APPEND(headers, h);
+        }
+
+        curl_easy_setopt(curl, CURLOPT_URL, url);
+        curl_easy_setopt(curl, CURLOPT_CUSTOMREQUEST, "PUT");
+        curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+        curl_easy_setopt(curl, CURLOPT_POSTFIELDS, "");
+        curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, 0L);
+        curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, curl_write_cb);
+        curl_easy_setopt(curl, CURLOPT_WRITEDATA, &body);
+        curl_easy_setopt(curl, CURLOPT_HEADERFUNCTION, curl_header_cb);
+        curl_easy_setopt(curl, CURLOPT_HEADERDATA, &rh);
+        curl_easy_setopt(curl, CURLOPT_TIMEOUT, 60L);
+        curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 10L);
+        curl_easy_setopt(curl, CURLOPT_TCP_KEEPALIVE, 1L);
+        curl_easy_setopt(curl, CURLOPT_HTTP_VERSION, CURL_HTTP_VERSION_2TLS);
+
+        CURLcode cres = curl_easy_perform(curl);
+        long http_status = 0;
+        curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_status);
+
+        if (cres != CURLE_OK) {
+            rc = (cres == CURLE_OPERATION_TIMEDOUT ||
+                  cres == CURLE_COULDNT_CONNECT)
+                 ? AZURE_ERR_SERVER : AZURE_ERR_NETWORK;
+            err->code = rc;
+            snprintf(err->error_message, sizeof(err->error_message),
+                     "batch lease renewal curl error: %s",
+                     curl_easy_strerror(cres));
+        } else if (http_status >= 200 && http_status < 300) {
+            curl_slist_free_all(headers);
+            headers = NULL;
+            azure_buffer_free(&body);
+            bodyInit = 0;
+            curl_easy_cleanup(curl);
+            curl = NULL;
+            azure_error_init(err);
+            return AZURE_OK;
+        } else {
+            rc = azure_classify_http_error(http_status, rh.error_code);
+            err->code = rc;
+            err->http_status = clamp_http_status(http_status);
+            if (body.size > 0) {
+                azure_parse_error_xml((const char *)body.data, body.size, err);
+            }
+            if (rh.error_code[0]) {
+                strncpy(err->error_code, rh.error_code,
+                        sizeof(err->error_code) - 1);
+            }
+            if (rh.request_id[0]) {
+                strncpy(err->request_id, rh.request_id,
+                        sizeof(err->request_id) - 1);
+            }
+        }
+
+        curl_slist_free_all(headers);
+        headers = NULL;
+        azure_buffer_free(&body);
+        bodyInit = 0;
+        curl_easy_cleanup(curl);
+        curl = NULL;
+
+        if (!azure_is_retryable(rc) || attempt == AZURE_MAX_RETRIES) {
+            return rc;
+        }
+
+        int delay_ms = azure_compute_retry_delay(attempt, rh.retry_after);
+        fprintf(stderr, "[sqlite-objs] PUT %s lease renew: %s (HTTP %d) — "
+                "retry %d/%d in %dms\n",
+                name, azure_err_str(rc), err->http_status,
+                attempt + 1, AZURE_MAX_RETRIES, delay_ms);
+        azure_retry_sleep_ms(delay_ms);
+    }
+
+    return rc;
+
+cleanup:
+    if (headers) curl_slist_free_all(headers);
+    if (bodyInit) azure_buffer_free(&body);
+    if (curl) curl_easy_cleanup(curl);
+    err->code = AZURE_ERR_NOMEM;
+    snprintf(err->error_message, sizeof(err->error_message),
+             "batch lease renewal header allocation failed");
+    return AZURE_ERR_NOMEM;
+}
+
+/*
  * Write multiple page ranges in parallel using curl_multi.
  *
  * nRanges ≤ 1: delegates to az_page_blob_write (simple path).
@@ -1987,10 +2183,21 @@ static azure_err_t az_page_blob_write_batch(
         }
 
         /* ---- Set up easy handles for pending ranges ---- */
-        batch_req_t *reqs = calloc((size_t)pending, sizeof(batch_req_t));
+        batch_req_t *reqs = NULL;
+#ifdef SQLITE_OBJS_TEST
+        if (g_fail_next_batch_reqs_alloc) {
+            g_fail_next_batch_reqs_alloc = 0;
+        } else
+#endif
+        {
+            reqs = calloc((size_t)pending, sizeof(batch_req_t));
+        }
         if (!reqs) {
             free(done);
             err->code = AZURE_ERR_NOMEM;
+            pthread_mutex_unlock(&c->mutex);
+            snprintf(err->error_message, sizeof(err->error_message),
+                     "batch write: request allocation failed");
             return AZURE_ERR_NOMEM;
         }
 
@@ -2044,8 +2251,8 @@ static azure_err_t az_page_blob_write_batch(
                 if (now - last_renewal >= BATCH_LEASE_RENEWAL_SEC) {
                     azure_error_t le;
                     azure_error_init(&le);
-                    azure_err_t lrc = az_lease_renew(ctx, name,
-                                                     lease_id, &le);
+                    azure_err_t lrc = batch_lease_renew_locked(c, name,
+                                                               lease_id, &le);
                     if (lrc != AZURE_OK) {
                         fprintf(stderr,
                                 "[sqlite-objs] batch write: lease renewal "

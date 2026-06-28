@@ -190,6 +190,11 @@ typedef void (*azure_retry_hook_fn)(const azure_retry_event_t *event, void *ctx)
 
 void azure_test_set_retry_hook(azure_retry_hook_fn hook, void *ctx);
 
+/* Force the next production page_blob_write_batch per-attempt request-array
+ * allocation to fail. Used to verify cleanup/unlock behavior without relying
+ * on memory pressure. */
+void azure_test_fail_next_batch_reqs_alloc(int fail);
+
 #endif /* SQLITE_OBJS_TEST */
 
 #ifdef __cplusplus
