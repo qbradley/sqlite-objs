@@ -1,0 +1,173 @@
+# Review Findings Remediation Implementation Plan
+
+## Overview
+
+This plan remediates the invariant audit findings across the C VFS/Azure client, Rust wrapper crates, tests, documentation, and release automation. The approach is to fix the data-safety issues first, then harden Rust and validation surfaces, then align documentation and workflow automation so maintainers can trust the resulting gates.
+
+## Current State Analysis
+
+The C VFS uses a global rollback-journal existence cache that can skip remote HEAD checks for cached-absent journals, while journal `xTruncate` only mutates the in-memory journal buffer and does not update remote block-blob state [CodeResearch.md:47-65](CodeResearch.md#L47-L65). WAL cleanup has a similar explicit-failure gap: `xTruncate(0)` calls `blob_delete` but ignores the result before clearing local state [CodeResearch.md:67-74](CodeResearch.md#L67-L74).
+
+The production Azure batch-write path holds the client mutex while using the multi handle, then calls lease renewal through the request helper that locks the same mutex; it also has a per-attempt allocation failure path that returns without unlocking [CodeResearch.md:76-88](CodeResearch.md#L76-L88). Existing tests cover many lease and upload paths but not these exact production mutex/renewal failure modes.
+
+Crash tests currently inject failures through hooks that run before the risky remote operation starts, so they prove clean pre-write error handling rather than behavior with representative partially persisted remote state [CodeResearch.md:90-97](CodeResearch.md#L90-L97). Release/test gates also have fidelity gaps: Azurite always starts with loose flags, property tests tolerate unexpected `SQLITE_ERROR`, and release gates/workflows can appear green while important coverage is skipped or unconfigured [CodeResearch.md:116-128](CodeResearch.md#L116-L128).
+
+The Rust wrappers expose safe repeatable registration methods over a global C VFS state that is reset on every registration path, validate only NUL bytes in safe config APIs, declare Rust 1.70 while feature-gated helper syntax uses newer constructs, and one ignored integration helper ignores `sqlite3_file_control` return codes [CodeResearch.md:99-114](CodeResearch.md#L99-L114).
+
+## Desired End State
+
+Rollback-journal and WAL cleanup/recovery decisions use authoritative remote state when needed, and remote cleanup failures surface to SQLite callers. Large Azure batch writes do not self-deadlock and every failure path releases internal synchronization resources. Rust safe APIs are deterministic, validate required fields before FFI, and compile under the documented MSRV/feature policy. Tests include targeted coverage for every fixed invariant, including representative partial remote state beyond pre-operation hook failures. Documentation, scripts, and workflows point at real commands and clearly distinguish fast, extended, and live-Azure readiness.
+
+## What We're NOT Doing
+
+- No pull request creation, posting, or pushing.
+- No new storage backend or broad VFS redesign.
+- No live release publishing, crate publishing, or tag creation.
+- No requirement to make default local validation depend on live Azure credentials.
+- No performance optimization beyond what is needed to fix deadlocks, stale state, false success, and misleading gates.
+
+## Phase Status
+
+- [ ] **Phase 1: Recovery Artifact Safety** - Fix rollback-journal/WAL cleanup and discovery invariants with targeted tests.
+- [ ] **Phase 2: Azure Batch Synchronization Safety** - Fix production batch-write lease renewal and mutex cleanup paths with targeted coverage.
+- [ ] **Phase 3: Rust Wrapper Safety and Compatibility** - Harden safe registration/configuration/MSRV/test helper behavior.
+- [ ] **Phase 4: Test Gate and Release Automation Integrity** - Make tests/gates/workflows fail or report accurately for critical coverage.
+- [ ] **Phase 5: Documentation and Final Validation** - Update project docs, create as-built Docs.md, and run final validation.
+
+## Phase Candidates
+
+---
+
+## Phase 1: Recovery Artifact Safety
+
+### Changes Required:
+
+- **`src/sqlite_objs_vfs.c`**: Rework rollback-journal existence caching so cached-absent state cannot suppress authoritative remote checks required for hot-journal discovery. Preserve useful cache updates from `xDelete` and journal `xSync`, but treat crash-recovery open/access paths as requiring either a HEAD or a safely scoped cache decision.
+- **`src/sqlite_objs_vfs.c`**: Decide and implement data-safe rollback-journal `xTruncate` semantics for non-WAL modes. Preferred behavior: when a main journal is truncated to zero, delete the remote journal blob or upload authoritative zero-length state, update the journal cache, and propagate remote cleanup failure instead of returning success.
+- **`src/sqlite_objs_vfs.c`**: Propagate WAL `blob_delete` failures from `xTruncate(0)` when stale WAL could remain visible; keep empty-WAL success behavior intact when delete is unnecessary or the blob is already absent.
+- **`test/test_vfs.c`**: Add unit tests for stale cached-absent journal state followed by remote journal presence, journal-mode `TRUNCATE`/zero-length cleanup behavior, and cleanup failure propagation.
+- **`test/test_wal.c`**: Add WAL checkpoint/truncate failure test using mock `blob_delete` injection.
+- **`test/test_integration.c`**: Add at least one representative recovery test where remote journal state exists beyond the pre-write hook boundary and reopen behavior proves authoritative discovery.
+
+### Success Criteria:
+
+#### Automated Verification:
+- [ ] Tests pass: `make test-unit`
+- [ ] Targeted integration passes: `make test-integration`
+
+#### Manual Verification:
+- [ ] Hot-journal discovery cannot be bypassed solely by stale cached absence.
+- [ ] Journal/WAL cleanup failures are observable to SQLite callers where stale remote recovery artifacts could remain.
+- [ ] Representative partial-state test covers behavior after remote recovery state exists, not only pre-operation hook aborts.
+
+---
+
+## Phase 2: Azure Batch Synchronization Safety
+
+### Changes Required:
+
+- **`src/azure_client.c`**: Refactor production `az_page_blob_write_batch` lease renewal so it does not re-enter `execute_with_retry` while holding `azure_client_t::mutex`. Viable options:
+  - Release the batch mutex around renewal only if CURLM state and active handles are safely quiesced.
+  - Introduce an internal no-lock lease-renew request path for use while the caller already owns the mutex.
+  - Use a separate CURL easy handle for lease renewal outside the shared easy-handle lock.
+- **`src/azure_client.c`**: Normalize batch-write cleanup with a single cleanup/unlock path so every allocation/setup/lease-loss/error branch releases `done`, request arrays, CURL handles, and the client mutex exactly once.
+- **`src/azure_client.c` / test seam**: Add a testable hook or injectable failure path for batch per-attempt allocation/renewal failure if existing hooks cannot cover it without unsafe memory pressure.
+- **`test/test_azure_client.c` or `test/test_coalesce.c`**: Add focused tests that exercise batch lease renewal without deadlock and verify client usability after injected setup failure.
+- **`test/test_chaos.c`**: Extend retry/lease tests if this is the most appropriate location for renewal failure classification.
+
+### Success Criteria:
+
+#### Automated Verification:
+- [ ] Tests pass: `make test-unit`
+- [ ] Sanitizer passes: `make sanitize`
+
+#### Manual Verification:
+- [ ] Batch-write lease renewal path has no recursive acquisition of the same non-recursive mutex.
+- [ ] Every batch-write return path after mutex acquisition has an auditable unlock/cleanup route.
+- [ ] Client remains usable after injected batch setup failure.
+
+---
+
+## Phase 3: Rust Wrapper Safety and Compatibility
+
+### Changes Required:
+
+- **`rust/sqlite-objs/src/lib.rs`**: Add process-wide registration coordination for safe wrapper APIs. Prefer deterministic idempotent behavior for repeated same-mode registration, and return a clear error for attempted incompatible reconfiguration through safe APIs. If true reconfiguration remains needed for tests, expose it only through an explicitly unsafe or clearly named API.
+- **`rust/sqlite-objs/src/lib.rs`**: Validate non-empty account/container and presence of either SAS token or account key in `SqliteObjsConfig` before FFI; keep NUL-byte validation.
+- **`rust/sqlite-objs/src/lib.rs`**: Add fallible URI-building or validation for required account/container/auth fields while preserving existing builder ergonomics where possible. If `build()` must remain infallible for compatibility, add `try_build()` and update docs/tests to recommend it for validated URIs.
+- **`rust/sqlite-objs/src/pragmas.rs`**: Replace newer raw-reference/C-string literal syntax with Rust 1.70-compatible code, or raise documented MSRV consistently. Preferred for lower churn: keep Rust 1.70 and use compatible `CStr`/pointer construction.
+- **`rust/sqlite-objs/tests/vfs_integration.rs`**: Make the local download-count helper assert/check `sqlite3_file_control` return code, or use the checked `sqlite_objs::pragmas::get_download_count` helper under the `rusqlite` feature.
+- **Rust tests**: Add tests for invalid empty config, missing auth, repeated/concurrent safe registration behavior, validated URI construction, and feature-gated pragma helper compilation.
+
+### Success Criteria:
+
+#### Automated Verification:
+- [ ] Tests pass: `cd rust && cargo test --workspace`
+- [ ] Feature-gated tests pass: `cd rust && cargo test --workspace --all-features`
+
+#### Manual Verification:
+- [ ] Safe Rust API cannot accidentally reset global C VFS state for active users.
+- [ ] Invalid required config values fail before unsafe FFI.
+- [ ] MSRV/documented feature behavior is internally consistent.
+
+---
+
+## Phase 4: Test Gate and Release Automation Integrity
+
+### Changes Required:
+
+- **`test/test_integration.c`**: Make deterministic property tests fail on unexpected `SQLITE_ERROR` for generated insert/update/delete operations unless a scenario has an explicitly documented expected constraint/error reason.
+- **`test/run-integration.sh`**: Make Azurite loose/API-version behavior explicit and configurable. Preferred behavior: default to stricter mode; allow opt-in `AZURITE_LOOSE=1` for compatibility, and print the selected mode.
+- **`scripts/release-gate.sh`**: Make skipped critical gates visible in the final result and prevent "alpha ready" language when important release-readiness gates are skipped. Preserve fast local usability by distinguishing "fast gate passed" from "full release gate passed".
+- **`.github/workflows/squad-ci.yml`**: Keep CI local-fast by default, but ensure it reports fast-gate semantics accurately and installs/runs the available Azurite-backed gate intentionally.
+- **`.github/workflows/squad-release.yml`, `squad-insider-release.yml`, `squad-preview.yml`, `squad-docs.yml`, `squad-promote.yml`**: Replace placeholder Node/package assumptions with repository-appropriate build/test/release validation, or convert them into explicit disabled/manual workflows that fail with actionable configuration messages rather than echoing success-shaped placeholders.
+
+### Success Criteria:
+
+#### Automated Verification:
+- [ ] Tests pass: `make test-integration`
+- [ ] Gate smoke passes: `./scripts/release-gate.sh`
+- [ ] Workflow YAML remains syntactically valid by inspection and any available local YAML/tooling checks.
+
+#### Manual Verification:
+- [ ] Fast gate output no longer implies full release readiness when extended/live-Azure gates are skipped.
+- [ ] Property tests no longer accept unexpected data-operation `SQLITE_ERROR` as success.
+- [ ] Azurite runner makes strict/loose fidelity explicit.
+- [ ] Workflows no longer rely on nonexistent `package.json` release metadata for this C/Rust repository.
+
+---
+
+## Phase 5: Documentation and Final Validation
+
+### Changes Required:
+
+- **`.paw/work/review-findings-remediation/Docs.md`**: Create the as-built technical reference with implementation details, changed invariants, and validation commands. Load `paw-docs-guidance` before writing.
+- **`README.md`**: Correct production build instructions, WAL support/limitations, validation tiers, and any changed behavior for journal/WAL cleanup or Rust APIs.
+- **`benchmark/README.md`, `benchmark/tpcc/README.md`, `demo/README.md`, `demo/azure-demo.sh`**: Replace nonexistent `make all-production` references or add a compatible Makefile target if that is the chosen documentation-compatible fix.
+- **`TEST_DOCS_INDEX.md`, `TEST_QUICK_REFERENCE.md`, and related test docs**: Update validation gate semantics, Azurite strict/loose mode notes, and newly added invariant tests.
+- **`rust/README.md`, `rust/QUICKSTART.md`, `rust/sqlite-objs/README.md`, `rust/sqlite-objs-sys/README.md`**: Update Rust API validation, MSRV/feature notes, and registration semantics.
+- **Validation**: Run local verification commands that cover all changed surfaces.
+
+### Success Criteria:
+
+#### Automated Verification:
+- [ ] Tests pass: `make test-unit`
+- [ ] Tests pass: `make sanitize`
+- [ ] Tests pass: `make test-integration`
+- [ ] Tests pass: `cd rust && cargo test --workspace`
+- [ ] Tests pass: `cd rust && cargo test --workspace --all-features`
+- [ ] Gate smoke passes: `./scripts/release-gate.sh`
+
+#### Manual Verification:
+- [ ] Documentation references only existing targets or intentionally added targets.
+- [ ] README limitations match implemented WAL/journal behavior.
+- [ ] Docs.md captures final as-built state and validation results.
+- [ ] No pull request was created, pushed, or posted.
+
+---
+
+## References
+
+- Issue: none
+- Spec: `.paw/work/review-findings-remediation/Spec.md`
+- Research: `.paw/work/review-findings-remediation/CodeResearch.md`
