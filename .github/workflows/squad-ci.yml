@@ -1,5 +1,4 @@
 name: Squad CI
-# Project type was not detected — configure build/test commands below
 
 on:
   pull_request:
@@ -12,17 +11,52 @@ permissions:
   contents: read
 
 jobs:
-  test:
+  fast-gate:
+    name: Fast Release Gate
     runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
+    timeout-minutes: 30
 
-      - name: Build and test
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # ── Install C toolchain & dependencies ──
+      - name: Install C dependencies
         run: |
-          # TODO: Project type was not detected — add your build/test commands here
-          # Go:            go test ./...
-          # Python:        pip install -r requirements.txt && pytest
-          # .NET:          dotnet test
-          # Java (Maven):  mvn test
-          # Java (Gradle): ./gradlew test
-          echo "No build commands configured — update squad-ci.yml"
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            build-essential \
+            pkg-config \
+            libcurl4-openssl-dev \
+            libssl-dev \
+            libc6-dev \
+            lsof \
+            tcl-dev
+
+      # ── Install Rust toolchain ──
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      # ── Install Node.js & Azurite ──
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install Azurite
+        run: npm install -g azurite
+
+      # ── Run fast release gate (local mode) ──
+      - name: Run release gate
+        run: ./scripts/release-gate.sh
+
+      # ── Upload gate report on failure ──
+      - name: Upload release gate report
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-gate-report
+          path: build/release-gate-report.txt
+          if-no-files-found: ignore

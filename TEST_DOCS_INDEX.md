@@ -1,51 +1,382 @@
 # sqliteObjs Test Infrastructure Documentation Index
 
+## 🎯 Quick Navigation
+
+**Starting out?** → Start with TEST_QUICK_REFERENCE.md (5 min, fast gate commands)
+**Need details?** → See section-specific docs below
+**Release prep?** → See "Extended Testing & Validation" section
+
+---
+
 ## Available Documentation
 
-### 1. **TEST_INFRASTRUCTURE_DETAILED.md** (770 lines)
+### 1. **TEST_QUICK_REFERENCE.md** (400+ lines)
+   Quick-start guide with fast gate commands:
+   - ⚡ Pre-commit validation commands
+   - Minimal C test example
+   - How to add tests to test_main.c
+   - Failure injection & mock inspection
+   - Common assertion patterns
+   - Build and run commands
+
+### 2. **TEST_INFRASTRUCTURE_DETAILED.md** (770 lines)
    Comprehensive guide covering:
    - Test directory structure (9 files)
-   - Complete example test with URI parameters (lines 86-123 of test_uri.c)
+   - Complete example test with URI parameters
    - How mock system stores data in-memory
-   - How reads/writes work (with code snippets)
-   - blob_get_properties implementation (returns size, lease state/status, sets error detail)
-   - Test harness framework and TEST_SUITE_BEGIN/RUN_TEST pattern
-   - Individual test file organization (test_vfs.c as example)
-   - Stub implementation files (mock_azure_ops.h and .c)
-   - Persistence/reopening test pattern (integ_multi_db_independent, lines 690-719)
+   - Read/write operations with code snippets
+   - blob_get_properties implementation
+   - Test harness framework
+   - Persistence/reopening patterns
    - Complete "Writing New Tests" checklist
-   - Key assertion macros
-   - Running tests (unit vs integration)
-   - Step-by-step example: URI persistence test
-
-### 2. **TEST_QUICK_REFERENCE.md** (400+ lines)
-   Quick-start guide with real code:
-   - Minimal test example (3 tests: create, insert/query, persistence)
-   - How to add test to test_main.c
-   - Failure injection example
-   - Mock state inspection example
-   - URI-based test example
-   - Common assertion patterns
-   - Cleanup pattern
-   - Build command
-   - Test output example
-   - Key functions quick reference
 
 ### 3. **This Document (TEST_DOCS_INDEX.md)**
    Navigation guide to all test documentation
 
+### 4. **test/SECURITY-TESTING.md** (600+ lines)
+   Security and sanitizer details:
+   - **AddressSanitizer + UBSan** (runtime memory safety) ← Use `make sanitize`
+   - **MemorySanitizer** (uninitialized memory detection)
+   - **ThreadSanitizer** (data race detection)
+   - Static analysis tools (cppcheck, clang-tidy, scan-build)
+   - Fuzzing targets (libFuzzer, AFL++)
+   - Code coverage (gcov/lcov, llvm-cov)
+   - Credential handling and hardening flags
+
+### 5. **test/tcl-test-status.md** (1200+ lines)
+   Status of official SQLite TCL test suite:
+   - 1151 passing test files
+   - ~720,042 individual assertions
+   - Coverage across SELECT, DML, transactions, indexes, schema, functions, JSON, FTS5
+
+### 6. **VFS_TEST_INFRASTRUCTURE.md** (260 lines)
+   Quick reference for VFS architecture:
+   - Page cache (LRU demand-paging)
+   - Read/write/sync flows
+   - xOpen initialization
+   - Lease state machine
+   - Mock page blob implementation
+
+### 7. **TEST_INFRASTRUCTURE_QUICK_REFERENCE.md** (260 lines)
+   Compact VFS reference:
+   - Essential files and test execution pattern
+   - Mock context usage and failure injection
+   - Page cache architecture and write recording
+   - Environment variables (SQLITE_OBJS_CACHE_PAGES, SQLITE_OBJS_DEBUG_TIMING)
+   - Common test patterns
+
 ---
 
-## Quick Start (5 minutes)
+## Extended Testing & Validation
 
-1. Read: **TEST_QUICK_REFERENCE.md** Section 1 (Minimal Test Example)
-2. Copy: Pattern into new test file
-3. Build: `gcc -o test_runner test/test_main.c test/mock_azure_ops.c sqlite-autoconf-3520000/sqlite3.c -I sqlite-autoconf-3520000 -lpthread -ldl -lm`
-4. Run: `./test_runner`
+### ⚡ **Fast Gate Commands** (Run Before Commit)
+
+```bash
+# Unit tests + sanitizers (1-2 minutes)
+make test-unit
+make sanitize
+
+# Add Rust binding tests if modified Rust code
+cd rust && cargo test
+```
+
+### 🔄 **Stress Testing** (Pre-Release)
+
+```bash
+# Normal stress: 2× concurrent writers, 3 iterations (~5 min)
+make test-stress
+
+# Heavy stress: 4× concurrent writers, 5 iterations (~30 min)
+make test-stress-heavy
+
+# Extended property testing: 500+ operations per test (~10 min)
+make test-integration-extended
+
+# Custom multipliers via environment variables:
+SQLITE_OBJS_STRESS_MULTIPLIER=3 make test-integration
+PROP_TEST_OPS=1000 make test-integration
+```
+
+**What these test:**
+- Concurrent lease acquisition and renewal
+- Large transaction flushes (100+ dirty pages)
+- Rapid open/close cycles
+- Mixed read/write workloads
+- Page cache eviction under load
+- Dirty page coalescing edge cases
+
+### 🧪 **Sanitizer Validation** (Memory Safety)
+
+```bash
+# Build and run unit tests with AddressSanitizer + UBSan
+make sanitize
+
+# What it catches:
+#  - Buffer overflows (heap, stack, global)
+#  - Use-after-free bugs
+#  - Memory leaks
+#  - Uninitialized memory reads
+#  - Undefined behavior (signed overflow, etc.)
+#  - Invalid memory access patterns
+```
+
+**Details:** See `test/SECURITY-TESTING.md` Section 2 for all sanitizer options.
+
+### 📊 **Coverage Analysis**
+
+```bash
+make coverage
+# Opens: build/coverage-report/index.html
+
+# Aim for ≥80% line coverage on src/ files
+# Check uncovered paths in:
+#  - Error handling (failure injection tests)
+#  - Lease renewal logic
+#  - Page cache eviction
+#  - Alignment calculations
+```
+
+### 🔬 **TCL Test Suite** (Official SQLite Tests)
+
+```bash
+# Smoke test (5 test files, ~1 min)
+make test-tcl-quick
+
+# Full suite (1187 test files, ~10 min)
+make test-tcl
+
+# What it validates:
+#  - 1151 passing test files
+#  - SELECT, DML, transactions, indexes, schema, functions, JSON, FTS5
+#  - ~720,042 individual assertions
+```
+
+See `test/tcl-test-status.md` for complete test breakdown and known skips.
+
+### 🦀 **Rust Binding Tests**
+
+```bash
+# Low-level FFI tests
+cd rust && cargo test -p sqlite-objs-sys
+
+# High-level API tests
+cd rust && cargo test -p sqlite-objs
+
+# Integration tests (if Azurite running)
+cd rust && cargo test --tests -- --nocapture
+```
+
+**Current status:**
+- `sqlite-objs-sys`: Config size, register_uri, const verification
+- `sqlite-objs`: URI builder, error handling
+- `tests/perf_matrix.rs`: Performance benchmarks (requires Azurite)
+
+---
+
+## Known Testing Gaps & External Dependencies
+
+### ⚠️ **External Azure / Network Chaos Gaps**
+
+**Status:** Azurite-backed integration tests run locally via `make test-integration`, but production Azure retry-loop behavior still needs external fault injection.
+
+- Use `make test-integration` for local Azurite validation.
+- Use `./scripts/release-gate.sh --azure` when real Azure credentials are available.
+- Toxiproxy-style network chaos remains deferred for future work.
+
+**Next steps for contributors:**
+1. Run `make test-integration` for local Azurite coverage.
+2. Set AZURE_STORAGE_ACCOUNT, AZURE_STORAGE_CONTAINER, AZURE_STORAGE_SAS for real Azure validation.
+3. Run `./scripts/release-gate.sh --azure`.
+
+### 🚫 **Toxiproxy (Not Implemented)**
+
+**What it would test:** Network chaos (latency, packet loss, connection resets)
+
+**Why not critical for MVP:**
+- AddressSanitizer catches memory corruption
+- Unit tests cover failure injection (mock layer)
+- Real Azure provides network reliability guarantees
+
+**Future consideration:** Add after MVP 1 release for chaos testing.
+
+### 🔐 **Real Azure Testing (Manual)**
+
+**For final validation before release:**
+
+```bash
+# Set real Azure credentials
+export AZURE_STORAGE_ACCOUNT="your-account"
+export AZURE_STORAGE_CONTAINER="your-container"
+export AZURE_STORAGE_SAS="sv=2024-..."  # or AZURE_STORAGE_KEY
+
+# Run release gate against real Azure-backed Rust integration tests
+./scripts/release-gate.sh --azure
+```
+
+**Cost:** ~$0.01 per test run (minimal storage operations)
 
 ---
 
 ## By Task
+
+### "I want to write a C test"
+→ Read: TEST_QUICK_REFERENCE.md (Section 1)
+→ Add to: test/test_main.c
+→ Build: `make test-unit` or `make sanitize`
+
+### "I want to validate memory safety"
+→ Run: `make sanitize`
+→ Details: `test/SECURITY-TESTING.md`, Section 2
+
+### "I want to run stress tests before release"
+→ Run: `make test-stress` (5 min, 2× multiplier)
+→ Or: `make test-stress-heavy` (30 min, 4× multiplier)
+→ Custom: `SQLITE_OBJS_STRESS_MULTIPLIER=N make test-integration`
+
+### "I want to check code coverage"
+→ Run: `make coverage`
+→ View: `build/coverage-report/index.html`
+→ Details: `test/SECURITY-TESTING.md`, Section 4
+
+### "I want to test the TCL suite"
+→ Run: `make test-tcl-quick` (smoke, 1 min)
+→ Or: `make test-tcl` (full, 10 min)
+→ Status: `test/tcl-test-status.md`
+
+### "I want to write a Rust test"
+→ Create: `rust/sqlite-objs/tests/integration_test.rs`
+→ Build: `cd rust && cargo test`
+→ Example: `rust/sqlite-objs/examples/basic.rs`
+→ Details: rust/README.md
+
+### "Integration tests fail with AZURE_ERR_NETWORK"
+→ First check: `make test-integration` starts and manages local Azurite
+→ If testing real Azure: run `./scripts/release-gate.sh --azure`
+→ For retry/network chaos: Toxiproxy-style validation is still future work
+→ Tracking: See "Known Testing Gaps" above
+
+### "I want to debug a failed test"
+→ Build with debugging symbols: `make clean && make CFLAGS="-g -O0" test-unit`
+→ Run under gdb: `gdb ./build/test_main`
+→ Or use AddressSanitizer output: `make sanitize 2>&1 | grep -A 5 "ERROR"`
+
+---
+
+## Key Files in Codebase
+
+### Test Files
+- `/workspace/qbradley/sqlite-objs/test/test_harness.h` — Framework (TEST, ASSERT macros)
+- `/workspace/qbradley/sqlite-objs/test/test_main.c` — Entry point (includes all tests)
+- `/workspace/qbradley/sqlite-objs/test/test_vfs.c` — Unit tests (2500+ lines)
+- `/workspace/qbradley/sqlite-objs/test/test_integration.c` — Integration tests (Azurite)
+- `/workspace/qbradley/sqlite-objs/test/test_uri.c` — URI config tests
+- `/workspace/qbradley/sqlite-objs/test/test_coalesce.c` — Write coalescing tests
+- `/workspace/qbradley/sqlite-objs/test/test_wal.c` — WAL mode tests
+- `/workspace/qbradley/sqlite-objs/test/test_azure_client.c` — Azure client tests
+- `/workspace/qbradley/sqlite-objs/test/test_chaos.c` — Failure injection tests
+
+### Mock Implementation
+- `/workspace/qbradley/sqlite-objs/test/mock_azure_ops.h` — Public API (200 lines)
+- `/workspace/qbradley/sqlite-objs/test/mock_azure_ops.c` — Implementation (1040 lines)
+
+### Rust Tests
+- `/workspace/qbradley/sqlite-objs/rust/sqlite-objs-sys/src/lib.rs` — FFI tests
+- `/workspace/qbradley/sqlite-objs/rust/sqlite-objs/src/lib.rs` — API tests
+- `/workspace/qbradley/sqlite-objs/rust/sqlite-objs/tests/perf_matrix.rs` — Performance benchmarks
+
+---
+
+## Testing Workflow
+
+### Development Workflow
+
+```bash
+# 1. Make changes
+# 2. Quick validation (30 seconds)
+make test-unit
+
+# 3. Check memory safety (1 minute)
+make sanitize
+
+# 4. If Rust changes:
+cd rust && cargo test
+
+# 5. Before pushing PR:
+make test-tcl-quick
+make test-integration    # if Azure changes
+
+# 6. Final validation (before merge to main):
+make test-stress
+make test-tcl
+```
+
+### Release Workflow
+
+```bash
+# 1. All CI tests must pass
+make test-unit test-integration
+
+# 2. Sanitizers clean
+make sanitize
+
+# 3. TCL suite passes
+make test-tcl
+
+# 4. Stress tests pass (2×, 3 iterations)
+make test-stress
+
+# 5. (Optional) Heavy stress + property testing
+make test-stress-heavy
+make test-integration-extended
+
+# 6. Coverage ≥80% on src/
+make coverage
+
+# 7. Real Azure validation (if credentials available)
+./scripts/release-gate.sh --azure
+```
+
+---
+
+## Documentation Completeness
+
+✓ Test directory structure
+✓ Test declaration and registration
+✓ Mock blob storage implementation
+✓ Read/write operations with code
+✓ blob_get_properties signature and behavior
+✓ Failure injection mechanisms
+✓ VFS registration patterns
+✓ Persistence/reopening patterns
+✓ All assertion macros
+✓ Test harness framework
+✓ Unit vs integration tests
+✓ ✨ **EXTENDED: Fast gate commands** ← New (Phase 4)
+✓ ✨ **EXTENDED: Stress testing modes** ← New (Phase 4)
+✓ ✨ **EXTENDED: Sanitizer documentation** ← New (Phase 4)
+✓ ✨ **EXTENDED: Rust test integration** ← New (Phase 4)
+✓ ✨ **EXTENDED: Testing gaps & external deps** ← New (Phase 4)
+✓ Build and run commands
+✓ Complete working examples
+✓ Quick reference guide
+✓ Navigation index (this document)
+
+---
+
+## Support for Contributors
+
+- **Ask questions:** Check the "By Task" section above
+- **Report issues:** If tests fail unexpectedly, include:
+  - `make test-unit` output
+  - `make sanitize` output (if applicable)
+  - OS and compiler version
+  - Full error message with stack trace (if available)
+
+---
+
+**Last Updated:** June 28, 2026 (Phase 4 — Validation Documentation)
+**Codebase:** /workspace/qbradley/sqlite-objs
+**Contact:** Gimli (Rust Developer & Documentation Owner)
 
 ### "I want to write a test that opens a database with URI parameters"
 → Read: TEST_INFRASTRUCTURE_DETAILED.md, Section 2
@@ -275,4 +606,3 @@ sqlite_objs_vfs_register_with_ops(ops, ctx, 0);
 
 **Last Updated:** March 14, 2025
 **Codebase:** /Users/qbradley/src/sqlite
-

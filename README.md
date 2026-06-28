@@ -53,25 +53,71 @@ This produces:
 
 ## Testing
 
+### Fast Gate Commands (For Contributors)
+
+These are the primary validation commands for pre-commit and release prep:
+
+```bash
+# Unit tests (fast, ~30s, no external dependencies)
+make test-unit
+
+# Integration tests (requires Azurite, ~2min)
+npm install -g azurite  # One-time setup
+make test-integration
+
+# Extended validation (stress + property tests, ~10-30min)
+make test-stress                  # 2× multiplier, 3 iterations
+make test-stress-heavy            # 4× multiplier, 5 iterations (30+ min)
+make test-integration-extended    # 500+ property test operations
+
+# Sanitizers (memory safety, ~1min)
+make sanitize                      # AddressSanitizer + UBSan
+
+# Coverage report
+make coverage                      # Generates HTML coverage report
+
+# Official SQLite TCL test suite (comprehensive, ~5-10min)
+make test-tcl-quick               # Smoke test (5 tests)
+make test-tcl                      # Full suite (1187 test files)
+
+# Rust bindings (if Rust changes)
+cd rust && cargo test
+```
+
+### Validation Tiers
+
+| Tier | Commands | Time | When to Run | External Deps |
+|------|----------|------|------------|---------------|
+| **Gate** | `test-unit` | ~30s | Every commit (local) | None |
+| **Gate** | `sanitize` | ~1m | Before push | None |
+| **Gate** | `test-integration` | ~2m | Before PR | Azurite |
+| **Extended** | `test-stress` | ~5m | Release candidate | Azurite |
+| **Extended** | `test-stress-heavy` | ~30m | Final release validation | Azurite |
+| **Extended** | `test-tcl-quick` | ~1m | Before PR | None |
+| **Extended** | `test-tcl` | ~10m | Before release | None |
+| **Extended** | `test-integration-extended` | ~10m | Property-based validation | Azurite |
+
 ### Unit tests (no Azure required)
 
 ```bash
 make test-unit
 ```
 
-Runs 148 tests against mock Azure operations.
+Runs the mocked C unit suite, including VFS, Azure client, WAL, URI, chaos, and retry tests. Fast (~30s), suitable for pre-commit validation.
 
 ### Integration tests (requires Azurite)
 
 ```bash
-# Install Azurite (Azure Storage emulator)
+# Install Azurite (Azure Storage emulator) — one-time
 npm install -g azurite
 
 # Run integration tests
 make test-integration
 ```
 
-Runs 10 tests against a local Azurite instance.
+Runs the Azurite-backed integration suite, including multi-client, concurrency, crash recovery, snapshot isolation, and property/invariant tests (~2min).
+
+See [TEST_DOCS_INDEX.md](TEST_DOCS_INDEX.md) for advanced testing modes, stress testing, and sanitizer details.
 
 ### Benchmarks
 

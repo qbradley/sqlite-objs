@@ -65,31 +65,75 @@ cargo doc --open     # Generate and view documentation
 3. Update examples if API changes
 4. Run `cargo test --doc` for doctests
 
-### Testing Strategy
+## Development Workflow
 
-**Unit Tests (cargo test):**
-- FFI linkage verification
-- Config validation (null bytes, etc.)
-- No Azure connection required
+### Initial Setup
 
-**Integration Tests (manual):**
-- Requires Azurite or real Azure credentials
-- Test actual VFS operations
-- TODO: Add integration test suite
-
-**Example as Test:**
 ```bash
-cargo run --example basic  # Should succeed without errors
+cd rust
+cargo build          # Build all crates
+cargo test           # Run tests (FFI only, no Azure needed)
+cargo doc --open     # Generate and view documentation
 ```
 
-### Code Quality
+### Making Changes
 
+**To FFI bindings (sqlite-objs-sys):**
+1. Update `src/lib.rs` with new extern "C" declarations
+2. Update `build.rs` if new C sources added
+3. Run `cargo build` to verify compilation
+4. Run `cargo test` (basic linkage tests)
+
+**To safe wrapper (sqlite-objs):**
+1. Update `src/lib.rs` with safe Rust API
+2. Add tests in `#[cfg(test)] mod tests`
+3. Update examples if API changes
+4. Run `cargo test --doc` for doctests
+
+### Testing Strategy
+
+**Fast validation (pre-commit):**
+```bash
+cd rust && cargo test
+```
+
+**Full C + Rust validation:**
+```bash
+# From project root
+make test-unit        # C unit tests
+make sanitize         # Memory safety checks
+cd rust && cargo test -p sqlite-objs-sys  # Rust FFI tests
+cd rust && cargo test -p sqlite-objs      # Rust API tests
+```
+
+**Integration testing:**
+- For Layer 2 tests (Azurite), see main project docs: `../TEST_DOCS_INDEX.md`
+- Requires: `npm install -g azurite` and `make test-integration`
+
+**Code quality checks:**
 ```bash
 cargo fmt              # Format code
 cargo clippy           # Lint warnings
 cargo doc              # Check documentation builds
 cargo build --release  # Check optimized build
 ```
+
+**Running examples:**
+```bash
+cargo run --example basic      # Smoke test (should succeed)
+```
+
+**Contributing requirement:**
+Before submitting changes:
+1. Run `cargo fmt` to format code
+2. Run `cargo clippy` and fix warnings
+3. Run `cargo test` (all tests must pass)
+4. Run `cargo test --doc` (doctests pass)
+5. Run from project root: `make test-unit && make sanitize`
+6. Update documentation if API changes
+7. Add tests for new functionality
+
+See `../TEST_DOCS_INDEX.md` for complete testing documentation including stress tests, TCL suite, and known gaps.
 
 ## API Stability
 

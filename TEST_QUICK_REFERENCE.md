@@ -1,6 +1,39 @@
 # Test Infrastructure Quick Reference
 
-## 1. Minimal Test Example
+## ⚡ Fast Gate Commands (Pre-Commit Validation)
+
+For developers making changes, use these commands before committing:
+
+```bash
+# All-in-one validation (recommended for CI/PR prep)
+make test-unit && make sanitize && (cd rust && cargo test -p sqlite-objs-sys && cargo test -p sqlite-objs)
+
+# Or run individually:
+make test-unit        # Unit tests (30s, no dependencies)
+make sanitize         # Memory safety checks (1m)
+make test-tcl-quick   # SQLite test suite (1m)
+
+# For Azure/integration changes:
+npm install -g azurite 2>/dev/null
+make test-integration # Integration tests (2m, requires Azurite)
+```
+
+## ⏱️ Test Execution Times
+
+| Command | Duration | Dependencies |
+|---------|----------|--------------|
+| `make test-unit` | ~30s | None |
+| `make sanitize` | ~1m | None (clang/gcc) |
+| `make test-tcl-quick` | ~1m | None |
+| `make test-integration` | ~2m | Azurite (npm) |
+| `make test-stress` | ~5m | Azurite |
+| `make test-stress-heavy` | ~30m | Azurite |
+| `make test-integration-extended` | ~10m | Azurite |
+| `cargo test` (Rust) | ~2-5m | libcurl, OpenSSL |
+
+---
+
+# 1. Minimal Test Example
 
 ```c
 /* test_my_feature.c */
@@ -386,4 +419,3 @@ int is_leased = mock_is_leased(ctx, "name");
 int count = mock_get_write_record_count(ctx);
 mock_write_record_t rec = mock_get_write_record(ctx, 0);  /* offset, len */
 ```
-

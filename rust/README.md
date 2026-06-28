@@ -23,9 +23,62 @@ cargo build
 
 ## Testing
 
+### Unit Tests (FFI Layer)
+
 ```sh
-cargo test
+cargo test -p sqlite-objs-sys
 ```
+
+Tests FFI bindings:
+- `test_config_size` — Verify C struct layouts match Rust FFI
+- `test_register_uri` — Verify URI registration works
+- `test_fcntl_constants_match_header` — Check FCNTL constants
+
+### Integration Tests (High-Level API)
+
+```sh
+cargo test -p sqlite-objs
+```
+
+Tests safe Rust API:
+- URI builder URL encoding
+- Error handling and conversions
+- Configuration validation
+
+### Performance Benchmarks (Requires Azurite)
+
+```sh
+# Start Azurite first
+npm install -g azurite
+azurite-blob --silent --location /tmp/azurite &
+
+# Run performance matrix tests
+cargo test --test perf_matrix -- --nocapture
+
+# What it benchmarks:
+#  - Local SQLite (baseline)
+#  - sqlite-objs with Azurite (network latency)
+#  - Various workload patterns (OLTP, OLAP, etc.)
+```
+
+### Full Rust Validation
+
+```sh
+# Local tests only (no dependencies)
+cargo test --workspace
+
+# With Azurite (performance benchmarks)
+cd rust && cargo test --tests
+```
+
+## Contributing
+
+See main project [TEST_DOCS_INDEX.md](../TEST_DOCS_INDEX.md) for:
+- Fast gate commands
+- Sanitizer validation (`make sanitize`)
+- Stress testing modes
+- TCL test suite
+- Known testing gaps
 
 ## Example
 
