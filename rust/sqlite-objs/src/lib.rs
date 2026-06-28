@@ -237,7 +237,7 @@ fn registration_compatible(existing: RegistrationState, requested: RegistrationS
         /* URI opens remain available after env/config registration because
          * sqliteObjsOpen checks URI parameters before falling back to global
          * VFS configuration. */
-        (_, RegistrationMode::Uri) => true,
+        (_, RegistrationMode::Uri) if existing.make_default == requested.make_default => true,
         _ => false,
     }
 }
@@ -673,13 +673,27 @@ mod tests {
         let config = SqliteObjsConfig {
             account: "test\0account".to_string(),
             container: "container".to_string(),
-            sas_token: None,
+            sas_token: Some("token".to_string()),
             account_key: None,
             endpoint: None,
         };
 
         let result = SqliteObjsVfs::register_with_config(&config, false);
         assert!(matches!(result, Err(SqliteObjsError::InvalidConfig(_))));
+    }
+
+    #[test]
+    fn test_uri_registration_default_promotion_rejected() {
+        let existing = RegistrationState {
+            mode: RegistrationMode::Uri,
+            make_default: false,
+        };
+        let requested = RegistrationState {
+            mode: RegistrationMode::Uri,
+            make_default: true,
+        };
+
+        assert!(!registration_compatible(existing, requested));
     }
 
     #[test]
