@@ -1620,6 +1620,39 @@ TEST(vfs_journal_remote_presence_checked_on_reopen) {
     ASSERT_GT(mock_get_call_count(g_ctx, "block_blob_download"), 0);
 }
 
+TEST(vfs_journal_download_failure_fails_closed) {
+    setup();
+    sqlite3 *db = open_test_db(g_ctx);
+    ASSERT_NOT_NULL(db);
+    sqlite3_exec(db, "CREATE TABLE t(x);", NULL, NULL, NULL);
+    sqlite3_exec(db, "INSERT INTO t VALUES(1);", NULL, NULL, NULL);
+    close_test_db(db);
+
+    unsigned char remote_journal[] = "representative-remote-journal";
+    azure_error_t err;
+    azure_error_init(&err);
+    azure_err_t arc = g_ops->block_blob_upload(
+        g_ctx, "test.db-journal", remote_journal, sizeof(remote_journal), &err);
+    ASSERT_AZURE_OK(arc);
+
+    mock_set_fail_operation(g_ctx, "block_blob_download", AZURE_ERR_NETWORK);
+    sqlite3 *db2 = NULL;
+    int rc = sqlite3_open_v2("test.db", &db2,
+                              SQLITE_OPEN_READWRITE, "sqlite-objs");
+    if (rc == SQLITE_OK) {
+        sqlite3_stmt *stmt = NULL;
+        rc = sqlite3_prepare_v2(db2, "SELECT COUNT(*) FROM t;", -1,
+                                &stmt, NULL);
+        if (stmt) sqlite3_finalize(stmt);
+        ASSERT_NE(rc, SQLITE_OK);
+        sqlite3_close(db2);
+    } else if (db2) {
+        sqlite3_close(db2);
+    }
+    ASSERT_GT(mock_get_call_count(g_ctx, "block_blob_download"), 0);
+    mock_clear_failures(g_ctx);
+}
+
 TEST(vfs_journal_mode_truncate_removes_remote_journal) {
     setup();
     sqlite3 *db = open_test_db(g_ctx);
@@ -4157,6 +4190,7 @@ void run_vfs_tests(void) {
     RUN_TEST(vfs_journal_cached_absent_does_not_hide_remote_journal);
     RUN_TEST(vfs_journal_blob_exists_failure_fails_closed_without_cache_entry);
     RUN_TEST(vfs_journal_remote_presence_checked_on_reopen);
+    RUN_TEST(vfs_journal_download_failure_fails_closed);
     RUN_TEST(vfs_journal_mode_truncate_removes_remote_journal);
     RUN_TEST(vfs_journal_mode_truncate_delete_failure_returns_error);
     TEST_SUITE_END();

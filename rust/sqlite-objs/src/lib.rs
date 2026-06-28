@@ -237,8 +237,20 @@ fn registration_compatible(existing: RegistrationState, requested: RegistrationS
         /* URI opens remain available after env/config registration because
          * sqliteObjsOpen checks URI parameters before falling back to global
          * VFS configuration. */
-        (_, RegistrationMode::Uri) if existing.make_default == requested.make_default => true,
+        (RegistrationMode::Uri, RegistrationMode::Uri)
+            if existing.make_default == requested.make_default =>
+        {
+            true
+        }
         _ => false,
+    }
+}
+
+fn registration_mode_label(mode: RegistrationMode) -> &'static str {
+    match mode {
+        RegistrationMode::Env => "environment configuration",
+        RegistrationMode::Config(_) => "explicit configuration",
+        RegistrationMode::Uri => "URI-only mode",
     }
 }
 
@@ -255,8 +267,11 @@ where
             return Ok(());
         }
         return Err(SqliteObjsError::RegistrationFailed(format!(
-            "sqlite-objs VFS already registered as {:?}; safe reconfiguration to {:?} is not supported",
-            existing.mode, requested.mode
+            "sqlite-objs VFS already registered in {} with make_default={}; safe reconfiguration to {} with make_default={} is not supported",
+            registration_mode_label(existing.mode),
+            existing.make_default,
+            registration_mode_label(requested.mode),
+            requested.make_default
         )));
     }
 
@@ -571,6 +586,15 @@ impl UriBuilder {
 
         // Prefer SAS token over account key
         if let Some(sas) = &self.sas_token {
+            if sas.is_empty() {
+                if let Some(key) = &self.account_key {
+                    if !key.is_empty() {
+                        uri.push_str("&azure_key=");
+                        uri.push_str(&percent_encode(key));
+                    }
+                }
+                return uri;
+            }
             uri.push_str("&azure_sas=");
             uri.push_str(&percent_encode(sas));
         } else if let Some(key) = &self.account_key {
@@ -654,7 +678,7 @@ mod tests {
     }
 
     #[test]
-    fn test_config_with_sas() {
+    fn test_config_with_sas_validates_required_fields() {
         let config = SqliteObjsConfig {
             account: "testaccount".to_string(),
             container: "testcontainer".to_string(),
@@ -663,9 +687,7 @@ mod tests {
             endpoint: None,
         };
 
-        // This will fail since we don't have real Azure creds,
-        // but it tests the FFI layer
-        let _ = SqliteObjsVfs::register_with_config(&config, false);
+        validate_required_config(&config).expect("valid config");
     }
 
     #[test]
@@ -691,6 +713,20 @@ mod tests {
         let requested = RegistrationState {
             mode: RegistrationMode::Uri,
             make_default: true,
+        };
+
+        assert!(!registration_compatible(existing, requested));
+    }
+
+    #[test]
+    fn test_config_to_uri_registration_transition_rejected() {
+        let existing = RegistrationState {
+            mode: RegistrationMode::Config(123),
+            make_default: false,
+        };
+        let requested = RegistrationState {
+            mode: RegistrationMode::Uri,
+            make_default: false,
         };
 
         assert!(!registration_compatible(existing, requested));
@@ -870,6 +906,17 @@ mod tests {
             .try_build()
             .expect("valid URI");
         assert!(uri.contains("azure_sas=token"));
+    }
+
+    #[test]
+    fn test_uri_builder_try_build_empty_sas_falls_back_to_key() {
+        let uri = UriBuilder::new("test.db", "account", "container")
+            .sas_token("")
+            .account_key("key")
+            .try_build()
+            .expect("valid URI");
+        assert!(!uri.contains("azure_sas="));
+        assert!(uri.contains("azure_key=key"));
     }
 
     #[test]

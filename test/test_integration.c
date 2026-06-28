@@ -608,7 +608,7 @@ TEST(batch_lease_renewal_path_does_not_deadlock) {
     };
 
     azure_test_set_batch_lease_renewal_seconds(0);
-    azure_test_set_batch_lease_renew_result(1, AZURE_OK);
+    azure_test_set_batch_lease_renew_result(0, AZURE_OK);
     rc = g_ops->page_blob_write_batch(
         g_ctx, blob, ranges, 2, lease_id, NULL, &err);
     ASSERT_AZURE_OK(rc);
@@ -622,6 +622,43 @@ TEST(batch_lease_renewal_path_does_not_deadlock) {
     azure_test_set_batch_lease_renewal_seconds(-1);
     rc = g_ops->lease_release(g_ctx, blob, lease_id, &err);
     ASSERT_AZURE_OK(rc);
+    cleanup_blob(blob);
+}
+
+TEST(batch_lease_renewal_failure_propagates_error) {
+    const char *blob = "batch-renew-fail.db";
+    cleanup_blob(blob);
+
+    azure_error_t err;
+    azure_error_init(&err);
+    azure_err_t rc = g_ops->page_blob_create(g_ctx, blob, 1024, &err);
+    ASSERT_AZURE_OK(rc);
+
+    char lease_id[64];
+    rc = g_ops->lease_acquire(g_ctx, blob, 60, lease_id, sizeof(lease_id), &err);
+    ASSERT_AZURE_OK(rc);
+
+    uint8_t data[1024];
+    memset(data, 0x7C, sizeof(data));
+    azure_page_range_t ranges[2] = {
+        { .offset = 0, .data = data, .len = 512 },
+        { .offset = 512, .data = data + 512, .len = 512 }
+    };
+
+    azure_test_set_batch_lease_renewal_seconds(0);
+    azure_test_set_batch_lease_renew_result(1, AZURE_ERR_AUTH);
+    rc = g_ops->page_blob_write_batch(
+        g_ctx, blob, ranges, 2, lease_id, NULL, &err);
+    ASSERT_AZURE_ERR(rc, AZURE_ERR_AUTH);
+    ASSERT_GT(azure_test_get_batch_lease_renew_count(), 0);
+
+    int lock_rc = pthread_mutex_trylock(&g_client->mutex);
+    ASSERT_EQ(lock_rc, 0);
+    pthread_mutex_unlock(&g_client->mutex);
+
+    azure_test_set_batch_lease_renew_result(0, AZURE_OK);
+    azure_test_set_batch_lease_renewal_seconds(-1);
+    (void)g_ops->lease_release(g_ctx, blob, lease_id, &err);
     cleanup_blob(blob);
 }
 
@@ -5481,6 +5518,7 @@ int main(void) {
     RUN_TEST(lease_break);
     RUN_TEST(batch_reqs_alloc_failure_releases_mutex);
     RUN_TEST(batch_lease_renewal_path_does_not_deadlock);
+    RUN_TEST(batch_lease_renewal_failure_propagates_error);
     TEST_SUITE_END();
 
     /* Run VFS integration tests */

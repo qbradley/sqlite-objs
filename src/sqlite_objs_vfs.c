@@ -3480,7 +3480,14 @@ static int sqliteObjsOpen(sqlite3_vfs *pVfs, sqlite3_filename zName,
             azure_error_init(&aerr);
             azure_err_t arc = p->ops->block_blob_download(
                 p->ops_ctx, zName, &buf, &aerr);
-            if (arc == AZURE_OK && buf.data && buf.size > 0) {
+            if (arc != AZURE_OK) {
+                p->metrics.azure_errors++;
+                free(buf.data);
+                sqlite3_free(p->zBlobName);
+                p->zBlobName = NULL;
+                return azureErrToSqlite(arc, SQLITE_CANTOPEN);
+            }
+            if (buf.data && buf.size > 0) {
                 int rc = jrnlBufferEnsure(p, (sqlite3_int64)buf.size);
                 if (rc == SQLITE_OK) {
                     memcpy(p->aJrnlData, buf.data, buf.size);

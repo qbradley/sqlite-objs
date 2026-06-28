@@ -2266,6 +2266,7 @@ static azure_err_t az_page_blob_write_batch(
         int still_running = 0;
         time_t last_renewal = time(NULL);
         int lease_lost = 0;
+        azure_err_t lease_err = AZURE_OK;
 
         double batch_t0 = 0;
         if (az_debug_timing()) batch_t0 = az_time_ms();
@@ -2281,6 +2282,8 @@ static azure_err_t az_page_blob_write_batch(
                 fprintf(stderr,
                         "[sqlite-objs] batch write: lease renewal failed (%s), aborting\n",
                         azure_err_str(lrc));
+                *err = le;
+                lease_err = lrc;
                 lease_lost = 1;
             }
             last_renewal = time(NULL);
@@ -2310,6 +2313,8 @@ static azure_err_t az_page_blob_write_batch(
                                 "[sqlite-objs] batch write: lease renewal "
                                 "failed (%s), aborting\n",
                                 azure_err_str(lrc));
+                        *err = le;
+                        lease_err = lrc;
                         lease_lost = 1;
                         break;
                     }
@@ -2390,10 +2395,13 @@ static azure_err_t az_page_blob_write_batch(
         if (lease_lost) {
             free(done);
             pthread_mutex_unlock(&c->mutex);
-            err->code = AZURE_ERR_LEASE_EXPIRED;
-            snprintf(err->error_message, sizeof(err->error_message),
-                     "Lease lost during batch write");
-            return AZURE_ERR_LEASE_EXPIRED;
+            if (lease_err == AZURE_OK) lease_err = AZURE_ERR_LEASE_EXPIRED;
+            err->code = lease_err;
+            if (!err->error_message[0]) {
+                snprintf(err->error_message, sizeof(err->error_message),
+                         "Lease renewal failed during batch write");
+            }
+            return lease_err;
         }
 
         result = attempt_err;

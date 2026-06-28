@@ -32,5 +32,9 @@ jobs:
       - name: Install Azurite
         run: npm install -g azurite
 
+      - name: Provision SQLite TCL source
+        run: |
+          git clone --depth=1 --branch version-3.52.0 https://github.com/sqlite/sqlite.git test/sqlite-src
+
       - name: Validate
         run: ./scripts/release-gate.sh --extended

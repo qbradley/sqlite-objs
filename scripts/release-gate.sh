@@ -57,7 +57,7 @@ bold()   { printf '\033[1m%s\033[0m' "$*"; }
 
 run_gate() {
     local name="$1"; shift
-    local start elapsed status
+    local start elapsed status rc
 
     printf "  %-46s " "$name"
     start=$(date +%s)
@@ -71,12 +71,31 @@ run_gate() {
 
     set +e
     if [[ "$name" == *"sanitizer"* || "$name" == *"Sanitizer"* ]]; then
-        ASAN_OPTIONS="${ASAN_OPTIONS:-handle_segv=0}" \
-        LSAN_OPTIONS="${LSAN_OPTIONS:-detect_leaks=0}" "$@" > "$logfile" 2>&1
+        (
+            ASAN_OPTIONS="${ASAN_OPTIONS:-handle_segv=0}" \
+            LSAN_OPTIONS="${LSAN_OPTIONS:-detect_leaks=0}" "$@"
+        ) > "$logfile" 2>&1 &
+        local pid=$!
+        local waited=0
+        while kill -0 "$pid" 2>/dev/null; do
+            if [ "$waited" -ge "$GATE_TIMEOUT" ]; then
+                kill "$pid" 2>/dev/null || true
+                wait "$pid" 2>/dev/null || true
+                echo "TIMEOUT after ${GATE_TIMEOUT}s" >> "$logfile"
+                rc=124
+                break
+            fi
+            sleep 1
+            waited=$((waited + 1))
+        done
+        if [ "${rc:-0}" -ne 124 ]; then
+            wait "$pid"
+            rc=$?
+        fi
     else
         timeout "$GATE_TIMEOUT" "$@" > "$logfile" 2>&1
+        rc=$?
     fi
-    local rc=$?
     set -e
     if [ "$rc" -eq 0 ]; then
         status="PASS"
@@ -410,6 +429,12 @@ if [ "$FAIL_COUNT" -gt 0 ]; then
     red "  ❌ ALPHA RELEASE GATE FAILED"
     echo ""
     echo "  Review gate logs above or in: $REPORT"
+    echo ""
+    exit 1
+elif $FULL && [ "$SKIP_COUNT" -gt 0 ]; then
+    red "  ❌ FULL RELEASE GATE INCOMPLETE"
+    echo ""
+    echo "  Full mode requires zero skipped gates. Review: $REPORT"
     echo ""
     exit 1
 else

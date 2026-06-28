@@ -278,8 +278,8 @@ fn uri_builder_empty_sas_token() {
         .build();
 
     assert!(
-        uri.contains("azure_sas="),
-        "Empty SAS token should be included"
+        !uri.contains("azure_sas="),
+        "Empty SAS token should be omitted"
     );
 }
 
