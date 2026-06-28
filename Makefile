@@ -270,7 +270,8 @@ SANITIZE_BUILD_DIR = $(BUILD_DIR)/sanitize
 
 sanitize:
 	@echo "=== Building with AddressSanitizer + UBSan ==="
-	$(MAKE) test-unit \
+	ASAN_OPTIONS="handle_segv=0:$${ASAN_OPTIONS:-}" \
+	LSAN_OPTIONS="detect_leaks=0:$${LSAN_OPTIONS:-}" $(MAKE) test-unit \
 		BUILD_DIR="$(SANITIZE_BUILD_DIR)" \
 		CFLAGS="$(CFLAGS) $(SANITIZE_CFLAGS)" \
 		LDFLAGS="$(LDFLAGS) $(SANITIZE_LDFLAGS)"

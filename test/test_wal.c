@@ -785,6 +785,14 @@ TEST(wal_recovery_downloads_existing_wal) {
     rc = wal_exec(db, "PRAGMA wal_checkpoint(TRUNCATE);");
     ASSERT_OK(rc);
 
+    int64_t main_size = mock_get_page_blob_size(wal_ctx, "walrecov.db");
+    ASSERT_GT(main_size, (int64_t)0);
+    const uint8_t *main_data = mock_get_page_blob_data(wal_ctx, "walrecov.db");
+    ASSERT_NOT_NULL(main_data);
+    unsigned char *main_copy = (unsigned char *)malloc((size_t)main_size);
+    ASSERT_NOT_NULL(main_copy);
+    memcpy(main_copy, main_data, (size_t)main_size);
+
     /* Write more data (stays in WAL only — not checkpointed) */
     rc = wal_exec(db, "INSERT INTO t VALUES(2, 'wal-only-data');");
     ASSERT_OK(rc);
@@ -804,14 +812,32 @@ TEST(wal_recovery_downloads_existing_wal) {
     wal_close_db(db);
     db = NULL;
 
+    /* Restore main DB to the pre-WAL-only snapshot so row 2 can only appear
+    ** by replaying the restored WAL blob below. */
+    azure_error_t aerr;
+    azure_error_init(&aerr);
+    azure_err_t arc = wal_base_ops->page_blob_create(
+        wal_ctx, "walrecov.db", main_size, &aerr);
+    ASSERT_AZURE_OK(arc);
+    int64_t off = 0;
+    while (off < main_size) {
+        size_t chunk = (size_t)(main_size - off);
+        if (chunk > 4 * 1024 * 1024) chunk = 4 * 1024 * 1024;
+        arc = wal_base_ops->page_blob_write(
+            wal_ctx, "walrecov.db", off, main_copy + off,
+            chunk, NULL, NULL, &aerr);
+        ASSERT_AZURE_OK(arc);
+        off += (int64_t)chunk;
+    }
+    free(main_copy);
+
     /* Phase 2: Simulate crash recovery scenario.
     ** The page blob from phase 1 survives (Azure persists it).
     ** Re-upload the WAL data as a block blob to simulate Azure state
     ** after a crash (WAL append blob still present). The mock's
     ** block_blob_download is type-strict, so upload as block blob. */
-    azure_error_t aerr;
     azure_error_init(&aerr);
-    azure_err_t arc = wal_base_ops->block_blob_upload(
+    arc = wal_base_ops->block_blob_upload(
         wal_ctx, "walrecov.db-wal", wal_copy, (size_t)wal_size, &aerr);
     ASSERT_AZURE_OK(arc);
     free(wal_copy);
