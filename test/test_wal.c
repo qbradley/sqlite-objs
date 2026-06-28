@@ -840,6 +840,15 @@ TEST(wal_recovery_downloads_existing_wal) {
     int dl_count = mock_get_call_count(wal_ctx, "block_blob_download");
     ASSERT_GT(dl_count, 0);
 
+    sqlite3_stmt *stmt = NULL;
+    rc = sqlite3_prepare_v2(db, "SELECT val FROM t WHERE id = 2;",
+                             -1, &stmt, NULL);
+    ASSERT_OK(rc);
+    rc = sqlite3_step(stmt);
+    ASSERT_EQ(rc, SQLITE_ROW);
+    ASSERT_STR_EQ((const char *)sqlite3_column_text(stmt, 0), "wal-only-data");
+    sqlite3_finalize(stmt);
+
     wal_close_db(db);
 }
 

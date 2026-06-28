@@ -70,7 +70,7 @@ For each targeted invariant test added in Phases 1-3, record evidence that it fa
 - Added mock/VFS coverage that first caches `test.db-journal` as absent, then creates remote journal blob state and verifies both direct `xAccess` and SQLite reopen paths perform authoritative journal discovery.
 - Added recovery-artifact fail-closed coverage for `blob_exists` failures when no journal cache entry exists.
 - Added `TRUNCATE` journal cleanup coverage proving remote journal deletion and delete-failure propagation.
-- Added WAL checkpoint/truncate delete-failure coverage.
+- Added WAL checkpoint/truncate delete-failure coverage and strengthened existing WAL recovery coverage to assert recovered WAL-only data after reopen.
 - Fail-first/equivalent evidence: the new stale-cached-absence test directly exercises the previously unsafe cache path; the new journal/WAL cleanup failure tests target code paths that previously ignored or skipped remote cleanup errors.
 
 ---
@@ -106,7 +106,8 @@ For each targeted invariant test added in Phases 1-3, record evidence that it fa
 - Replaced recursive lease renewal inside production batch writes with a mutex-held renewal path using a temporary CURL easy handle instead of `execute_with_retry`.
 - Fixed the per-attempt batch request allocation failure path to unlock the Azure client mutex before returning.
 - Added integration coverage that injects batch request allocation failure and verifies the client mutex is released.
-- Fail-first/equivalent evidence: the allocation-failure hook targets the previously leaked-mutex branch directly; existing batch partial-failure tests continue to verify VFS error propagation and the integration test proves the remediated cleanup path leaves the client usable.
+- Added deterministic integration coverage that forces the batch lease-renewal path to run and verifies it completes without deadlock or client mutex poisoning.
+- Fail-first/equivalent evidence: the allocation-failure hook targets the previously leaked-mutex branch directly; the lease-renewal override drives the previously deadlocking renewal branch; existing batch partial-failure tests continue to verify VFS error propagation.
 
 ---
 

@@ -587,6 +587,44 @@ TEST(batch_reqs_alloc_failure_releases_mutex) {
     pthread_mutex_unlock(&g_client->mutex);
 }
 
+TEST(batch_lease_renewal_path_does_not_deadlock) {
+    const char *blob = "batch-renew.db";
+    cleanup_blob(blob);
+
+    azure_error_t err;
+    azure_error_init(&err);
+    azure_err_t rc = g_ops->page_blob_create(g_ctx, blob, 1024, &err);
+    ASSERT_AZURE_OK(rc);
+
+    char lease_id[64];
+    rc = g_ops->lease_acquire(g_ctx, blob, 60, lease_id, sizeof(lease_id), &err);
+    ASSERT_AZURE_OK(rc);
+
+    uint8_t data[1024];
+    memset(data, 0x6B, sizeof(data));
+    azure_page_range_t ranges[2] = {
+        { .offset = 0, .data = data, .len = 512 },
+        { .offset = 512, .data = data + 512, .len = 512 }
+    };
+
+    azure_test_set_batch_lease_renewal_seconds(0);
+    azure_test_set_batch_lease_renew_result(1, AZURE_OK);
+    rc = g_ops->page_blob_write_batch(
+        g_ctx, blob, ranges, 2, lease_id, NULL, &err);
+    ASSERT_AZURE_OK(rc);
+    ASSERT_GT(azure_test_get_batch_lease_renew_count(), 0);
+
+    int lock_rc = pthread_mutex_trylock(&g_client->mutex);
+    ASSERT_EQ(lock_rc, 0);
+    pthread_mutex_unlock(&g_client->mutex);
+
+    azure_test_set_batch_lease_renew_result(0, AZURE_OK);
+    azure_test_set_batch_lease_renewal_seconds(-1);
+    rc = g_ops->lease_release(g_ctx, blob, lease_id, &err);
+    ASSERT_AZURE_OK(rc);
+    cleanup_blob(blob);
+}
+
 /* ================================================================
  * Test: URI Open with Azurite Params
  * Open a database via URI with Azurite credentials, insert data,
@@ -5449,6 +5487,7 @@ int main(void) {
     RUN_TEST(page_blob_resize);
     RUN_TEST(lease_break);
     RUN_TEST(batch_reqs_alloc_failure_releases_mutex);
+    RUN_TEST(batch_lease_renewal_path_does_not_deadlock);
     TEST_SUITE_END();
 
     /* Run VFS integration tests */

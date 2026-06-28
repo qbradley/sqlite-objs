@@ -194,6 +194,9 @@ void azure_test_set_retry_hook(azure_retry_hook_fn hook, void *ctx);
  * allocation to fail. Used to verify cleanup/unlock behavior without relying
  * on memory pressure. */
 void azure_test_fail_next_batch_reqs_alloc(int fail);
+void azure_test_set_batch_lease_renewal_seconds(int seconds);
+void azure_test_set_batch_lease_renew_result(int enabled, azure_err_t result);
+int azure_test_get_batch_lease_renew_count(void);
 
 #endif /* SQLITE_OBJS_TEST */
 

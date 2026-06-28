@@ -104,6 +104,10 @@ static double az_time_ms(void) {
 static azure_retry_hook_fn g_retry_hook = NULL;
 static void *g_retry_hook_ctx = NULL;
 static int g_fail_next_batch_reqs_alloc = 0;
+static int g_batch_lease_renewal_sec_override = -1;
+static int g_batch_lease_renew_result_enabled = 0;
+static azure_err_t g_batch_lease_renew_result = AZURE_OK;
+static int g_batch_lease_renew_count = 0;
 
 void azure_test_set_retry_hook(azure_retry_hook_fn hook, void *ctx) {
     g_retry_hook = hook;
@@ -112,6 +116,20 @@ void azure_test_set_retry_hook(azure_retry_hook_fn hook, void *ctx) {
 
 void azure_test_fail_next_batch_reqs_alloc(int fail) {
     g_fail_next_batch_reqs_alloc = fail ? 1 : 0;
+}
+
+void azure_test_set_batch_lease_renewal_seconds(int seconds) {
+    g_batch_lease_renewal_sec_override = seconds;
+}
+
+void azure_test_set_batch_lease_renew_result(int enabled, azure_err_t result) {
+    g_batch_lease_renew_result_enabled = enabled ? 1 : 0;
+    g_batch_lease_renew_result = result;
+    g_batch_lease_renew_count = 0;
+}
+
+int azure_test_get_batch_lease_renew_count(void) {
+    return g_batch_lease_renew_count;
 }
 #endif /* SQLITE_OBJS_TEST */
 
@@ -1921,6 +1939,19 @@ static azure_err_t batch_lease_renew_locked(
         return AZURE_ERR_INVALID_ARG;
     }
 
+#ifdef SQLITE_OBJS_TEST
+    g_batch_lease_renew_count++;
+    if (g_batch_lease_renew_result_enabled) {
+        azure_error_init(err);
+        err->code = g_batch_lease_renew_result;
+        if (g_batch_lease_renew_result != AZURE_OK) {
+            snprintf(err->error_message, sizeof(err->error_message),
+                     "injected batch lease renewal result");
+        }
+        return g_batch_lease_renew_result;
+    }
+#endif
+
     azure_err_t rc = AZURE_OK;
     azure_response_headers_t rh;
     CURL *curl = NULL;
@@ -2241,6 +2272,21 @@ static azure_err_t az_page_blob_write_batch(
 
         curl_multi_perform(multi, &still_running);
 
+#ifdef SQLITE_OBJS_TEST
+        if (lease_id && *lease_id && g_batch_lease_renewal_sec_override == 0) {
+            azure_error_t le;
+            azure_error_init(&le);
+            azure_err_t lrc = batch_lease_renew_locked(c, name, lease_id, &le);
+            if (lrc != AZURE_OK) {
+                fprintf(stderr,
+                        "[sqlite-objs] batch write: lease renewal failed (%s), aborting\n",
+                        azure_err_str(lrc));
+                lease_lost = 1;
+            }
+            last_renewal = time(NULL);
+        }
+#endif
+
         while (still_running > 0) {
             curl_multi_wait(multi, NULL, 0, 1000, NULL);
             curl_multi_perform(multi, &still_running);
@@ -2248,7 +2294,13 @@ static azure_err_t az_page_blob_write_batch(
             /* Renew lease to prevent 30s expiry during large flushes */
             if (lease_id && *lease_id) {
                 time_t now = time(NULL);
-                if (now - last_renewal >= BATCH_LEASE_RENEWAL_SEC) {
+                int renewAfter = BATCH_LEASE_RENEWAL_SEC;
+#ifdef SQLITE_OBJS_TEST
+                if (g_batch_lease_renewal_sec_override >= 0) {
+                    renewAfter = g_batch_lease_renewal_sec_override;
+                }
+#endif
+                if (!lease_lost && now - last_renewal >= renewAfter) {
                     azure_error_t le;
                     azure_error_init(&le);
                     azure_err_t lrc = batch_lease_renew_locked(c, name,
