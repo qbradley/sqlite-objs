@@ -35,16 +35,10 @@ sudo apt-get install libcurl4-openssl-dev libssl-dev
 
 ## Building
 
-### Development build (stub Azure client, for unit tests)
+### Build
 
 ```bash
 make all
-```
-
-### Production build (real Azure client)
-
-```bash
-make all-production
 ```
 
 This produces:
@@ -61,7 +55,7 @@ These are the primary validation commands for pre-commit and release prep:
 # Unit tests (fast, ~30s, no external dependencies)
 make test-unit
 
-# Integration tests (requires Azurite, ~2min)
+# Integration tests (requires Azurite, ~2min; strict mode by default)
 npm install -g azurite  # One-time setup
 make test-integration
 
@@ -130,7 +124,7 @@ cd benchmark
 make && ./benchmark --local-only --size 25
 
 # Full comparison (requires Azure credentials)
-make all-production
+make all
 export AZURE_STORAGE_ACCOUNT=myaccount
 export AZURE_STORAGE_KEY=mykey
 export AZURE_STORAGE_CONTAINER=benchmarks
@@ -292,10 +286,10 @@ This enables opening databases across different Azure accounts and containers wi
 
 ## Limitations
 
-- **Journal mode only**: WAL mode not supported (no shared memory over Azure)
+- **WAL requires exclusive locking**: Shared-memory WAL is not supported over Azure; use `PRAGMA locking_mode=EXCLUSIVE` before enabling WAL.
 - **Single writer**: One machine can write at a time (lease-based)
-- **Full download**: Entire database loaded into memory on open
-- **No streaming**: Not suitable for databases larger than available RAM
+- **Default full download**: Databases are downloaded on open unless URI mode uses `prefetch=none`
+- **Local cache required**: Database pages are cached locally and revalidated with ETags when cache reuse is enabled
 
 ## Roadmap
 

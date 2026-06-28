@@ -63,7 +63,7 @@ let uri = UriBuilder::new("mydb.db", "myaccount", "databases")
     .sas_token("sv=2024-08-04&ss=b&srt=sco&sp=rwdlacyx&se=2026-01-01T00:00:00Z&sig=abc123")
     .cache_dir("/var/cache/myapp")
     .cache_reuse(true)  // Persist cache across connections (ETag revalidation)
-    .build();
+    .try_build()?;
 
 let conn = Connection::open_with_flags_and_vfs(
     &uri,
@@ -125,7 +125,7 @@ use sqlite_objs::{UriBuilder, PrefetchMode};
 let uri = UriBuilder::new("big.db", "acct", "cont")
     .sas_token("tok")
     .prefetch(PrefetchMode::None)
-    .build();
+    .try_build()?;
 ```
 
 ### Cache Reuse
@@ -137,7 +137,7 @@ let uri = UriBuilder::new("mydb.db", "acct", "cont")
     .sas_token("tok")
     .cache_dir("/var/cache/myapp")
     .cache_reuse(true)  // Keep cache file, revalidate via ETag
-    .build();
+    .try_build()?;
 ```
 
 ## Metrics

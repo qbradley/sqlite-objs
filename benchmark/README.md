@@ -20,12 +20,12 @@ Build with stub Azure client (local-only benchmarks):
 make
 ```
 
-### Production Build (Full Azure Support)
+### Azure Build (Full Azure Support)
 
-Build with real Azure client (requires libcurl and OpenSSL):
+Build with the sqlite-objs VFS and Azure client (requires libcurl and OpenSSL):
 
 ```bash
-make all-production
+make all
 ```
 
 Dependencies:
@@ -184,7 +184,7 @@ The in-memory cache (D4) significantly reduces the gap by eliminating repeated b
 Check that the production build was used:
 ```bash
 make clean
-make all-production
+make all
 ```
 
 ### Azure benchmark fails with environment variable errors
@@ -214,8 +214,7 @@ Example GitHub Actions workflow:
     AZURE_STORAGE_KEY: ${{ secrets.AZURE_STORAGE_KEY }}
     AZURE_STORAGE_CONTAINER: ci-benchmarks
   run: |
-    cd benchmark
-    make all-production
+    make all
     ./benchmark --size 50 --output csv > results.csv
     
 - name: Upload results

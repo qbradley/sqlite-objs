@@ -62,7 +62,7 @@
    - Essential files and test execution pattern
    - Mock context usage and failure injection
    - Page cache architecture and write recording
-   - Environment variables (SQLITE_OBJS_CACHE_PAGES, SQLITE_OBJS_DEBUG_TIMING)
+   - Runtime configuration notes (`SQLITE_OBJS_DEBUG_TIMING`, `AZURITE_LOOSE`)
    - Common test patterns
 
 ---
@@ -75,6 +75,9 @@
 # Unit tests + sanitizers (1-2 minutes)
 make test-unit
 make sanitize
+
+# Azurite-backed integration tests (strict mode by default)
+make test-integration
 
 # Add Rust binding tests if modified Rust code
 cd rust && cargo test
@@ -422,17 +425,17 @@ make coverage
 ## Key Files in Codebase
 
 ### Test Files
-- `/Users/qbradley/src/sqlite/test/test_harness.h` — Framework (TEST, ASSERT macros)
-- `/Users/qbradley/src/sqlite/test/test_main.c` — Entry point (includes all tests)
-- `/Users/qbradley/src/sqlite/test/test_vfs.c` — Unit tests (2500+ lines)
-- `/Users/qbradley/src/sqlite/test/test_integration.c` — Integration tests (Azurite)
-- `/Users/qbradley/src/sqlite/test/test_uri.c` — URI config tests
-- `/Users/qbradley/src/sqlite/test/test_coalesce.c` — Write coalescing tests
-- `/Users/qbradley/src/sqlite/test/test_wal.c` — WAL mode tests
+- `test/test_harness.h` — Framework (TEST, ASSERT macros)
+- `test/test_main.c` — Entry point (includes all tests)
+- `test/test_vfs.c` — Unit tests
+- `test/test_integration.c` — Integration tests (Azurite)
+- `test/test_uri.c` — URI config tests
+- `test/test_coalesce.c` — Write coalescing tests
+- `test/test_wal.c` — WAL mode tests
 
 ### Mock Implementation
-- `/Users/qbradley/src/sqlite/test/mock_azure_ops.h` — Public API (200 lines)
-- `/Users/qbradley/src/sqlite/test/mock_azure_ops.c` — Implementation (1040 lines)
+- `test/mock_azure_ops.h` — Public API
+- `test/mock_azure_ops.c` — Implementation
 
 ### Key Functions in mock_azure_ops.c
 - `mock_azure_create()` line 816 — Allocate context
@@ -605,4 +608,4 @@ sqlite_objs_vfs_register_with_ops(ops, ctx, 0);
 ---
 
 **Last Updated:** March 14, 2025
-**Codebase:** /Users/qbradley/src/sqlite
+**Codebase:** qbradley/sqlite-objs

@@ -28,15 +28,19 @@ rusqlite = "0.32"
 ### URI Mode (Recommended)
 
 ```rust
-use sqlite_objs::SqliteObjsVfs;
+use sqlite_objs::{SqliteObjsVfs, UriBuilder};
 use rusqlite::{Connection, OpenFlags};
 
 // Register VFS once at startup
 SqliteObjsVfs::register_uri(false)?;
 
 // Open database with Azure credentials in URI
+let uri = UriBuilder::new("mydb.db", "myaccount", "databases")
+    .sas_token("sv=2024...")
+    .try_build()?;
+
 let conn = Connection::open_with_flags_and_vfs(
-    "file:mydb.db?azure_account=myaccount&azure_container=databases&azure_sas=sv=2024...",
+    &uri,
     OpenFlags::SQLITE_OPEN_READ_WRITE 
         | OpenFlags::SQLITE_OPEN_CREATE 
         | OpenFlags::SQLITE_OPEN_URI,
@@ -82,6 +86,8 @@ let config = SqliteObjsConfig {
 
 SqliteObjsVfs::register_with_config(&config, false)?;
 ```
+
+Safe registration is process-wide and idempotent for the same mode. Use URI mode when different databases need different Azure accounts or containers.
 
 ## Testing with Azurite
 

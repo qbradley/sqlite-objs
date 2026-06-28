@@ -240,7 +240,7 @@ static int run_benchmark(benchmark_config_t *config) {
                          "sqlite-objs");
 #else
     fprintf(stderr, "Error: URI mode requested but binary not built with Azure support\n");
-    fprintf(stderr, "Build with 'make all-production' to enable Azure mode\n");
+    fprintf(stderr, "Build with 'make all' to enable Azure mode\n");
     return 1;
 #endif
   } else if (config->use_azure) {
@@ -258,7 +258,7 @@ static int run_benchmark(benchmark_config_t *config) {
                          "sqlite-objs");
 #else
     fprintf(stderr, "Error: Azure mode requested but binary not built with Azure support\n");
-    fprintf(stderr, "Build with 'make all-production' to enable Azure mode\n");
+    fprintf(stderr, "Build with 'make all' to enable Azure mode\n");
     return 1;
 #endif
   } else {

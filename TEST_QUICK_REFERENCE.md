@@ -349,7 +349,7 @@ TEST(cleanup_example) {
 ## 8. Build Command
 
 ```bash
-cd /Users/qbradley/src/sqlite
+cd /workspace/qbradley/sqlite-objs
 
 gcc -o test_runner \
     test/test_main.c \

@@ -71,7 +71,7 @@ echo
 # Build the production shell
 echo -e "${YELLOW}Building sqlite-objs-shell with production Azure client...${NC}"
 make clean > /dev/null 2>&1
-if ! make all-production > /dev/null 2>&1; then
+if ! make all > /dev/null 2>&1; then
     echo -e "${RED}ERROR: Build failed. Check that libcurl and OpenSSL are installed.${NC}"
     echo "On macOS with Homebrew:"
     echo "  brew install curl openssl@3"

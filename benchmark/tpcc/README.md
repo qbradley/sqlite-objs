@@ -37,7 +37,7 @@ This builds `tpcc-local` which runs against standard SQLite.
 ### Full version (with Azure support):
 
 ```bash
-make all-production
+make all
 ```
 
 This builds both `tpcc-local` and `tpcc-azure` (which can use the sqlite-objs VFS).

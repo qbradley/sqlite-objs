@@ -1,10 +1,10 @@
 # SQLite-Objs VFS Test Infrastructure — Quick Reference
 
 ## Essential Files
-- `/Users/qbradley/src/sqlite/test/test_harness.h` — Test macros & framework
-- `/Users/qbradley/src/sqlite/test/mock_azure_ops.h/c` — Mock Azure ops
-- `/Users/qbradley/src/sqlite/test/test_vfs.c` — 105 integration tests
-- `/Users/qbradley/src/sqlite/src/sqlite_objs_vfs.c` — Production VFS implementation
+- `test/test_harness.h` — Test macros & framework
+- `test/mock_azure_ops.h/c` — Mock Azure ops
+- `test/test_vfs.c` — VFS unit/integration tests
+- `src/sqlite_objs_vfs.c` — Production VFS implementation
 
 ## Test Execution Pattern
 
@@ -47,11 +47,11 @@ mock_clear_write_records(ctx);
 
 ## Page Cache Architecture
 
-**LRU Demand-Paging Cache**
-- Default: 1024 pages
-- Override: `export SQLITE_OBJS_CACHE_PAGES=2048`
-- Hash table for O(1) lookup
-- Doubly-linked LRU list for eviction
+**Disk-backed cache with valid/dirty page tracking**
+- Default: full database blob download on open
+- URI option: `prefetch=none` for lazy page fetches
+- URI option: `cache_reuse=1` with `cache_dir=...` for ETag-validated reuse
+- Dirty and valid bitmaps track pages that need sync or lazy fetch
 
 **Read Flow**:
 ```
@@ -108,7 +108,7 @@ SQLITE_OBJS_MAX_PUT_PAGE            (4*1024*1024) // 4 MiB max per page_blob_wri
 |-----------|---------|---------|
 | MAIN_DB | `xRead/xWrite/xSync/xTruncate` | Azure Page Blob |
 | MAIN_JOURNAL | `xRead/xWrite/xSync/xTruncate` | Azure Block Blob |
-| WAL | `xRead/xWrite/xSync/xTruncate` | Azure Append Blob |
+| WAL | `xRead/xWrite/xSync/xTruncate` | Azure Block Blob |
 | Temp/sub-journals | Delegate | Platform default VFS |
 
 ## xOpen Initialization
@@ -217,8 +217,8 @@ mock_clear_write_records(ctx);
 ## Environment Variables
 
 ```bash
-export SQLITE_OBJS_CACHE_PAGES=2048      # Override default 1024 pages
 export SQLITE_OBJS_DEBUG_TIMING=1        # Enable timing output in xSync
+export AZURITE_LOOSE=1                   # Optional loose Azurite compatibility mode
 ```
 
 ## Common Test Patterns
@@ -259,4 +259,4 @@ ASSERT_FALSE(leased);
 
 ---
 
-For full details, see: `/Users/qbradley/src/sqlite/VFS_TEST_INFRASTRUCTURE.md`
+For full details, see: `VFS_TEST_INFRASTRUCTURE.md`
