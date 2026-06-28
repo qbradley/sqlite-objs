@@ -1605,12 +1605,19 @@ TEST(vfs_journal_remote_presence_checked_on_reopen) {
     rc = sqlite3_open_v2("test.db", &db2,
                           SQLITE_OPEN_READWRITE, "sqlite-objs");
     if (rc == SQLITE_OK) {
+        sqlite3_stmt *stmt = NULL;
+        int prc = sqlite3_prepare_v2(db2, "SELECT COUNT(*) FROM t;", -1,
+                                     &stmt, NULL);
+        if (prc == SQLITE_OK) {
+            (void)sqlite3_step(stmt);
+        }
+        if (stmt) sqlite3_finalize(stmt);
         close_test_db(db2);
     } else if (db2) {
         sqlite3_close(db2);
     }
 
-    ASSERT_GT(mock_get_call_count(g_ctx, "blob_exists"), 0);
+    ASSERT_GT(mock_get_call_count(g_ctx, "block_blob_download"), 0);
 }
 
 TEST(vfs_journal_mode_truncate_removes_remote_journal) {
