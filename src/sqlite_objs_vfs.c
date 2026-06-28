@@ -310,6 +310,15 @@ static sqliteObjsJournalCacheEntry *journalCacheGetOrCreate(sqliteObjsVfsData *p
     return e;
 }
 
+static void journalCacheSetState(sqliteObjsVfsData *pData, const char *zName,
+                                 int state) {
+    if (!pData || !zName) return;
+    pthread_mutex_lock(&pData->journalCacheMutex);
+    sqliteObjsJournalCacheEntry *jce = journalCacheGetOrCreate(pData, zName);
+    if (jce) jce->state = state;
+    pthread_mutex_unlock(&pData->journalCacheMutex);
+}
+
 static const sqlite3_io_methods sqliteObjsIoMethods = {
     2,                              /* iVersion = 2 (WAL via exclusive locking) */
     sqliteObjsClose,
@@ -1620,7 +1629,12 @@ static int sqliteObjsTruncate(sqlite3_file *pFile, sqlite3_int64 size) {
             if (p->ops && p->ops->blob_delete) {
                 azure_error_t aerr;
                 azure_error_init(&aerr);
-                p->ops->blob_delete(p->ops_ctx, p->zBlobName, &aerr);
+                azure_err_t arc = p->ops->blob_delete(
+                    p->ops_ctx, p->zBlobName, &aerr);
+                if (arc != AZURE_OK && arc != AZURE_ERR_NOT_FOUND) {
+                    p->metrics.azure_errors++;
+                    return azureErrToSqlite(arc, SQLITE_IOERR_TRUNCATE);
+                }
             }
             p->nWalData = 0;
             if (p->aWalData) {
@@ -1633,7 +1647,23 @@ static int sqliteObjsTruncate(sqlite3_file *pFile, sqlite3_int64 size) {
     }
 
     if (p->eFileType & SQLITE_OPEN_MAIN_JOURNAL) {
-        if (size < p->nJrnlData) {
+        if (size == 0) {
+            if (p->ops && p->ops->blob_delete && p->zBlobName) {
+                azure_error_t aerr;
+                azure_error_init(&aerr);
+                azure_err_t arc = p->ops->blob_delete(
+                    p->ops_ctx, p->zBlobName, &aerr);
+                if (arc != AZURE_OK && arc != AZURE_ERR_NOT_FOUND) {
+                    p->metrics.azure_errors++;
+                    return azureErrToSqlite(arc, SQLITE_IOERR_TRUNCATE);
+                }
+                journalCacheSetState(p->pVfsData, p->zBlobName, 0);
+            }
+            p->nJrnlData = 0;
+            if (p->aJrnlData && p->nJrnlAlloc > 0) {
+                memset(p->aJrnlData, 0, (size_t)p->nJrnlAlloc);
+            }
+        } else if (size < p->nJrnlData) {
             p->nJrnlData = size;
             if (p->aJrnlData && size < p->nJrnlAlloc) {
                 memset(p->aJrnlData + size, 0,
@@ -1865,13 +1895,7 @@ static int sqliteObjsSync(sqlite3_file *pFile, int flags) {
             p->metrics.blob_bytes_written += p->nJrnlData;
 
             /* R1: Journal blob now exists in Azure */
-            {
-                pthread_mutex_lock(&p->pVfsData->journalCacheMutex);
-                sqliteObjsJournalCacheEntry *jce =
-                    journalCacheGetOrCreate(p->pVfsData, p->zBlobName);
-                if (jce) jce->state = 1;
-                pthread_mutex_unlock(&p->pVfsData->journalCacheMutex);
-            }
+            journalCacheSetState(p->pVfsData, p->zBlobName, 1);
         }
         return SQLITE_OK;
     }
@@ -3426,19 +3450,23 @@ static int sqliteObjsOpen(sqlite3_vfs *pVfs, sqlite3_filename zName,
         int cached_state = jce ? jce->state : -1;
         pthread_mutex_unlock(&pVfsData->journalCacheMutex);
 
-        /* R1: If cache says journal doesn't exist, skip the HEAD request.
-        ** Only do a real HEAD when cache is unknown (-1) or says it exists (1).
-        ** Since we are the single writer, cache=0 is authoritative. */
+        /* Hot-journal discovery must be authoritative.  Cached absence is an
+        ** optimization hint only; another process may have created a journal
+        ** and crashed since this process last deleted one. */
         int exists = 0;
-        if (cached_state == 0) {
-            exists = 0;  /* We deleted it — no HEAD needed */
-        } else if (p->ops && p->ops->blob_exists) {
+        if (p->ops && p->ops->blob_exists) {
             azure_error_t aerr;
             azure_error_init(&aerr);
-            p->ops->blob_exists(p->ops_ctx, zName, &exists, &aerr);
-            pthread_mutex_lock(&pVfsData->journalCacheMutex);
-            if (jce) jce->state = exists ? 1 : 0;
-            pthread_mutex_unlock(&pVfsData->journalCacheMutex);
+            azure_err_t arc = p->ops->blob_exists(p->ops_ctx, zName,
+                                                   &exists, &aerr);
+            if (arc != AZURE_OK) {
+                sqlite3_free(p->zBlobName);
+                p->zBlobName = NULL;
+                return azureErrToSqlite(arc, SQLITE_CANTOPEN);
+            }
+            journalCacheSetState(pVfsData, zName, exists ? 1 : 0);
+        } else if (cached_state >= 0) {
+            exists = cached_state;
         }
 
         /* Check if journal blob already exists (crash recovery) */
@@ -3598,10 +3626,10 @@ static int sqliteObjsDelete(sqlite3_vfs *pVfs, const char *zName, int syncDir) {
 /*
 ** xAccess — Check blob existence or readability.
 **
-** R1 optimization: We cache journal blob existence state. Since we are the
-** single writer, we know when the journal exists (we uploaded it in xSync)
-** or doesn't exist (we deleted it in xDelete). This eliminates ~4 HEAD
-** requests per transaction (~110ms saved).
+** Journal existence state is cached for observability and local state updates,
+** but hot-journal discovery still performs an authoritative remote check.
+** Cached absence cannot prove that another process did not create a journal
+** and crash after this process last deleted one.
 */
 static int sqliteObjsAccess(sqlite3_vfs *pVfs, const char *zName,
                           int flags, int *pResOut) {
@@ -3616,23 +3644,10 @@ static int sqliteObjsAccess(sqlite3_vfs *pVfs, const char *zName,
     const azure_ops_t *ops;
     void *ops_ctx;
     if (resolveOps(pVfsData, zName, &ops, &ops_ctx) && ops->blob_exists) {
-        /* R1: Use cached journal existence when available */
+        /* R1: Update journal existence cache, but never let cached absence
+        ** suppress a remote check needed for hot-journal discovery. */
         pthread_mutex_lock(&pVfsData->journalCacheMutex);
         sqliteObjsJournalCacheEntry *jce = journalCacheFind(pVfsData, zName);
-        if (jce && jce->state >= 0) {
-            int cached_result = jce->state;
-            pthread_mutex_unlock(&pVfsData->journalCacheMutex);
-            switch (flags) {
-                case SQLITE_ACCESS_EXISTS:
-                case SQLITE_ACCESS_READWRITE:
-                case SQLITE_ACCESS_READ:
-                    *pResOut = cached_result;
-                    break;
-                default:
-                    *pResOut = 0;
-            }
-            return SQLITE_OK;
-        }
         pthread_mutex_unlock(&pVfsData->journalCacheMutex);
 
         int exists = 0;
@@ -3641,7 +3656,10 @@ static int sqliteObjsAccess(sqlite3_vfs *pVfs, const char *zName,
         azure_err_t arc = ops->blob_exists(ops_ctx, zName, &exists, &aerr);
         if (arc != AZURE_OK) {
             *pResOut = 0;
-            return SQLITE_OK;  /* Access check should not fail fatally */
+            if (jce) {
+                return azureErrToSqlite(arc, SQLITE_IOERR_ACCESS);
+            }
+            return SQLITE_OK;  /* Non-journal access checks stay best-effort. */
         }
 
         /* R1: Seed journal cache if this is a journal blob we haven't tracked yet.

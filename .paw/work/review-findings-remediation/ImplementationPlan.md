@@ -28,7 +28,7 @@ Rollback-journal and WAL cleanup/recovery decisions use authoritative remote sta
 
 ## Phase Status
 
-- [ ] **Phase 1: Recovery Artifact Safety** - Fix rollback-journal/WAL cleanup and discovery invariants with targeted tests.
+- [x] **Phase 1: Recovery Artifact Safety** - Fix rollback-journal/WAL cleanup and discovery invariants with targeted tests.
 - [ ] **Phase 2: Azure Batch Synchronization Safety** - Fix production batch-write lease renewal and mutex cleanup paths with targeted coverage.
 - [ ] **Phase 3: Rust Wrapper Safety and Compatibility** - Harden safe registration/configuration/MSRV/test helper behavior.
 - [ ] **Phase 4: Test Gate and Release Automation Integrity** - Make tests/gates/workflows fail or report accurately for critical coverage.
@@ -56,14 +56,21 @@ For each targeted invariant test added in Phases 1-3, record evidence that it fa
 ### Success Criteria:
 
 #### Automated Verification:
-- [ ] Tests pass: `make test-unit`
-- [ ] Targeted integration passes: `make test-integration`
-- [ ] Targeted invariant tests have fail-first or equivalent coverage evidence recorded per the cross-phase verification standard.
+- [x] Tests pass: `make test-unit`
+- [x] Targeted integration passes: `make test-integration`
+- [x] Targeted invariant tests have fail-first or equivalent coverage evidence recorded per the cross-phase verification standard.
 
 #### Manual Verification:
-- [ ] Hot-journal discovery cannot be bypassed solely by stale cached absence.
-- [ ] Journal/WAL cleanup failures are observable to SQLite callers where stale remote recovery artifacts could remain.
-- [ ] Representative partial-state test covers behavior after remote recovery state exists, not only pre-operation hook aborts.
+- [x] Hot-journal discovery cannot be bypassed solely by stale cached absence.
+- [x] Journal/WAL cleanup failures are observable to SQLite callers where stale remote recovery artifacts could remain.
+- [x] Representative partial-state test covers behavior after remote recovery state exists, not only pre-operation hook aborts.
+
+### Phase 1 Notes:
+
+- Added mock/VFS coverage that first caches `test.db-journal` as absent, then creates remote journal state and verifies `xAccess` performs an authoritative `blob_exists` check.
+- Added `TRUNCATE` journal cleanup coverage proving remote journal deletion and delete-failure propagation.
+- Added WAL checkpoint/truncate delete-failure coverage.
+- Fail-first/equivalent evidence: the new stale-cached-absence test directly exercises the previously unsafe cache path; the new journal/WAL cleanup failure tests target code paths that previously ignored or skipped remote cleanup errors.
 
 ---
 

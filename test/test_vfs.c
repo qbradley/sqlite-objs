@@ -1530,6 +1530,77 @@ TEST(vfs_journal_deleted_after_commit) {
     close_test_db(db);
 }
 
+TEST(vfs_journal_cached_absent_does_not_hide_remote_journal) {
+    setup();
+    sqlite3 *db = open_test_db(g_ctx);
+    ASSERT_NOT_NULL(db);
+    sqlite3_exec(db, "CREATE TABLE t(x);", NULL, NULL, NULL);
+    sqlite3_exec(db, "INSERT INTO t VALUES(1);", NULL, NULL, NULL);
+
+    sqlite3_vfs *vfs = sqlite3_vfs_find("sqlite-objs");
+    ASSERT_NOT_NULL(vfs);
+
+    int exists = -1;
+    int rc = vfs->xAccess(vfs, "test.db-journal", SQLITE_ACCESS_EXISTS, &exists);
+    ASSERT_OK(rc);
+    ASSERT_EQ(exists, 0);
+
+    unsigned char hot_journal[] = "representative-hot-journal";
+    azure_error_t err;
+    azure_error_init(&err);
+    azure_err_t arc = g_ops->block_blob_upload(
+        g_ctx, "test.db-journal", hot_journal, sizeof(hot_journal), &err);
+    ASSERT_AZURE_OK(arc);
+
+    mock_reset_call_counts(g_ctx);
+    exists = 0;
+    rc = vfs->xAccess(vfs, "test.db-journal", SQLITE_ACCESS_EXISTS, &exists);
+    ASSERT_OK(rc);
+    ASSERT_EQ(exists, 1);
+    ASSERT_GT(mock_get_call_count(g_ctx, "blob_exists"), 0);
+
+    close_test_db(db);
+}
+
+TEST(vfs_journal_mode_truncate_removes_remote_journal) {
+    setup();
+    sqlite3 *db = open_test_db(g_ctx);
+    ASSERT_NOT_NULL(db);
+
+    int rc = sqlite3_exec(db,
+        "PRAGMA journal_mode=TRUNCATE;"
+        "CREATE TABLE t(x);", NULL, NULL, NULL);
+    ASSERT_OK(rc);
+
+    mock_reset_call_counts(g_ctx);
+    rc = sqlite3_exec(db, "INSERT INTO t VALUES(1);", NULL, NULL, NULL);
+    ASSERT_OK(rc);
+
+    ASSERT_GT(mock_get_call_count(g_ctx, "block_blob_upload"), 0);
+    ASSERT_GT(mock_get_call_count(g_ctx, "blob_delete"), 0);
+    ASSERT_FALSE(mock_blob_exists(g_ctx, "test.db-journal"));
+
+    close_test_db(db);
+}
+
+TEST(vfs_journal_mode_truncate_delete_failure_returns_error) {
+    setup();
+    sqlite3 *db = open_test_db(g_ctx);
+    ASSERT_NOT_NULL(db);
+
+    int rc = sqlite3_exec(db,
+        "PRAGMA journal_mode=TRUNCATE;"
+        "CREATE TABLE t(x);", NULL, NULL, NULL);
+    ASSERT_OK(rc);
+
+    mock_set_fail_operation(g_ctx, "blob_delete", AZURE_ERR_NETWORK);
+    rc = sqlite3_exec(db, "INSERT INTO t VALUES(1);", NULL, NULL, NULL);
+    ASSERT_NE(rc, SQLITE_OK);
+
+    mock_clear_failures(g_ctx);
+    close_test_db(db);
+}
+
 /* ── Locking ──────────────────────────────────────────────────────── */
 
 TEST(vfs_read_no_lease) {
@@ -4025,6 +4096,9 @@ void run_vfs_tests(void) {
     TEST_SUITE_BEGIN("VFS Journal Files");
     RUN_TEST(vfs_journal_created_as_block_blob);
     RUN_TEST(vfs_journal_deleted_after_commit);
+    RUN_TEST(vfs_journal_cached_absent_does_not_hide_remote_journal);
+    RUN_TEST(vfs_journal_mode_truncate_removes_remote_journal);
+    RUN_TEST(vfs_journal_mode_truncate_delete_failure_returns_error);
     TEST_SUITE_END();
 
     TEST_SUITE_BEGIN("VFS Locking");

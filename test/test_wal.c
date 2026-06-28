@@ -510,6 +510,28 @@ TEST(wal_checkpoint_resets_wal) {
     wal_close_db(db);
 }
 
+TEST(wal_checkpoint_truncate_delete_failure_returns_error) {
+    wal_setup();
+
+    sqlite3 *db = wal_open_db(wal_base_ops, wal_ctx, "waldelfail.db");
+    ASSERT_NOT_NULL(db);
+
+    int rc = wal_exec(db, "CREATE TABLE t(id INTEGER PRIMARY KEY, val TEXT);");
+    ASSERT_OK(rc);
+    rc = wal_exec(db, "INSERT INTO t VALUES(1, 'delete-failure');");
+    ASSERT_OK(rc);
+
+    int64_t pre_ckpt_size = mock_get_block_blob_size(wal_ctx, "waldelfail.db-wal");
+    ASSERT_GT(pre_ckpt_size, (int64_t)0);
+
+    mock_set_fail_operation(wal_ctx, "blob_delete", AZURE_ERR_NETWORK);
+    rc = wal_exec(db, "PRAGMA wal_checkpoint(TRUNCATE);");
+    ASSERT_NE(rc, SQLITE_OK);
+
+    mock_clear_failures(wal_ctx);
+    wal_close_db(db);
+}
+
 
 /* ══════════════════════════════════════════════════════════════════════
 ** Suite: WAL Mode — Error Handling
@@ -1337,6 +1359,7 @@ void run_wal_tests(void) {
     TEST_SUITE_BEGIN("WAL Mode \xe2\x80\x94 Checkpoint");
     RUN_TEST(wal_checkpoint_writes_pages);
     RUN_TEST(wal_checkpoint_resets_wal);
+    RUN_TEST(wal_checkpoint_truncate_delete_failure_returns_error);
     TEST_SUITE_END();
 
     TEST_SUITE_BEGIN("WAL Mode \xe2\x80\x94 Error Handling");
