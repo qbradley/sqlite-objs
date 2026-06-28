@@ -201,7 +201,7 @@ For each targeted invariant test added in Phases 1-3, record evidence that it fa
 - [x] Tests pass: `cd rust && cargo test --workspace`
 - [x] Tests pass: `cd rust && cargo test --workspace --all-features`
 - [x] Gate smoke passes: `./scripts/release-gate.sh`
-- [ ] Final society-of-thought review completes with no unresolved high-severity correctness, safety, or validation gaps from the original audit.
+- [x] Final society-of-thought review completes with no unresolved high-severity correctness, safety, or validation gaps from the original audit.
 
 #### Manual Verification:
 - [x] Documentation references only existing targets or intentionally added targets.
@@ -215,6 +215,7 @@ For each targeted invariant test added in Phases 1-3, record evidence that it fa
 - Updated README, benchmark/demo docs, test docs, and Rust docs for actual build targets, strict Azurite default, WAL/exclusive-locking support, Rust 1.82, and validated URI construction.
 - Updated benchmark TPC-C runtime messages to reference `make all` instead of the nonexistent `make all-production`.
 - Validation completed: `make test-unit`, `make sanitize`, `make test-integration`, `cd rust && cargo test --workspace`, `cd rust && cargo test --workspace --all-features`, `cd rust && cargo +1.82.0 check --workspace --all-features`, `cd rust && cargo doc --workspace --no-deps --quiet`, and `./scripts/release-gate.sh`.
+- Final society-of-thought review completed. Must-fix and should-fix findings were applied, and post-SoT validation passed: `make test-unit` (341 tests), `make sanitize` (341 tests), `make test-integration` (58 tests), `cd rust && cargo test --workspace --all-features`, `cd rust && cargo +1.82.0 check --workspace --all-features`, and `./scripts/release-gate.sh`.
 
 ---
 
