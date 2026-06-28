@@ -110,7 +110,11 @@ fn get_download_count(conn: &Connection) -> i32 {
             &mut count as *mut i32 as *mut std::ffi::c_void,
         )
     };
-    assert_eq!(rc, rusqlite::ffi::SQLITE_OK, "download-count file_control failed");
+    assert_eq!(
+        rc,
+        rusqlite::ffi::SQLITE_OK,
+        "download-count file_control failed"
+    );
     count
 }
 

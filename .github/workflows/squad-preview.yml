@@ -1,5 +1,4 @@
 name: Squad Preview Validation
-# Project type was not detected — configure build, test, and validation commands below
 
 on:
   push:
@@ -14,17 +13,24 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Build and test
+      - name: Install dependencies
         run: |
-          # TODO: Project type was not detected — add your build/test commands here
-          # Go:            go test ./...
-          # Python:        pip install -r requirements.txt && pytest
-          # .NET:          dotnet test
-          # Java (Maven):  mvn test
-          # Java (Gradle): ./gradlew test
-          echo "No build commands configured — update squad-preview.yml"
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            build-essential pkg-config libcurl4-openssl-dev libssl-dev libc6-dev lsof tcl-dev
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install Azurite
+        run: npm install -g azurite
 
       - name: Validate
-        run: |
-          # TODO: Add pre-release validation commands here
-          echo "No validation commands configured — update squad-preview.yml"
+        run: ./scripts/release-gate.sh --extended

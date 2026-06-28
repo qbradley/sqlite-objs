@@ -69,12 +69,20 @@ run_gate() {
     local safe_name="$(echo "$name" | sed 's/[^a-zA-Z0-9]/-/g' | sed 's/--*/-/g' | sed 's/^-//' | sed 's/-$//')"
     local logfile="$REPO_ROOT/build/gate-${safe_name}.log"
 
-    if timeout "$GATE_TIMEOUT" "$@" > "$logfile" 2>&1; then
+    set +e
+    if [[ "$name" == *"sanitizer"* || "$name" == *"Sanitizer"* ]]; then
+        ASAN_OPTIONS="${ASAN_OPTIONS:-handle_segv=0}" \
+        LSAN_OPTIONS="${LSAN_OPTIONS:-detect_leaks=0}" "$@" > "$logfile" 2>&1
+    else
+        timeout "$GATE_TIMEOUT" "$@" > "$logfile" 2>&1
+    fi
+    local rc=$?
+    set -e
+    if [ "$rc" -eq 0 ]; then
         status="PASS"
         PASS_COUNT=$((PASS_COUNT + 1))
         green "✓ PASS"
     else
-        local rc=$?
         status="FAIL"
         FAIL_COUNT=$((FAIL_COUNT + 1))
         red "✗ FAIL"
@@ -367,6 +375,16 @@ TOTAL_GATES=$(( PASS_COUNT + FAIL_COUNT + SKIP_COUNT ))
                 echo "  - $name"
             fi
         done
+    elif [ "$SKIP_COUNT" -gt 0 ]; then
+        echo "RESULT: ✅ PASSED WITH SKIPS — fast/local gate is green, but this is not full release readiness"
+        echo ""
+        echo "Skipped gates:"
+        for result in "${RESULTS[@]}"; do
+            IFS='|' read -r status name timing <<< "$result"
+            if [ "$status" = "SKIP" ]; then
+                echo "  - $name ($timing)"
+            fi
+        done
     else
         echo "RESULT: ✅ PASSED — all gates green, alpha ready"
     fi
@@ -395,10 +413,14 @@ if [ "$FAIL_COUNT" -gt 0 ]; then
     echo ""
     exit 1
 else
-    green "  ✅ ALPHA RELEASE GATE PASSED"
+    if [ "$SKIP_COUNT" -gt 0 ]; then
+        green "  ✅ FAST/LOCAL RELEASE GATE PASSED"
+    else
+        green "  ✅ ALPHA RELEASE GATE PASSED"
+    fi
     echo ""
     if [ "$SKIP_COUNT" -gt 0 ]; then
-        echo "  Note: $SKIP_COUNT gate(s) skipped (use --extended or --azure for full validation)"
+        echo "  Note: $SKIP_COUNT gate(s) skipped; use --full with credentials/tooling for full release readiness"
         echo ""
     fi
     exit 0

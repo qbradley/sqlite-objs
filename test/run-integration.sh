@@ -14,6 +14,7 @@
 # Environment variables (optional):
 #   AZURITE_PORT      — Port for blob service (default: 10000)
 #   AZURITE_SILENT    — Set to 1 to suppress Azurite output
+#   AZURITE_LOOSE     — Set to 0 for strict Azurite validation (default: 1)
 #
 # Part of the sqlite-objs project. License: MIT
 
@@ -25,6 +26,7 @@ set -e
 
 AZURITE_PORT="${AZURITE_PORT:-10000}"
 AZURITE_SILENT="${AZURITE_SILENT:-0}"
+AZURITE_LOOSE="${AZURITE_LOOSE:-1}"
 CONTAINER_NAME="sqlite-objs-test"
 ACCOUNT_NAME="devstoreaccount1"
 AZURITE_ENDPOINT="http://127.0.0.1:${AZURITE_PORT}"
@@ -70,6 +72,13 @@ fi
 rm -rf __azurite_db_*.json __blobstorage__/ __queuestorage__/ AzuriteConfig 2>/dev/null
 
 echo "🚀  Starting Azurite on port ${AZURITE_PORT}..."
+if [ "$AZURITE_LOOSE" = "1" ]; then
+    echo "⚠️   Azurite loose/API-version compatibility mode enabled (AZURITE_LOOSE=1)"
+    AZURITE_COMPAT_FLAGS="--skipApiVersionCheck --loose"
+else
+    echo "✓   Azurite strict mode enabled (AZURITE_LOOSE=0)"
+    AZURITE_COMPAT_FLAGS=""
+fi
 
 # Kill any stale Azurite on our port
 lsof -ti :"$AZURITE_PORT" | xargs kill 2>/dev/null || true
@@ -80,15 +89,13 @@ if [ "$AZURITE_SILENT" = "1" ]; then
     npx azurite \
         --blobPort "$AZURITE_PORT" \
         --silent \
-        --skipApiVersionCheck \
-        --loose \
+        $AZURITE_COMPAT_FLAGS \
         >/dev/null 2>&1 &
 else
     npx azurite \
         --blobPort "$AZURITE_PORT" \
         --silent \
-        --skipApiVersionCheck \
-        --loose \
+        $AZURITE_COMPAT_FLAGS \
         >/dev/null 2>&1 &
 fi
 

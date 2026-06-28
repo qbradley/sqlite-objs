@@ -31,7 +31,7 @@ Rollback-journal and WAL cleanup/recovery decisions use authoritative remote sta
 - [x] **Phase 1: Recovery Artifact Safety** - Fix rollback-journal/WAL cleanup and discovery invariants with targeted tests.
 - [x] **Phase 2: Azure Batch Synchronization Safety** - Fix production batch-write lease renewal and mutex cleanup paths with targeted coverage.
 - [x] **Phase 3: Rust Wrapper Safety and Compatibility** - Harden safe registration/configuration/MSRV/test helper behavior.
-- [ ] **Phase 4: Test Gate and Release Automation Integrity** - Make tests/gates/workflows fail or report accurately for critical coverage.
+- [x] **Phase 4: Test Gate and Release Automation Integrity** - Make tests/gates/workflows fail or report accurately for critical coverage.
 - [ ] **Phase 5: Documentation and Final Validation** - Update project docs, create as-built Docs.md, and run final validation.
 
 ## Cross-Phase Verification Standard
@@ -160,15 +160,23 @@ For each targeted invariant test added in Phases 1-3, record evidence that it fa
 ### Success Criteria:
 
 #### Automated Verification:
-- [ ] Tests pass: `make test-integration`
-- [ ] Gate smoke passes: `./scripts/release-gate.sh`
-- [ ] Workflow YAML remains syntactically valid by inspection and any available local YAML/tooling checks.
+- [x] Tests pass: `make test-integration`
+- [x] Gate smoke passes: `./scripts/release-gate.sh`
+- [x] Workflow YAML remains syntactically valid by inspection and any available local YAML/tooling checks.
 
 #### Manual Verification:
-- [ ] Fast gate output no longer implies full release readiness when extended/live-Azure gates are skipped.
-- [ ] Property tests no longer accept unexpected data-operation `SQLITE_ERROR` as success.
-- [ ] Azurite runner makes strict/loose fidelity explicit.
-- [ ] Workflows no longer rely on nonexistent `package.json` release metadata for this C/Rust repository.
+- [x] Fast gate output no longer implies full release readiness when extended/live-Azure gates are skipped.
+- [x] Property tests no longer accept unexpected data-operation `SQLITE_ERROR` as success.
+- [x] Azurite runner makes strict/loose fidelity explicit.
+- [x] Workflows no longer rely on nonexistent `package.json` release metadata for this C/Rust repository.
+
+### Phase 4 Notes:
+
+- Property tests now fail on unexpected `SQLITE_ERROR` for generated data operations instead of treating it as acceptable.
+- Azurite integration startup now prints whether loose/API-version compatibility mode is enabled and supports `AZURITE_LOOSE=0` for strict mode.
+- Release gate output distinguishes fast/local pass-with-skips from full release readiness and exempts sanitizer execution from the `timeout` wrapper that conflicts with ASan signal handling.
+- Preview/release/docs workflows now run repository-appropriate validation instead of placeholder echo commands; promotion now reads the Rust workspace version instead of nonexistent Node package metadata.
+- Verification: `make test-integration` passed 57 tests; `./scripts/release-gate.sh` passed with explicit skipped-gate reporting; workflow YAML parsed with Python/PyYAML and shell scripts passed `bash -n`.
 
 ---
 

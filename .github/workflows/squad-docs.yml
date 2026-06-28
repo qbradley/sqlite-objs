@@ -1,12 +1,12 @@
 name: Squad Docs — Build & Deploy
-# Project type was not detected — configure documentation build commands below
 
 on:
   workflow_dispatch:
   push:
     branches: [preview]
     paths:
-      - 'docs/**'
+      - '**/*.md'
+      - 'rust/**/*.rs'
       - '.github/workflows/squad-docs.yml'
 
 permissions:
@@ -20,8 +20,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Build docs
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Validate documentation inputs
         run: |
-          # TODO: Add your documentation build commands here
-          # This workflow is optional — remove or customize it for your project
-          echo "No docs build commands configured — update or remove squad-docs.yml"
+          test -f README.md
+          test -f TEST_DOCS_INDEX.md
+          cd rust
+          cargo doc --workspace --no-deps --quiet

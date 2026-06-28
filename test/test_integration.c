@@ -5198,16 +5198,13 @@ TEST(prop_deterministic_basic) {
             ASSERT_OK(rc);
         }
         
-        /* Allow operations to fail gracefully (transaction control, busy, etc.) */
-        /* Only fail on critical errors for data operations */
+        /* Data operations are generated to be valid. They may contend, but
+        ** ordinary SQLITE_ERROR indicates a VFS/regression bug. */
         if (rc != SQLITE_OK && rc != SQLITE_BUSY && rc != SQLITE_LOCKED) {
             if (op.type == OP_INSERT || op.type == OP_UPDATE || op.type == OP_DELETE) {
-                /* Data operations should succeed or return acceptable errors */
-                if (rc != SQLITE_ERROR) {  /* SQLITE_ERROR can happen for constraints */
-                    fprintf(stderr, "  Operation %d (%s) failed unexpectedly: rc=%d\n",
-                            i, op_name(op.type), rc);
-                    ASSERT_OK(rc);
-                }
+                fprintf(stderr, "  Operation %d (%s) failed unexpectedly: rc=%d\n",
+                        i, op_name(op.type), rc);
+                ASSERT_OK(rc);
             }
             /* Transaction control operations can fail without corrupting state. */
         }
@@ -5295,11 +5292,9 @@ TEST(prop_deterministic_multi_seed) {
             /* Allow operations to fail gracefully */
             if (rc != SQLITE_OK && rc != SQLITE_BUSY && rc != SQLITE_LOCKED) {
                 if (op.type == OP_INSERT || op.type == OP_UPDATE || op.type == OP_DELETE) {
-                    if (rc != SQLITE_ERROR) {
-                        fprintf(stderr, "  Seed %lu op %d (%s) failed: rc=%d\n",
-                                (unsigned long)seed, i, op_name(op.type), rc);
-                        ASSERT_OK(rc);
-                    }
+                    fprintf(stderr, "  Seed %lu op %d (%s) failed: rc=%d\n",
+                            (unsigned long)seed, i, op_name(op.type), rc);
+                    ASSERT_OK(rc);
                 }
             }
         }
@@ -5419,11 +5414,9 @@ TEST(prop_transaction_heavy) {
         /* Allow operations to fail gracefully */
         if (rc != SQLITE_OK && rc != SQLITE_BUSY && rc != SQLITE_LOCKED) {
             if (op.type == OP_INSERT || op.type == OP_UPDATE || op.type == OP_DELETE) {
-                if (rc != SQLITE_ERROR) {
-                    fprintf(stderr, "  Op %d (%s) failed: rc=%d\n",
-                            i, op_name(op.type), rc);
-                    ASSERT_OK(rc);
-                }
+                fprintf(stderr, "  Op %d (%s) failed: rc=%d\n",
+                        i, op_name(op.type), rc);
+                ASSERT_OK(rc);
             }
         }
     }

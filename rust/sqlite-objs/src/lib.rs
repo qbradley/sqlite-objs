@@ -707,7 +707,9 @@ mod tests {
         };
 
         let result = SqliteObjsVfs::register_with_config(&config, false);
-        assert!(matches!(result, Err(SqliteObjsError::InvalidConfig(msg)) if msg.contains("account")));
+        assert!(
+            matches!(result, Err(SqliteObjsError::InvalidConfig(msg)) if msg.contains("account"))
+        );
     }
 
     #[test]
@@ -721,7 +723,9 @@ mod tests {
         };
 
         let result = SqliteObjsVfs::register_with_config(&config, false);
-        assert!(matches!(result, Err(SqliteObjsError::InvalidConfig(msg)) if msg.contains("container")));
+        assert!(
+            matches!(result, Err(SqliteObjsError::InvalidConfig(msg)) if msg.contains("container"))
+        );
     }
 
     #[test]
@@ -735,7 +739,9 @@ mod tests {
         };
 
         let result = SqliteObjsVfs::register_with_config(&config, false);
-        assert!(matches!(result, Err(SqliteObjsError::InvalidConfig(msg)) if msg.contains("sas_token") || msg.contains("account_key")));
+        assert!(
+            matches!(result, Err(SqliteObjsError::InvalidConfig(msg)) if msg.contains("sas_token") || msg.contains("account_key"))
+        );
     }
 
     #[test]
@@ -832,7 +838,9 @@ mod tests {
     #[test]
     fn test_uri_builder_try_build_requires_auth() {
         let result = UriBuilder::new("test.db", "account", "container").try_build();
-        assert!(matches!(result, Err(SqliteObjsError::InvalidConfig(msg)) if msg.contains("azure_sas") || msg.contains("azure_key")));
+        assert!(
+            matches!(result, Err(SqliteObjsError::InvalidConfig(msg)) if msg.contains("azure_sas") || msg.contains("azure_key"))
+        );
     }
 
     #[test]
@@ -840,7 +848,9 @@ mod tests {
         let result = UriBuilder::new("test.db", "", "container")
             .sas_token("token")
             .try_build();
-        assert!(matches!(result, Err(SqliteObjsError::InvalidConfig(msg)) if msg.contains("azure_account")));
+        assert!(
+            matches!(result, Err(SqliteObjsError::InvalidConfig(msg)) if msg.contains("azure_account"))
+        );
     }
 
     #[test]
@@ -848,7 +858,9 @@ mod tests {
         let result = UriBuilder::new("test.db", "account", "")
             .sas_token("token")
             .try_build();
-        assert!(matches!(result, Err(SqliteObjsError::InvalidConfig(msg)) if msg.contains("azure_container")));
+        assert!(
+            matches!(result, Err(SqliteObjsError::InvalidConfig(msg)) if msg.contains("azure_container"))
+        );
     }
 
     #[test]
