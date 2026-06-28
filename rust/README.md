@@ -12,7 +12,7 @@ This workspace contains two crates:
 ## Building
 
 Requirements:
-- Rust 1.70 or later
+- Rust 1.82 or later
 - libcurl, OpenSSL (linked dynamically)
 - C compiler (for building the C sources)
 

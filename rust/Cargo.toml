@@ -8,7 +8,7 @@ authors = ["sqlite-objs Contributors"]
 edition = "2021"
 license = "MIT"
 repository = "https://github.com/qbradley/sqlite-objs/rust"
-rust-version = "1.70"
+rust-version = "1.82"
 
 [workspace.dependencies]
 libc = "0.2"

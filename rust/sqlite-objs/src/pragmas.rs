@@ -41,7 +41,7 @@ use crate::metrics::VfsMetrics;
 use crate::{Result, SqliteObjsError};
 
 /// Name of the main database schema passed to `sqlite3_file_control`.
-const MAIN_DB: &CStr = c"main";
+const MAIN_DB: &[u8] = b"main\0";
 
 /// Retrieve all VFS activity metrics for the connection.
 ///
@@ -63,9 +63,9 @@ pub fn get_stats(conn: &Connection) -> Result<VfsMetrics> {
     let rc = unsafe {
         rusqlite::ffi::sqlite3_file_control(
             conn.handle(),
-            MAIN_DB.as_ptr(),
+            MAIN_DB.as_ptr().cast(),
             sqlite_objs_sys::SQLITE_OBJS_FCNTL_STATS,
-            (&raw mut stats_ptr).cast(),
+            (&mut stats_ptr as *mut *mut c_char).cast(),
         )
     };
 
@@ -102,7 +102,7 @@ pub fn reset_stats(conn: &Connection) -> Result<()> {
     let rc = unsafe {
         rusqlite::ffi::sqlite3_file_control(
             conn.handle(),
-            MAIN_DB.as_ptr(),
+            MAIN_DB.as_ptr().cast(),
             sqlite_objs_sys::SQLITE_OBJS_FCNTL_STATS_RESET,
             ptr::null_mut(),
         )
@@ -130,9 +130,9 @@ pub fn get_download_count(conn: &Connection) -> Result<i32> {
     let rc = unsafe {
         rusqlite::ffi::sqlite3_file_control(
             conn.handle(),
-            MAIN_DB.as_ptr(),
+            MAIN_DB.as_ptr().cast(),
             sqlite_objs_sys::SQLITE_OBJS_FCNTL_DOWNLOAD_COUNT,
-            (&raw mut count).cast(),
+            (&mut count as *mut i32).cast(),
         )
     };
 

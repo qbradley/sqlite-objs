@@ -18,7 +18,7 @@ rusqlite = "0.32"
 
 ## Requirements
 
-- Rust 1.70+
+- Rust 1.82+
 - System libraries: libcurl, OpenSSL
 - macOS: `brew install curl openssl` (usually already present)
 - Linux: `apt-get install libcurl4-openssl-dev libssl-dev`

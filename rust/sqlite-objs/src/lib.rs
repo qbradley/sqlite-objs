@@ -80,9 +80,12 @@
 //! # Ok::<(), Box<dyn std::error::Error>>(())
 //! ```
 
+use std::collections::hash_map::DefaultHasher;
 use std::ffi::CString;
 use std::fmt::Write;
+use std::hash::{Hash, Hasher};
 use std::ptr;
+use std::sync::{Mutex, OnceLock};
 use thiserror::Error;
 
 pub mod metrics;
@@ -175,6 +178,100 @@ pub struct SqliteObjsConfig {
 /// This is a zero-sized type that provides static methods for VFS registration.
 pub struct SqliteObjsVfs;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RegistrationMode {
+    Env,
+    Config(u64),
+    Uri,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RegistrationState {
+    mode: RegistrationMode,
+    make_default: bool,
+}
+
+static REGISTRATION_STATE: OnceLock<Mutex<Option<RegistrationState>>> = OnceLock::new();
+
+fn registration_state() -> &'static Mutex<Option<RegistrationState>> {
+    REGISTRATION_STATE.get_or_init(|| Mutex::new(None))
+}
+
+fn config_fingerprint(config: &SqliteObjsConfig) -> u64 {
+    let mut h = DefaultHasher::new();
+    config.account.hash(&mut h);
+    config.container.hash(&mut h);
+    config.sas_token.hash(&mut h);
+    config.account_key.hash(&mut h);
+    config.endpoint.hash(&mut h);
+    h.finish()
+}
+
+fn validate_required_config(config: &SqliteObjsConfig) -> Result<()> {
+    if config.account.is_empty() {
+        return Err(SqliteObjsError::InvalidConfig(
+            "account must not be empty".into(),
+        ));
+    }
+    if config.container.is_empty() {
+        return Err(SqliteObjsError::InvalidConfig(
+            "container must not be empty".into(),
+        ));
+    }
+    let has_sas = config.sas_token.as_ref().is_some_and(|s| !s.is_empty());
+    let has_key = config.account_key.as_ref().is_some_and(|s| !s.is_empty());
+    if !has_sas && !has_key {
+        return Err(SqliteObjsError::InvalidConfig(
+            "either sas_token or account_key is required".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn registration_compatible(existing: RegistrationState, requested: RegistrationState) -> bool {
+    if existing == requested {
+        return true;
+    }
+
+    match (existing.mode, requested.mode) {
+        /* URI opens remain available after env/config registration because
+         * sqliteObjsOpen checks URI parameters before falling back to global
+         * VFS configuration. */
+        (_, RegistrationMode::Uri) => true,
+        _ => false,
+    }
+}
+
+fn with_registration_gate<F>(requested: RegistrationState, register: F) -> Result<()>
+where
+    F: FnOnce() -> i32,
+{
+    let mut state = registration_state()
+        .lock()
+        .map_err(|_| SqliteObjsError::RegistrationFailed("registration mutex poisoned".into()))?;
+
+    if let Some(existing) = *state {
+        if registration_compatible(existing, requested) {
+            return Ok(());
+        }
+        return Err(SqliteObjsError::RegistrationFailed(format!(
+            "sqlite-objs VFS already registered as {:?}; safe reconfiguration to {:?} is not supported",
+            existing.mode, requested.mode
+        )));
+    }
+
+    let rc = register();
+    if rc == sqlite_objs_sys::SQLITE_OK {
+        *state = Some(requested);
+        Ok(())
+    } else {
+        Err(SqliteObjsError::RegistrationFailed(format!(
+            "sqlite-objs registration returned {}",
+            rc
+        )))
+    }
+}
+
 impl SqliteObjsVfs {
     /// Register the sqlite-objs VFS using environment variables.
     ///
@@ -192,15 +289,13 @@ impl SqliteObjsVfs {
     ///
     /// Returns an error if registration fails (e.g., missing environment variables).
     pub fn register(make_default: bool) -> Result<()> {
-        let rc = unsafe { sqlite_objs_sys::sqlite_objs_vfs_register(make_default as i32) };
-        if rc == sqlite_objs_sys::SQLITE_OK {
-            Ok(())
-        } else {
-            Err(SqliteObjsError::RegistrationFailed(format!(
-                "sqlite_objs_vfs_register returned {}",
-                rc
-            )))
-        }
+        with_registration_gate(
+            RegistrationState {
+                mode: RegistrationMode::Env,
+                make_default,
+            },
+            || unsafe { sqlite_objs_sys::sqlite_objs_vfs_register(make_default as i32) },
+        )
     }
 
     /// Register the sqlite-objs VFS with explicit configuration.
@@ -215,6 +310,8 @@ impl SqliteObjsVfs {
     /// Returns an error if the configuration contains invalid data (null bytes)
     /// or if registration fails.
     pub fn register_with_config(config: &SqliteObjsConfig, make_default: bool) -> Result<()> {
+        validate_required_config(config)?;
+
         // Convert Rust strings to C strings
         let account = CString::new(config.account.as_str())
             .map_err(|_| SqliteObjsError::InvalidConfig("account contains null byte".into()))?;
@@ -258,18 +355,18 @@ impl SqliteObjsVfs {
             ops_ctx: ptr::null_mut(),
         };
 
-        let rc = unsafe {
-            sqlite_objs_sys::sqlite_objs_vfs_register_with_config(&c_config, make_default as i32)
-        };
-
-        if rc == sqlite_objs_sys::SQLITE_OK {
-            Ok(())
-        } else {
-            Err(SqliteObjsError::RegistrationFailed(format!(
-                "sqlite_objs_vfs_register_with_config returned {}",
-                rc
-            )))
-        }
+        with_registration_gate(
+            RegistrationState {
+                mode: RegistrationMode::Config(config_fingerprint(config)),
+                make_default,
+            },
+            || unsafe {
+                sqlite_objs_sys::sqlite_objs_vfs_register_with_config(
+                    &c_config,
+                    make_default as i32,
+                )
+            },
+        )
     }
 
     /// Register the sqlite-objs VFS in URI mode.
@@ -295,15 +392,13 @@ impl SqliteObjsVfs {
     ///
     /// Returns an error if registration fails.
     pub fn register_uri(make_default: bool) -> Result<()> {
-        let rc = unsafe { sqlite_objs_sys::sqlite_objs_vfs_register_uri(make_default as i32) };
-        if rc == sqlite_objs_sys::SQLITE_OK {
-            Ok(())
-        } else {
-            Err(SqliteObjsError::RegistrationFailed(format!(
-                "sqlite_objs_vfs_register_uri returned {}",
-                rc
-            )))
-        }
+        with_registration_gate(
+            RegistrationState {
+                mode: RegistrationMode::Uri,
+                make_default,
+            },
+            || unsafe { sqlite_objs_sys::sqlite_objs_vfs_register_uri(make_default as i32) },
+        )
     }
 }
 
@@ -438,6 +533,35 @@ impl UriBuilder {
     /// Returns a SQLite URI in the format:
     /// `file:{database}?azure_account={account}&azure_container={container}&...`
     pub fn build(self) -> String {
+        self.build_unchecked()
+    }
+
+    /// Build the URI string after validating required Azure fields.
+    ///
+    /// This is preferred for new code. `build()` remains infallible for
+    /// backwards compatibility and may emit a URI that the C VFS later rejects.
+    pub fn try_build(self) -> Result<String> {
+        if self.account.is_empty() {
+            return Err(SqliteObjsError::InvalidConfig(
+                "azure_account must not be empty".into(),
+            ));
+        }
+        if self.container.is_empty() {
+            return Err(SqliteObjsError::InvalidConfig(
+                "azure_container must not be empty".into(),
+            ));
+        }
+        let has_sas = self.sas_token.as_ref().is_some_and(|s| !s.is_empty());
+        let has_key = self.account_key.as_ref().is_some_and(|s| !s.is_empty());
+        if !has_sas && !has_key {
+            return Err(SqliteObjsError::InvalidConfig(
+                "azure_sas or azure_key is required".into(),
+            ));
+        }
+        Ok(self.build_unchecked())
+    }
+
+    fn build_unchecked(self) -> String {
         let mut uri = format!(
             "file:{}?azure_account={}&azure_container={}",
             percent_encode(&self.database),
@@ -512,6 +636,21 @@ mod tests {
     fn test_register_uri() {
         // URI mode should succeed without config
         SqliteObjsVfs::register_uri(false).expect("URI registration should succeed");
+        SqliteObjsVfs::register_uri(false).expect("URI registration should be idempotent");
+    }
+
+    #[test]
+    fn test_register_uri_concurrent_idempotent() {
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            handles.push(std::thread::spawn(|| SqliteObjsVfs::register_uri(false)));
+        }
+
+        for h in handles {
+            h.join()
+                .expect("registration thread panicked")
+                .expect("URI registration should be concurrency-safe and idempotent");
+        }
     }
 
     #[test]
@@ -541,6 +680,48 @@ mod tests {
 
         let result = SqliteObjsVfs::register_with_config(&config, false);
         assert!(matches!(result, Err(SqliteObjsError::InvalidConfig(_))));
+    }
+
+    #[test]
+    fn test_config_empty_account_rejected() {
+        let config = SqliteObjsConfig {
+            account: "".to_string(),
+            container: "container".to_string(),
+            sas_token: Some("token".to_string()),
+            account_key: None,
+            endpoint: None,
+        };
+
+        let result = SqliteObjsVfs::register_with_config(&config, false);
+        assert!(matches!(result, Err(SqliteObjsError::InvalidConfig(msg)) if msg.contains("account")));
+    }
+
+    #[test]
+    fn test_config_empty_container_rejected() {
+        let config = SqliteObjsConfig {
+            account: "account".to_string(),
+            container: "".to_string(),
+            sas_token: Some("token".to_string()),
+            account_key: None,
+            endpoint: None,
+        };
+
+        let result = SqliteObjsVfs::register_with_config(&config, false);
+        assert!(matches!(result, Err(SqliteObjsError::InvalidConfig(msg)) if msg.contains("container")));
+    }
+
+    #[test]
+    fn test_config_missing_auth_rejected() {
+        let config = SqliteObjsConfig {
+            account: "account".to_string(),
+            container: "container".to_string(),
+            sas_token: None,
+            account_key: None,
+            endpoint: None,
+        };
+
+        let result = SqliteObjsVfs::register_with_config(&config, false);
+        assert!(matches!(result, Err(SqliteObjsError::InvalidConfig(msg)) if msg.contains("sas_token") || msg.contains("account_key")));
     }
 
     #[test]
@@ -632,6 +813,37 @@ mod tests {
             uri,
             "file:test.db?azure_account=account&azure_container=container&cache_dir=%2Ftmp%2Ftest"
         );
+    }
+
+    #[test]
+    fn test_uri_builder_try_build_requires_auth() {
+        let result = UriBuilder::new("test.db", "account", "container").try_build();
+        assert!(matches!(result, Err(SqliteObjsError::InvalidConfig(msg)) if msg.contains("azure_sas") || msg.contains("azure_key")));
+    }
+
+    #[test]
+    fn test_uri_builder_try_build_rejects_empty_account() {
+        let result = UriBuilder::new("test.db", "", "container")
+            .sas_token("token")
+            .try_build();
+        assert!(matches!(result, Err(SqliteObjsError::InvalidConfig(msg)) if msg.contains("azure_account")));
+    }
+
+    #[test]
+    fn test_uri_builder_try_build_rejects_empty_container() {
+        let result = UriBuilder::new("test.db", "account", "")
+            .sas_token("token")
+            .try_build();
+        assert!(matches!(result, Err(SqliteObjsError::InvalidConfig(msg)) if msg.contains("azure_container")));
+    }
+
+    #[test]
+    fn test_uri_builder_try_build_valid_with_sas() {
+        let uri = UriBuilder::new("test.db", "account", "container")
+            .sas_token("token")
+            .try_build()
+            .expect("valid URI");
+        assert!(uri.contains("azure_sas=token"));
     }
 
     #[test]

@@ -100,16 +100,17 @@ const SQLITE_OBJS_FCNTL_DOWNLOAD_COUNT: i32 = 200;
 
 fn get_download_count(conn: &Connection) -> i32 {
     let mut count: i32 = 0;
-    unsafe {
+    let schema = std::ffi::CString::new("main").unwrap();
+    let rc = unsafe {
         let db = conn.handle();
-        let schema = std::ffi::CString::new("main").unwrap();
         rusqlite::ffi::sqlite3_file_control(
             db,
             schema.as_ptr(),
             SQLITE_OBJS_FCNTL_DOWNLOAD_COUNT,
             &mut count as *mut i32 as *mut std::ffi::c_void,
-        );
-    }
+        )
+    };
+    assert_eq!(rc, rusqlite::ffi::SQLITE_OK, "download-count file_control failed");
     count
 }
 

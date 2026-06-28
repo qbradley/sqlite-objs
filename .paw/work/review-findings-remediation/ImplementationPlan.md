@@ -30,7 +30,7 @@ Rollback-journal and WAL cleanup/recovery decisions use authoritative remote sta
 
 - [x] **Phase 1: Recovery Artifact Safety** - Fix rollback-journal/WAL cleanup and discovery invariants with targeted tests.
 - [x] **Phase 2: Azure Batch Synchronization Safety** - Fix production batch-write lease renewal and mutex cleanup paths with targeted coverage.
-- [ ] **Phase 3: Rust Wrapper Safety and Compatibility** - Harden safe registration/configuration/MSRV/test helper behavior.
+- [x] **Phase 3: Rust Wrapper Safety and Compatibility** - Harden safe registration/configuration/MSRV/test helper behavior.
 - [ ] **Phase 4: Test Gate and Release Automation Integrity** - Make tests/gates/workflows fail or report accurately for critical coverage.
 - [ ] **Phase 5: Documentation and Final Validation** - Update project docs, create as-built Docs.md, and run final validation.
 
@@ -125,15 +125,24 @@ For each targeted invariant test added in Phases 1-3, record evidence that it fa
 ### Success Criteria:
 
 #### Automated Verification:
-- [ ] Tests pass: `cd rust && cargo test --workspace`
-- [ ] Feature-gated tests pass: `cd rust && cargo test --workspace --all-features`
-- [ ] MSRV policy check passes: `cd rust && cargo +1.70.0 check --workspace --all-features` if Rust 1.70 remains documented; otherwise all MSRV documentation is updated and checked against the newly documented minimum.
-- [ ] Targeted invariant tests have fail-first or equivalent coverage evidence recorded per the cross-phase verification standard.
+- [x] Tests pass: `cd rust && cargo test --workspace`
+- [x] Feature-gated tests pass: `cd rust && cargo test --workspace --all-features`
+- [x] MSRV policy check passes: `cd rust && cargo +1.70.0 check --workspace --all-features` if Rust 1.70 remains documented; otherwise all MSRV documentation is updated and checked against the newly documented minimum.
+- [x] Targeted invariant tests have fail-first or equivalent coverage evidence recorded per the cross-phase verification standard.
 
 #### Manual Verification:
-- [ ] Safe Rust API cannot accidentally reset global C VFS state for active users.
-- [ ] Invalid required config values fail before unsafe FFI.
-- [ ] MSRV/documented feature behavior is internally consistent.
+- [x] Safe Rust API cannot accidentally reset global C VFS state for active users.
+- [x] Invalid required config values fail before unsafe FFI.
+- [x] MSRV/documented feature behavior is internally consistent.
+
+### Phase 3 Notes:
+
+- Added a process-wide Rust registration gate so safe registration calls are idempotent or fail before reinitializing global C VFS state.
+- Added Rust-side required config validation for account, container, and auth before FFI.
+- Added `UriBuilder::try_build()` for validated URI construction while preserving `build()` compatibility.
+- Replaced feature-gated pragma helper raw-reference/C-string literal usage with Rust 1.82-compatible code and raised documented Rust MSRV from 1.70 to 1.82 after dependency validation.
+- Made the ignored Azure integration download-count helper assert `sqlite3_file_control` success instead of false-passing on the default count.
+- Fail-first/equivalent evidence: new invalid config, `try_build`, concurrent registration, and file-control return-code assertions directly cover the audited failure modes. Rust 1.70 and 1.71 checks failed on dependency/toolchain requirements; Rust 1.82 all-features check passed and documentation was updated accordingly.
 
 ---
 

@@ -117,8 +117,11 @@ fn config_empty_account() {
         endpoint: None,
     };
 
-    // Empty account is valid at Rust layer (C layer will reject)
-    let _ = SqliteObjsVfs::register_with_config(&config, false);
+    let result = SqliteObjsVfs::register_with_config(&config, false);
+    assert!(
+        matches!(result, Err(SqliteObjsError::InvalidConfig(msg)) if msg.contains("account")),
+        "Should reject empty account"
+    );
 }
 
 #[test]
@@ -131,8 +134,11 @@ fn config_empty_container() {
         endpoint: None,
     };
 
-    // Empty container is valid at Rust layer (C layer will reject)
-    let _ = SqliteObjsVfs::register_with_config(&config, false);
+    let result = SqliteObjsVfs::register_with_config(&config, false);
+    assert!(
+        matches!(result, Err(SqliteObjsError::InvalidConfig(msg)) if msg.contains("container")),
+        "Should reject empty container"
+    );
 }
 
 #[test]
@@ -159,8 +165,11 @@ fn config_neither_sas_nor_key() {
         endpoint: None,
     };
 
-    // No auth is valid at Rust layer (C layer will use env or fail)
-    let _ = SqliteObjsVfs::register_with_config(&config, false);
+    let result = SqliteObjsVfs::register_with_config(&config, false);
+    assert!(
+        matches!(result, Err(SqliteObjsError::InvalidConfig(msg)) if msg.contains("sas_token") || msg.contains("account_key")),
+        "Should reject missing auth"
+    );
 }
 
 // =============================================================================
